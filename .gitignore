@@ -1,0 +1,33 @@
+build/
+tmp/
+
+# Env files, including the SvelteKit/Vite-documented local-secret names
+# (.env.local, .env.production, .env.*.local). A bare `*.env` misses every
+# name that does not end in `.env`, so the `.env` / `.env.*` rules are load
+# bearing, not redundant. Templates stay committed.
+*.env
+.env
+.env.*
+!*.env.tmpl
+!.env.example
+
+# sqlc output (generated at build time, never committed)
+internal/db/repository/
+
+# Frontend
+web/node_modules/
+web/.svelte-kit/
+
+# SvelteKit build output. The Go binary embeds this directory with
+# //go:embed all:dist, and go:embed fails to compile when a pattern matches no
+# files -- so a fresh clone has to be able to `go build ./...` before npm has
+# ever run. The contents are ignored, but the .gitkeep placeholder stays
+# committed to keep that pattern non-empty. (The `all:` prefix is also what
+# lets the embed pattern match a dotfile in the first place.)
+#
+# This MUST stay `web/dist/*` and never become `web/dist/`: git cannot
+# re-include a file whose parent directory is excluded, so ignoring the
+# directory outright would prune the negation and .gitkeep would never be
+# committed.
+web/dist/*
+!web/dist/.gitkeep
