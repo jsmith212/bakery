@@ -50,6 +50,14 @@ Modeled on `../kbi` (adapt, don't copy blindly — kbi uses templ/htmx and go-en
 
 **`DEV_LOGIN_ENABLED` is settable only via env var / CLI flag.** No UI or API path may enable it. Defaults off.
 
+## Frontend: do not design ahead of the handoff
+
+The visual design system is being produced in Claude Design (see `docs/design/claude-design-brief.md`) and will be handed off into `web/tailwind.config.js` + `web/src/lib/components/`.
+
+**Until that handoff lands, do not build UI.** The SvelteKit app should scaffold, build, embed, and serve — nothing more. No component library, no styled screens, no layout work, no color choices. A placeholder page is the correct amount of frontend.
+
+Anything built before the handoff gets thrown away. If a milestone seems to need a screen, build the API and stop.
+
 ## Domain model
 
 `Organization` → `Project` → `Cache Backend` (sstate | downloads | hashserv | bazel | oci). Users have org and project roles. API keys are project-scoped and per-user, read/write-scoped, shown once.
