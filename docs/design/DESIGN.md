@@ -25,6 +25,8 @@ Bakery replaces all of it with one Go binary + Postgres: OIDC login, orgs → pr
 
 **Approved dependencies:** `grpc-go`, `protobuf`, `bazelbuild/remote-apis` (pregenerated — no protoc), `coreos/go-oidc/v3`, `x/oauth2`, `prometheus/client_golang`, `klauspost/compress`, `aws-sdk-go-v2/s3`, `coder/websocket`, `google/go-containerregistry`, `x/net` (h2c), `alecthomas/kong`.
 
+**S3 client: `aws-sdk-go-v2/s3`, decided.** Not `minio-go` — not used here. S3-compatible endpoints (Ceph, Garage, R2) are still reachable via `BaseEndpoint` + `UsePathStyle`.
+
 ---
 
 ## Protocol ground truth (verified against upstream source, not docs)
@@ -204,6 +206,5 @@ Also cheap to defend now, expensive later: take a `pg_try_advisory_lock` at boot
 
 ## Open items (not blocking; decide during implementation)
 
-- `aws-sdk-go-v2/s3` vs `minio-go` — pick on first S3 contact; SDK is heavier but canonical.
 - `bakery.bbclass` (push sstate on task completion) — deferred; the CLI is the v1 path.
 - Binary package feeds (ipk/deb/rpm) — explicitly out of scope; revisit as its own project.
