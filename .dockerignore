@@ -1,0 +1,23 @@
+.git/
+.github/
+docs/
+
+build/
+tmp/
+
+# .dockerignore globs do not cross `/`, so a bare `*.env` would only exclude
+# context-root env files and let web/.env into the node stage (and thus into the
+# gha cache export). The `**` patterns exclude env files at every depth.
+**/*.env
+**/.env
+**/.env.*
+!**/*.env.tmpl
+
+web/node_modules/
+web/.svelte-kit/
+
+# The node stage builds the frontend and the go stage COPYs it in from there.
+# Keeping a developer's local build out of the context makes the image
+# hermetic: a stale dist/ cannot leak files into the embed, since COPY layers
+# over what is already present rather than replacing the directory.
+web/dist/

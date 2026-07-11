@@ -1,0 +1,43 @@
+services:
+  bakery:
+    image: ghcr.io/jsmith212/bakery
+    container_name: bakery
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - stack.env
+    # No healthcheck, and this is deliberate rather than an omission. The image
+    # is gcr.io/distroless/static-debian12, which ships no shell, no curl and no
+    # wget, and the bakery CLI exposes only `serve` and `version` -- so there is
+    # nothing inside the container that can probe GET /healthz. Any test: we
+    # could write here would report unhealthy forever. A healthcheck lands when
+    # the CLI grows a subcommand that can probe itself, which the container can
+    # then exec directly. Until then, probe /healthz from outside.
+    #
+    # There is intentionally no depends_on gate on db either: the M0 binary
+    # never connects to Postgres and must boot with no database running.
+
+  db:
+    image: postgres:18-alpine
+    container_name: db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 1s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5432:5432"
+    env_file:
+      - stack.env
+    # Postgres 18 moved PGDATA to a major-version-specific subdirectory
+    # (/var/lib/postgresql/18/docker) and wants a single mount one level up, at
+    # /var/lib/postgresql. Mounting the pre-18 path (/var/lib/postgresql/data)
+    # leaves PGDATA outside the volume and the server refuses to start.
+    volumes:
+      - db-data:/var/lib/postgresql
+
+volumes:
+  db-data:
+    driver: local
