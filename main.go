@@ -92,7 +92,7 @@ func run(command string, cli config.CLI) error {
 
 	switch command {
 	case "serve":
-		return serve(cli.Serve)
+		return serve(ctx, cli.Serve)
 	case "migrate up":
 		return migrateUp(ctx, cli.Migrate.Up)
 	case "migrate down":
@@ -193,7 +193,15 @@ func migrateVersion(ctx context.Context, cmd config.MigrateVersionCmd) error {
 	return nil
 }
 
-func serve(cmd config.ServeCmd) error {
+// serve boots the whole server: pool, boot lock, migrations, metrics, auth, the
+// control-plane API, and both listeners. The wiring itself lives in
+// internal/server so that the end-to-end tests can boot the same thing main does,
+// rather than a lookalike assembled in a test file.
+func serve(ctx context.Context, cmd config.ServeCmd) error {
+	// The frontend is embedded unconditionally -- `all:dist` is a compile-time
+	// fact -- and --headless decides whether it is ROUTED. Loading it here even in
+	// headless mode keeps a broken embed a boot failure rather than a surprise the
+	// day someone drops --headless.
 	dist, err := web.Dist()
 	if err != nil {
 		return fmt.Errorf("load embedded frontend: %w", err)
@@ -201,11 +209,11 @@ func serve(cmd config.ServeCmd) error {
 
 	slog.Info("bakery starting", "version", buildVersion())
 
-	return server.New(server.Config{
-		Addr:    cmd.Addr(),
+	return server.Boot(ctx, server.BootParams{
+		Cmd:     cmd,
 		Version: buildVersion(),
 		Dist:    dist,
-	}).Run(context.Background())
+	})
 }
 
 // buildVersion prefers the linker-injected version and falls back to the VCS
