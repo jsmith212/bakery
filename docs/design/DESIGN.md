@@ -154,7 +154,7 @@ The asymmetry that dictates the design:
 - Drop a unihash, keep the sstate object → dead bytes nobody can name. *Wasteful.*
 - Drop the sstate object, keep the unihash → hashserv says "don't rebuild", bitbake 404s, rebuilds anyway. *Correct, but a silent performance cliff.*
 
-⇒ **The unihash is the GC root; sstate objects are reachable-from-unihash. Always sweep hashserv before sstate, in one transaction per chunk.** Every sweep predicate carries a **write barrier** (`created_at < gc_run.started_at`) so a build that starts mid-GC can't have its freshly-minted unihashes deleted. Blob bytes are refcounted with a grace period **and** a `FOR UPDATE` + `refcount = 0` recheck (the grace period alone is luck, not correctness).
+⇒ **The unihash is the GC root; sstate objects are reachable-from-unihash. Always sweep hashserv before sstate, in one transaction per chunk.** Every sweep predicate carries a **write barrier** so a build that starts mid-GC can't have its freshly-minted unihashes deleted. M1's schema shows the barrier has **two halves, and the timestamp alone is not enough**: `created_at < gc_run.started_at` *plus* `pg_visible_in_snapshot(live_xid, gc_runs.snapshot)`. A row inserted by a transaction that began before the GC run but committed after it satisfies the timestamp predicate and must still be spared; `TestGCWriteBarrierSparesAConcurrentBuild` asserts exactly that, and it is the snapshot half that saves it. Blob bytes are refcounted with a grace period **and** a `FOR UPDATE` + `refcount = 0` recheck (the grace period alone is luck, not correctness).
 
 **Invariant: on delete, metadata first then bytes; on create, bytes first then metadata.** Orphaned bytes are always recoverable; dangling metadata is a permanent 500.
 
@@ -168,13 +168,51 @@ Label with **slugs, never keys or digests** (`{org, project, backend, kind}`). H
 
 Each is independently shippable and leaves the tree green.
 
-- **M0 — Scaffolding.** Repo, Kong CLI, Justfile, pre-commit, commitizen, `.golangci.yml`, GitHub Actions (build/check/commit/image, ported from the gitea workflows), multi-stage Dockerfile (node → go → distroless), compose, `stack.env.tmpl`, SvelteKit skeleton embedded via `//go:embed all:dist` (the `all:` is **mandatory** — plain `//go:embed dist` silently skips SvelteKit's `_app/` and you ship a white page). Boots, serves `/healthz`.
-- **M1 — Control plane + storage.** Postgres schema + sqlc; orgs, projects, users, roles, memberships, API keys; OIDC login + DEV_LOGIN; `storage.Store` (local, then S3) + `blob.Service` (dedup, refcount, LRU, singleflight). **Benchmark the HEAD path here, before any backend exists.**
+- **M0 — Scaffolding. ✅ DONE.** Repo, Kong CLI, Justfile, pre-commit, commitizen, `.golangci.yml`, GitHub Actions (build/check/commit/image, ported from the gitea workflows), multi-stage Dockerfile (node → go → distroless), compose, `stack.env.tmpl`, SvelteKit skeleton embedded via `//go:embed all:dist` (the `all:` is **mandatory** — plain `//go:embed dist` silently skips SvelteKit's `_app/` and you ship a white page). Boots, serves `/healthz`.
+- **M1 — Control plane + storage. ✅ DONE** (see "M1 as landed" below). Postgres schema + sqlc; orgs, projects, users, roles, memberships, API keys; OIDC login + DEV_LOGIN; `storage.Store` (**local only — S3 is deferred**) + `blob.Service` (dedup, refcount, LRU, singleflight). The HEAD-path benchmark and its three gates landed with it, before any backend exists.
 - **M2 — Yocto sstate + downloads.** `httpblob` + two Policies + `bakery sstate push`. First thing a user can actually point bitbake at.
 - **M3 — hashserv.** Framing-first, pure and DB-free, with an exhaustive table-driven suite. **Run upstream's own hashserv test suite and the real `bitbake-hashclient` against our server in CI — this is non-negotiable.**
 - **M4 — Bazel REAPI (gRPC) + `/ac` `/cas` HTTP.** Ships moon, ccache, and sccache together.
 - **M5 — Docker OCI pull-through proxy.** Byte-exact manifests, stale-while-revalidate, own 401 challenge.
 - **M6 — GC, retention, quotas + UI polish.** (The GC *write barrier* and refcount tests land with M1, not here.)
+
+### M1 as landed
+
+The plan above is what M1 aimed at. This is what it *is*, so the next session onboards from the code rather than from the intention.
+
+**Packages.** `internal/db` (pgxpool + embedded golang-migrate + the boot advisory lock + `Store`, whose `Tx` really rebinds sqlc's `Queries` onto the `pgx.Tx`) · `internal/db/dbtest` (a private, migrated Postgres per test, cloned from a template, over docker or `TEST_DB_URL`) · `internal/slug` (mirrors the DB's `bakery_slug_ok`, so the reserved-slug denylist cannot drift) · `internal/storage` (content-addressed local disk + an instrumented decorator) · `internal/blob` (dedup, refcount, 64-shard LRU with **negative caching**, singleflight) · `internal/cache` (`Route`/`Deps`/`Backend` — the seams M2+ plug into; no backend exists yet) · `internal/metrics` · `internal/auth` · `internal/api` · `internal/cli` (the binary is also the API client) · `internal/server` (the wiring: `server.Boot` is what `bakery serve` runs, and what the end-to-end test boots).
+
+**Storage is LOCAL ONLY. S3 is deferred** — there is no storage-driver column in the schema, no S3 code in the binary, and `--storage-dir` is the only knob. `storage.Store` is the interface a future S3 driver implements; nothing above it knows which driver it has.
+
+**Serve modes.** `bakery serve` = SPA + `/api/v1` + `/healthz` + `/readyz` on the public listener, `/metrics` on `--metrics-addr` (loopback by default). `bakery serve --headless` = the same minus the SPA, which is simply **not routed** (an unknown path is a 404 from the mux, never a 500). `/readyz` really pings the pool; `/healthz` does not, because liveness and readiness must not be the same answer.
+
+**Boot order** (`internal/server/boot.go`): connect and **ping** → take `pg_try_advisory_lock` (refuse a second instance unless `--allow-multi-instance`) → migrate → metrics → auth → `EnsureOrgs` → `SeedDevLogin` → API → bind both listeners → serve. The lock is taken *before* the migrations so two instances starting together cannot race through the same migration.
+
+**The API surface** (`/api/v1`; every route declares its required role at registration, and a handler never sees a path id — `guard` resolves slugs to ids and authorizes them):
+
+| Route | Access |
+|---|---|
+| `GET /auth/config` · `GET /auth/login` · `GET /auth/callback` · `POST /auth/logout` | public |
+| `POST /auth/dev-login` | public, **and only registered when `DEV_LOGIN_ENABLED`** (otherwise the route does not exist: a 404, not a 403) |
+| `GET /me` | any principal |
+| `GET /orgs` · `POST /orgs` | authenticated · **site admin** |
+| `GET|PATCH|DELETE /orgs/{org}` | org view · org admin · org owner |
+| `GET /orgs/{org}/members` · `PUT|DELETE .../members/{user}` | org view · **409, always** — org roles are claim-derived |
+| `GET|POST /orgs/{org}/projects`, `GET|PATCH|DELETE /orgs/{org}/projects/{project}` | org view · org admin · project read/admin |
+| `GET|PUT|DELETE /orgs/{org}/projects/{project}/members[/{user}]` | project read · project admin |
+| `GET|POST|DELETE /orgs/{org}/projects/{project}/keys[/{key}]` | project read |
+| `GET|POST|GET|PATCH|DELETE /orgs/{org}/projects/{project}/backends[/{kind}]` | project read · project admin |
+
+Every non-2xx carries the same envelope, `{"error":{"code","message","field?"}}`, with a **closed** code vocabulary. Branch on `code`, never on `message`.
+
+**The auth model, as built.**
+
+- Humans: OIDC authorization-code flow (state + nonce + PKCE; we verify the nonce ourselves, because go-oidc does not) → an scs session in Postgres, over a hand-written pgxpool store.
+- CLI: OIDC **device grant**; `bakery login` caches tokens 0600 under `~/.config/bakery`, presents the ID token as a Bearer, and the server verifies it per request.
+- **Site and org roles come from OIDC group claims and are reconciled on EVERY login, fail-closed.** A login that resolves to no groups or no mapped orgs is *refused* — it is not treated as "zero memberships", which would delete every membership the user has. This is why the org-membership write endpoints return 409: an org role hand-edited here is either reverted at the next login or grants authority the IdP never granted. **A brand-new org therefore has no members until the group map names it — not even the site admin who created it.**
+- **Project roles are managed in-app** and are the only roles a human edits.
+- API keys are `bkry_` + 256 random bits, stored as raw SHA-256, shown exactly once, project-scoped **and** per-user, capped at the holder's project role *at creation* (validation deliberately does not join `project_memberships` — that would put a second probe on the sstate HEAD storm). An API-key principal never inherits its owner's site admin.
+- `auth.Principal` is an interface sealed by an unexported method: it cannot be constructed or implemented outside `internal/auth`. M5's OCI upstream fetch depends on that.
 
 **Frontend track (parallel):** design system + screens in Claude Design during M0–M1; implement in SvelteKit one milestone behind the backend so screens are built against real endpoints. Screens: login · org/project lists · project detail (overview / backends / members / keys / settings) · backend config + hit-rate charts · API keys (show-once) · admin. **The highest-value screen is a config snippet generator** — per backend, emit the exact `local.conf` / `workspace.yml` / `ccache.conf` / `hosts.toml` with a freshly-minted key baked in. Every one of these clients has a vicious config gotcha; this is what drives adoption.
 
