@@ -52,6 +52,55 @@ func TestLRU_PutGetDelete(t *testing.T) {
 	}
 }
 
+// putIfUnchanged is the ordering guard: a statDB fill lands ONLY if no authoritative
+// put/del touched the key's shard since the generation was read. This pins the exact
+// contract statDB relies on.
+func TestLRU_PutIfUnchanged(t *testing.T) {
+	c := newLRU(metrics.New(), 1024)
+
+	key := []byte("backend\x00\x00sstate:busybox")
+	positive := Meta{Exists: true, Digest: Digest{9}, Size: 42, UpdatedAt: time.Time{}}
+	stale := Meta{Exists: false, Digest: Digest{}, Size: 0, UpdatedAt: time.Time{}}
+
+	// No intervening write: the fill lands.
+	seq := c.seq(key)
+
+	if !c.putIfUnchanged(key, positive, seq) {
+		t.Fatal("putIfUnchanged dropped a fill with an unchanged generation")
+	}
+
+	if got, ok := c.get(key); !ok || got != positive {
+		t.Fatalf("get() = %+v, %v; want %+v, true", got, ok, positive)
+	}
+
+	// A stale reader captured the generation BEFORE an authoritative put; its later
+	// fill must be dropped and the authoritative entry must stand.
+	staleSeq := c.seq(key)
+
+	c.put(key, positive) // authoritative write bumps the generation
+
+	if c.putIfUnchanged(key, stale, staleSeq) {
+		t.Fatal("putIfUnchanged landed a fill whose generation was stale -- it clobbered an authoritative write")
+	}
+
+	if got, ok := c.get(key); !ok || !got.Exists {
+		t.Fatalf("get() = %+v, %v; want the authoritative positive entry", got, ok)
+	}
+
+	// del also bumps the generation, so a fill captured before a delete is dropped.
+	beforeDel := c.seq(key)
+
+	c.del(key)
+
+	if c.putIfUnchanged(key, positive, beforeDel) {
+		t.Fatal("putIfUnchanged landed a fill whose generation predated a del -- it would resurrect a deleted key")
+	}
+
+	if _, ok := c.get(key); ok {
+		t.Error("get() returned a hit for a key whose stale fill should have been dropped after del")
+	}
+}
+
 // Capacity is per shard, so a cache configured for N entries holds at most N. The
 // point of the assertion is that it is BOUNDED: an unbounded metadata cache in front
 // of a multi-million-object sstate mirror is a memory leak with a good reputation.

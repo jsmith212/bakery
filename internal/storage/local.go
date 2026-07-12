@@ -94,7 +94,7 @@ func (l *Local) Create(_ context.Context) (Writer, error) {
 		return nil, fmt.Errorf("chmod staging file: %w", err)
 	}
 
-	return &localWriter{store: l, f: f, h: sha256.New(), n: 0, done: false}, nil
+	return &localWriter{store: l, f: f, h: sha256.New(), n: 0, synced: false, done: false}, nil
 }
 
 func (l *Local) Get(_ context.Context, k Key) (io.ReadCloser, error) {
@@ -155,11 +155,12 @@ func (l *Local) mapErr(op string, k Key, err error) error {
 // localWriter stages bytes and hashes them in one pass. It never buffers the
 // object: an sstate tarball is multi-GB.
 type localWriter struct {
-	store *Local
-	f     *os.File
-	h     hash.Hash
-	n     int64
-	done  bool
+	store  *Local
+	f      *os.File
+	h      hash.Hash
+	n      int64
+	synced bool // the data fsync (Sync) has run; Commit need not repeat it
+	done   bool
 }
 
 func (w *localWriter) Write(p []byte) (int, error) {
@@ -189,8 +190,27 @@ func (w *localWriter) Digest() (Key, int64) {
 	return k, w.n
 }
 
-// Commit fsyncs the data, renames it into place, and fsyncs the containing
-// directory. All three are required:
+// Sync fsyncs the staged data WITHOUT renaming it into place -- durable bytes, no
+// name. It is the expensive half of Commit, split out so blob.Service can pay the
+// multi-GB fsync BEFORE it opens the metadata transaction and takes the digest
+// advisory lock, instead of pinning a pool connection and the lock across it. See the
+// Writer.Sync contract. Idempotent, and a no-op after Commit.
+func (w *localWriter) Sync() error {
+	if w.done || w.synced {
+		return nil
+	}
+
+	if err := w.f.Sync(); err != nil {
+		return fmt.Errorf("fsync staging file: %w", err)
+	}
+
+	w.synced = true
+
+	return nil
+}
+
+// Commit makes the staged bytes durable at their content address, renames them into
+// place, and fsyncs the containing directory. All are required:
 //
 //   - without the file fsync, a crash can leave the renamed name pointing at a
 //     file whose data blocks were never written -- a torn object with a valid name;
@@ -198,6 +218,11 @@ func (w *localWriter) Digest() (Key, int64) {
 //   - without the DIRECTORY fsync, the rename itself is not durable, and a crash
 //     leaves us having told Postgres the bytes are live when the name is gone.
 //     That is dangling metadata, i.e. a permanent 500.
+//
+// The file fsync is elided when Sync already ran (the hot path: blob.Service Syncs
+// before the transaction), so the only I/O left inside the caller's transaction is
+// the rename and the cheap directory fsync. A caller that did not Sync still gets a
+// durable object -- Commit fsyncs the data itself.
 func (w *localWriter) Commit(_ context.Context) (Info, error) {
 	if w.done {
 		return Info{}, ErrCommitted
@@ -206,8 +231,12 @@ func (w *localWriter) Commit(_ context.Context) (Info, error) {
 	k, n := w.Digest()
 
 	// From here on the staging file is either renamed away or removed by Abort.
-	if err := w.f.Sync(); err != nil {
-		return Info{}, fmt.Errorf("fsync staging file: %w", err)
+	if !w.synced {
+		if err := w.f.Sync(); err != nil {
+			return Info{}, fmt.Errorf("fsync staging file: %w", err)
+		}
+
+		w.synced = true
 	}
 
 	if err := w.f.Close(); err != nil {

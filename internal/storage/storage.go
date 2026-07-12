@@ -161,10 +161,28 @@ type Writer interface {
 	// them and dedup onto the copy that is already there.
 	Digest() (Key, int64)
 
+	// Sync makes the staged bytes durable WITHOUT naming them: it fsyncs the staged
+	// object but does not rename it into place, so nothing is observable at the
+	// object's content address yet.
+	//
+	// This is the EXPENSIVE step -- an fsync of a possibly multi-GB object -- and it
+	// is a separate call so blob.Service can pay it BEFORE it opens the metadata
+	// transaction and takes the digest advisory lock, rather than holding a pool
+	// connection and the lock across a multi-second fsync while every other Postgres
+	// user starves. Commit then only renames and fsyncs the directory, which is
+	// milliseconds.
+	//
+	// Bytes-first is preserved: the data is durable after Sync, before any metadata
+	// row. Sync is OPTIONAL -- Commit fsyncs the data itself if Sync was not called,
+	// so a caller that skips it still gets a durable object. Idempotent, and a no-op
+	// after Commit.
+	Sync() error
+
 	// Commit makes the staged bytes durable at their content address and returns
 	// their Info. On return the bytes are fsynced and the rename is fsynced: a
 	// reader can never observe a torn or partial object, and a crash cannot
-	// resurrect one.
+	// resurrect one. When Sync was already called, the data fsync is elided and only
+	// the rename and directory fsync remain.
 	//
 	// Committing content that is already present is a no-op that succeeds -- the
 	// bytes are identical by construction.

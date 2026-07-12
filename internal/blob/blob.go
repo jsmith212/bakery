@@ -435,31 +435,65 @@ func (s *Service) stat(ctx context.Context, ref Ref, rec *metrics.Recorder) (Met
 	//
 	// The key is string(ck) -- an allocation, but only on the COLD path, which is
 	// about to talk to Postgres anyway.
-	v, err, shared := s.sf.Do(string(ck), func() (any, error) {
+	key := string(ck)
+
+	// THE PROBE IS DETACHED FROM THE CALLER THAT HAPPENS TO LEAD THE FLIGHT.
+	//
+	// A storm collapses N callers onto ONE probe. If that probe rides the leader's
+	// request context, the leader disconnecting -- Ctrl-C, an ingress idle timeout, an
+	// HTTP/2 RST_STREAM -- cancels the shared probe and singleflight hands
+	// context.Canceled to every OTHER caller, whose contexts are perfectly alive. On the
+	// sstate miss path that renders as a 500, and a 500 there breaks the build. The
+	// leader is just whoever arrived first; it has no authority over anybody else's
+	// request. context.WithoutCancel keeps the values (trace IDs, and so pgx's tracing)
+	// while dropping the cancellation and the deadline.
+	probeCtx := context.WithoutCancel(ctx)
+
+	ch := s.sf.DoChan(key, func() (any, error) {
 		s.sfInFlight.Inc()
 		defer s.sfInFlight.Dec()
 
-		return s.statDB(ctx, ref, ck)
+		return s.statDB(probeCtx, ref, []byte(key))
 	})
 
-	rec.Singleflight(shared)
+	// And each caller still honours ITS OWN deadline against the shared flight: a
+	// caller whose context dies waits for nobody. Only the leader's cancellation is
+	// prevented from becoming everybody's.
+	select {
+	case <-ctx.Done():
+		return Meta{}, fmt.Errorf("stat object: %w", ctx.Err())
 
-	if err != nil {
-		return Meta{}, err
+	case res := <-ch:
+		rec.Singleflight(res.Shared)
+
+		if res.Err != nil {
+			return Meta{}, res.Err
+		}
+
+		meta, ok := res.Val.(Meta)
+		if !ok {
+			return Meta{}, errors.New("blob: singleflight returned an unexpected type")
+		}
+
+		return meta, nil
 	}
-
-	meta, ok := v.(Meta)
-	if !ok {
-		return Meta{}, errors.New("blob: singleflight returned an unexpected type")
-	}
-
-	return meta, nil
 }
 
 // statDB is the one query on the hot path: a single primary-key probe on
 // cache_objects (backend_id, namespace, key). No join to blobs -- digest and size
 // are denormalised and pinned by a composite FK -- and no lock.
 func (s *Service) statDB(ctx context.Context, ref Ref, ck []byte) (Meta, error) {
+	// THE ORDERING GUARD, and it must be read BEFORE the round-trip.
+	//
+	// This probe's answer describes the world as of NOW. By the time Postgres replies,
+	// a concurrent Put or Delete may have published an AUTHORITATIVE entry for this
+	// key. Landing our finding unconditionally would clobber it -- and because this
+	// cache serves negative entries, a stale "absent" fill that lands on top of a
+	// committed Put is a PERMANENT 404 for an object that exists, served from memory
+	// with no further query until eviction. putIfUnchanged drops the fill if the
+	// shard's write generation moved while we were in flight.
+	seq := s.lru.seq(ck)
+
 	s.qStat.Inc()
 
 	row, err := s.reader.StatObject(ctx, repository.StatObjectParams{
@@ -473,7 +507,7 @@ func (s *Service) statDB(ctx context.Context, ref Ref, ck []byte) (Meta, error) 
 		// against an empty cache sends every HEAD to Postgres, and no test that
 		// pre-populates the repository will ever reveal it.
 		meta := Meta{Exists: false, Digest: Digest{}, Size: 0, UpdatedAt: time.Time{}}
-		s.lru.put(ck, meta)
+		s.lru.putIfUnchanged(ck, meta, seq)
 
 		return meta, nil
 	}
@@ -488,7 +522,7 @@ func (s *Service) statDB(ctx context.Context, ref Ref, ck []byte) (Meta, error) 
 	}
 
 	meta := Meta{Exists: true, Digest: d, Size: row.SizeBytes, UpdatedAt: row.UpdatedAt.Time}
-	s.lru.put(ck, meta)
+	s.lru.putIfUnchanged(ck, meta, seq)
 
 	return meta, nil
 }
@@ -606,6 +640,21 @@ func (s *Service) put(ctx context.Context, ref Ref, r io.Reader, opts PutOptions
 
 	if opts.Verify.mode == verifyContent && opts.Verify.want != digest {
 		return PutResult{}, fmt.Errorf("%w: want %s, got %s", ErrDigestMismatch, opts.Verify.want, digest)
+	}
+
+	// THE FSYNC HAPPENS HERE -- OUTSIDE THE TRANSACTION, BEFORE THE DIGEST LOCK.
+	//
+	// Making the bytes durable is the expensive half of Commit, and on an sstate
+	// tarball it is seconds of I/O. Inside the transaction it would hold a pool
+	// connection (there are 16) AND the digest advisory lock across that fsync, so a
+	// handful of concurrent large PUTs starve every other Postgres user: /readyz's
+	// ping, the next build's HEAD storm, every /api/v1 call. Commit then only renames
+	// and fsyncs the directory, which is microseconds.
+	//
+	// Bytes-first is preserved and in fact strengthened: the data is durable HERE,
+	// strictly before any metadata row exists to name it.
+	if err := w.Sync(); err != nil {
+		return PutResult{}, fmt.Errorf("sync staged object: %w", err)
 	}
 
 	var (

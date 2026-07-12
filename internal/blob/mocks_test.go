@@ -33,17 +33,49 @@ type fakeReader struct {
 	// decoration.
 	latency time.Duration
 
+	// entered and gate give a test DETERMINISTIC control over the probe instead of
+	// relying on a sleep. When entered is non-nil, StatObject sends on it as it begins
+	// (so a test can wait until the flight is genuinely in progress). When gate is
+	// non-nil, StatObject blocks until the gate is closed OR the context is cancelled
+	// -- the latter is what lets the singleflight-cancellation test observe whether a
+	// caller's disconnect propagates to the shared probe.
+	entered chan struct{}
+	gate    chan struct{}
+
 	err error
 }
 
 func newFakeReader() *fakeReader {
-	return &fakeReader{queries: atomic.Int64{}, rows: map[string]repository.StatObjectRow{}, latency: 0, err: nil}
+	return &fakeReader{
+		queries: atomic.Int64{},
+		rows:    map[string]repository.StatObjectRow{},
+		latency: 0,
+		entered: nil,
+		gate:    nil,
+		err:     nil,
+	}
 }
 
 func (f *fakeReader) StatObject(
-	_ context.Context, arg repository.StatObjectParams,
+	ctx context.Context, arg repository.StatObjectParams,
 ) (repository.StatObjectRow, error) {
 	f.queries.Add(1)
+
+	if f.entered != nil {
+		f.entered <- struct{}{}
+	}
+
+	if f.gate != nil {
+		// Honour the context here, exactly as a real Postgres round-trip does: this is
+		// what makes the singleflight-cancellation gate able to fail. If the probe rode
+		// a caller's context, cancelling that caller would return ctx.Err() from here
+		// and singleflight would hand it to every waiter.
+		select {
+		case <-f.gate:
+		case <-ctx.Done():
+			return repository.StatObjectRow{}, ctx.Err()
+		}
+	}
 
 	if f.latency > 0 {
 		time.Sleep(f.latency)

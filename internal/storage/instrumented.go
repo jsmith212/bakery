@@ -37,14 +37,40 @@ type Instrumented struct {
 
 var _ Store = (*Instrumented)(nil)
 
+// storageResults is the CLOSED set of result labels the storage layer emits.
+// It is deliberately a subset of metrics.Result*: a byte store hits, misses, or
+// errors -- there is no `stale`, which is a metadata-freshness verdict blob.Service
+// makes and the byte layer knows nothing about.
+var storageResults = []string{
+	string(metrics.ResultHit),
+	string(metrics.ResultMiss),
+	string(metrics.ResultError),
+}
+
 // NewInstrumented wraps inner. driver is metrics.DriverLocal today; S3 is deferred.
+//
+// It pre-registers this driver's operation series at zero across the closed
+// op x result label set, so bakery_storage_operations_total exists the moment the
+// store is constructed rather than springing into being on the first cache
+// request. That is not cosmetic: a rate() alert cannot otherwise tell "no storage
+// traffic yet" from "the store was never wired up at all", which is exactly the
+// dead-config failure this constructor being CALLED at boot exists to prevent.
 func NewInstrumented(inner Store, m *metrics.Metrics, driver string) *Instrumented {
-	return &Instrumented{
+	i := &Instrumented{
 		inner:   inner,
 		driver:  driver,
 		ops:     m.StorageOps.MustCurryWith(prometheus.Labels{"driver": driver}),
 		latency: m.StorageLatency.MustCurryWith(prometheus.Labels{"driver": driver}),
 	}
+
+	for _, op := range []string{opGet, opPut, opStat, opExists, opDelete} {
+		for _, res := range storageResults {
+			// WithLabelValues instantiates the child at zero without incrementing.
+			i.ops.WithLabelValues(op, res)
+		}
+	}
+
+	return i
 }
 
 // observe records one storage operation.

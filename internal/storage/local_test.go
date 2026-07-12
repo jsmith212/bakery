@@ -469,6 +469,60 @@ func TestInstrumented_AbortRecordsNoPut(t *testing.T) {
 	}
 }
 
+// TestInstrumented_PreRegistersSeriesAtZero proves the store's operation series
+// EXIST the moment it is constructed, before any call. This is the storage half of
+// the "STORAGE_DIR is not dead config" guarantee: bakery_storage_operations_total
+// must be present from boot so a rate() alert can distinguish "no storage traffic
+// yet" from "the store was never wired up at all". counterValue reads zero for both
+// an absent series and a present-but-zero one, so this test counts series instead.
+func TestInstrumented_PreRegistersSeriesAtZero(t *testing.T) {
+	m := metrics.New()
+
+	// Construct and discard: the series live in the registry, not on the store.
+	_ = NewInstrumented(newTestStore(t), m, metrics.DriverLocal)
+
+	ops := []string{opGet, opPut, opStat, opExists, opDelete}
+	results := []string{string(metrics.ResultHit), string(metrics.ResultMiss), string(metrics.ResultError)}
+
+	want := len(ops) * len(results)
+
+	got := seriesCount(t, m, "bakery_storage_operations_total")
+	if got != want {
+		t.Fatalf("bakery_storage_operations_total has %d series after construction, want %d "+
+			"(op x result, pre-registered at zero) -- the store's series were not initialized at boot", got, want)
+	}
+
+	// Every one of them must be exactly zero: pre-registration seeds the labels,
+	// it must never fabricate traffic.
+	for _, op := range ops {
+		for _, res := range results {
+			if v := counterValue(t, m, "bakery_storage_operations_total", map[string]string{
+				"driver": metrics.DriverLocal, "op": op, "result": res,
+			}); v != 0 {
+				t.Errorf("pre-registered series {op=%q,result=%q} = %v, want 0", op, res, v)
+			}
+		}
+	}
+}
+
+// seriesCount returns how many series a metric family currently exposes.
+func seriesCount(t *testing.T, m *metrics.Metrics, name string) int {
+	t.Helper()
+
+	families, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatalf("Gather() error = %v", err)
+	}
+
+	for _, f := range families {
+		if f.GetName() == name {
+			return len(f.GetMetric())
+		}
+	}
+
+	return 0
+}
+
 // counterValue reads one series out of the registry by name and exact label set.
 func counterValue(t *testing.T, m *metrics.Metrics, name string, labels map[string]string) float64 {
 	t.Helper()
