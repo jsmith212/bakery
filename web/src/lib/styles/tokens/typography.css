@@ -1,0 +1,44 @@
+/* ============================================================
+   Bakery type tokens.
+   One UI sans (Geist), one true monospace (JetBrains Mono).
+   Mono is a first-class carrier: hashes, digests, keys, config,
+   logs. JetBrains Mono: dotted 0 vs O, serifed 1 vs l vs I.
+   ============================================================ */
+
+:root {
+  --font-sans: "Geist", -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+
+  /* ---- Sans scale (dense; 13px is the UI default) ---- */
+  --text-xs: 11px;   --leading-xs: 16px;   /* table cells, axis labels, badges */
+  --text-sm: 12px;   --leading-sm: 18px;   /* secondary UI, nav, labels */
+  --text-base: 13px; --leading-base: 20px; /* default UI text */
+  --text-md: 14px;   --leading-md: 20px;   /* section titles, modal titles */
+  --text-lg: 16px;   --leading-lg: 24px;   /* page titles */
+  --text-xl: 20px;   --leading-xl: 28px;   /* rare: page-level headers */
+  --text-metric: 26px; --leading-metric: 32px; /* stat-tile numbers */
+
+  /* ---- Mono scale ---- */
+  --mono-xs: 11px;   --mono-leading-xs: 16px;  /* hashes in table cells */
+  --mono-sm: 12px;   --mono-leading-sm: 18px;  /* code blocks, log lines */
+  --mono-base: 13px; --mono-leading-base: 20px;/* config editors, kv values */
+
+  /* ---- Weights (600 is the ceiling — no bolds) ---- */
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+
+  /* ---- Tracking ---- */
+  --tracking-tight: -0.01em;   /* metric numerals */
+  --tracking-normal: 0;
+  --tracking-label: 0.04em;    /* uppercase micro-labels */
+}
+
+/* Tabular numerals: apply to ANY column of figures set in the sans
+   (metrics, deltas, counts) so numbers never jitter as they update.
+   Mono is tabular by construction. */
+.tabular, [data-tabular] {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  letter-spacing: var(--tracking-tight);
+}

@@ -1,0 +1,44 @@
+/* ============================================================
+   Bakery spacing / radius / border scale. Tight — this is a
+   dense instrument, not a marketing page. Base unit 4px, with
+   a 2px half-step for intra-control gaps.
+   ============================================================ */
+
+:root {
+  --space-05: 2px;
+  --space-1: 4px;
+  --space-15: 6px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* Radii — small and consistent; nothing pill-shaped except radius-full,
+     which is reserved for status dots and toggle knobs. */
+  --radius-1: 4px;   /* buttons, inputs, badges, cells */
+  --radius-2: 6px;   /* cards, panels, modals, code blocks */
+  --radius-3: 8px;   /* page-level containers (rare) */
+  --radius-full: 999px;
+
+  /* Borders — 1px everywhere. --shadow-overlay is per-theme (colors.css):
+     none in dark, a faint lift in light. Floating layers only. */
+  --border-w: 1px;
+
+  /* Control heights (3 sizes across all form controls) */
+  --control-sm: 24px;
+  --control-md: 28px;
+  --control-lg: 32px;
+
+  /* Layout constants */
+  --sidenav-w: 220px;
+  --table-row-h: 32px;
+  --table-row-h-dense: 28px;
+
+  /* Motion — fast and dry; fades and 120ms eases, no bounces. */
+  --ease: cubic-bezier(0.25, 0.1, 0.25, 1);
+  --dur-1: 80ms;
+  --dur-2: 120ms;
+  --dur-3: 200ms;
+}

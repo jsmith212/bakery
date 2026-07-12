@@ -1,0 +1,141 @@
+/* ============================================================
+   Bakery color tokens.
+   Dark is the primary theme and lives on :root.
+   Light is a first-class override under [data-theme="light"].
+   Contrast ratios in comments are against the surface the token
+   is designed to sit on (stated per token).
+   ============================================================ */
+
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* ---- Surfaces (near-neutral, very slightly cool) ---- */
+  --bg-0: #0B0C0E;          /* app background */
+  --bg-1: #111214;          /* panels, side nav */
+  --bg-2: #17191C;          /* cards, table header, inputs */
+  --bg-3: #1E2126;          /* hover fill, active rows */
+  --bg-inset: #08090A;      /* code blocks, wells */
+  --bg-overlay: rgba(8, 9, 10, 0.72);   /* modal scrim */
+  --shadow-overlay: none;                /* flat: borders do the lifting */
+
+  /* ---- Borders (flat UI: borders do the work shadows would) ---- */
+  --border-0: #24262B;      /* hairline dividers */
+  --border-1: #33363D;      /* control outlines, card edges */
+  --border-2: #4A4E56;      /* hover border */
+
+  /* ---- Text ---- */
+  --text-1: #EDEEF0;        /* primary        16.9:1 on bg-0 */
+  --text-2: #A0A6AD;        /* secondary       7.5:1 on bg-0 */
+  --text-3: #6E747B;        /* tertiary/labels 4.4:1 on bg-0 (≥12px or non-essential) */
+  --text-disabled: #4C5157; /* disabled        2.6:1 — intentionally sub-AA */
+  --text-on-solid: #FFFFFF; /* text on accent/danger solids */
+
+  /* ---- Accent (one restrained indigo-blue; interactive only) ---- */
+  --accent-solid: #5468E7;        /* primary button bg; white on it 4.7:1 */
+  --accent-solid-hover: #6376EC;
+  --accent-solid-active: #4759D6;
+  --accent-text: #8FA6F8;         /* links, active nav   7.3:1 on bg-0 */
+  --accent-muted: rgba(84, 104, 231, 0.16);  /* selected fills */
+  --accent-border: rgba(143, 166, 248, 0.45);
+  --focus-ring: #8FA6F8;
+
+  /* ---- Semantic (rated for use as data color, ≥11px text on bg-0/1/2) ----
+     CVD note: hit-green is teal-leaning (h≈157), miss-red warm (h≈357),
+     and they differ strongly in lightness (L* ~78 vs ~58) so they remain
+     distinct under deutan/protan vision. Status UI always pairs color
+     with a shape glyph (● hit, ✕ miss, ▲ stale, ○ idle). */
+  --ok: #3DD68C;            /* success / cache hit   10.5:1 on bg-0 */
+  --ok-muted: rgba(61, 214, 140, 0.13);
+  --ok-border: rgba(61, 214, 140, 0.38);
+  --warn: #F5B138;          /* warning / stale       10.5:1 on bg-0 */
+  --warn-muted: rgba(245, 177, 56, 0.13);
+  --warn-border: rgba(245, 177, 56, 0.38);
+  --err: #F2545E;           /* error / cache miss     5.8:1 on bg-0 */
+  --err-muted: rgba(242, 84, 94, 0.13);
+  --err-border: rgba(242, 84, 94, 0.40);
+  --err-solid: #D93A44;     /* danger button bg; white on it 5.0:1 */
+  --err-solid-hover: #E4515A;
+  --idle: #8B9198;          /* neutral / idle         5.6:1 on bg-0 */
+  --idle-muted: rgba(139, 145, 152, 0.13);
+  --idle-border: rgba(139, 145, 152, 0.38);
+
+  /* ---- Chart / data-viz palette (its own thing) ----
+     chart-1..4 are the semantic data colors (hit/miss/stale/idle order
+     is deliberate: series 1 in any cache chart is hits).
+     chart-5..7 extend for multi-series non-semantic charts. */
+  --chart-hit: #3DD68C;
+  --chart-miss: #F2545E;
+  --chart-stale: #F5B138;
+  --chart-idle: #7A828C;
+  --chart-1: #3DD68C;
+  --chart-2: #F2545E;
+  --chart-3: #F5B138;
+  --chart-4: #8FA6F8;       /* indigo — accent family */
+  --chart-5: #4CC3E0;       /* cyan */
+  --chart-6: #C58AF0;       /* violet */
+  --chart-7: #7A828C;       /* gray */
+  --chart-grid: #1E2126;    /* gridlines */
+  --chart-axis: #6E747B;    /* axis labels (11px mono) */
+  --chart-fill-alpha: 0.10; /* area fill opacity under lines */
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  --bg-0: #FAFAFB;
+  --bg-1: #FFFFFF;
+  --bg-2: #F4F5F6;
+  --bg-3: #ECEDEF;
+  --bg-inset: #F1F2F4;
+  --bg-overlay: rgba(23, 24, 26, 0.40);
+  --shadow-overlay: 0 4px 16px rgba(23, 24, 26, 0.10); /* floating layers only */
+
+  --border-0: #E4E6E9;
+  --border-1: #C9CCD2;
+  --border-2: #A9ADB5;
+
+  --text-1: #17181A;        /* 16.4:1 on bg-1 */
+  --text-2: #55595F;        /*  7.3:1 on bg-1 */
+  --text-3: #6E747B;        /*  4.5:1 on bg-1 */
+  --text-disabled: #A6AAB0;
+  --text-on-solid: #FFFFFF;
+
+  --accent-solid: #4553CE;        /* white on it 6.2:1 */
+  --accent-solid-hover: #3A47BC;
+  --accent-solid-active: #323EA8;
+  --accent-text: #3D4CC7;         /* 7.0:1 on bg-1 */
+  --accent-muted: rgba(69, 83, 206, 0.10);
+  --accent-border: rgba(69, 83, 206, 0.45);
+  --focus-ring: #4553CE;
+
+  --ok: #1B7F4D;            /* 5.0:1 on bg-1 */
+  --ok-muted: rgba(27, 127, 77, 0.10);
+  --ok-border: rgba(27, 127, 77, 0.40);
+  --warn: #96610A;          /* 5.2:1 on bg-1 */
+  --warn-muted: rgba(178, 116, 12, 0.12);
+  --warn-border: rgba(150, 97, 10, 0.45);
+  --err: #C9303C;           /* 5.4:1 on bg-1 */
+  --err-muted: rgba(201, 48, 60, 0.09);
+  --err-border: rgba(201, 48, 60, 0.42);
+  --err-solid: #C9303C;     /* white on it 5.4:1 */
+  --err-solid-hover: #B32833;
+  --idle: #5F656C;          /* 5.9:1 on bg-1 */
+  --idle-muted: rgba(95, 101, 108, 0.10);
+  --idle-border: rgba(95, 101, 108, 0.38);
+
+  --chart-hit: #159457;
+  --chart-miss: #DC3D49;
+  --chart-stale: #C07E00;
+  --chart-idle: #878E96;
+  --chart-1: #159457;
+  --chart-2: #DC3D49;
+  --chart-3: #C07E00;
+  --chart-4: #4553CE;
+  --chart-5: #0E8DA8;
+  --chart-6: #8A4FC8;
+  --chart-7: #878E96;
+  --chart-grid: #ECEDEF;
+  --chart-axis: #6E747B;
+  --chart-fill-alpha: 0.08;
+}
