@@ -791,6 +791,421 @@ func TestStoreTxRebindsQueriesOntoTheTransaction(t *testing.T) {
 	}
 }
 
+// --- the refcount FOR UPDATE / recheck interlock -----------------------------
+
+// zeroGrace is the grace period the mark tests use: none, so a blob is sweepable
+// the instant it is unreferenced and the GC is as adversarial as it can be.
+func zeroGrace() pgtype.Interval {
+	return pgtype.Interval{Microseconds: 0, Days: 0, Months: 0, Valid: true}
+}
+
+// TestGetBlobForWriteLockBlocksTheGCMark is the missing guard the M1 refcount-safety
+// invariant names explicitly: FOR UPDATE in GetBlobForWrite.
+//
+// The interlock: a PUT that has run GetBlobForWrite holds `FOR UPDATE` on the blob
+// row, and the GC's mark is `FOR UPDATE OF b SKIP LOCKED`, so the row a live PUT has
+// locked is SKIPPED and never tombstoned under it. Delete FOR UPDATE from
+// GetBlobForWrite and the PUT locks nothing, the mark no longer skips it, and the GC
+// tombstones a blob a committed object is about to reference -- silently, with every
+// other test still green. This is the test that goes red.
+func TestGetBlobForWriteLockBlocksTheGCMark(t *testing.T) {
+	t.Parallel()
+
+	pool := dbtest.New(t)
+	ctx := t.Context()
+	q := repository.New(pool)
+
+	d := digest(0xF0)
+
+	// A committed, sweepable blob: no objects (refcount 0, therefore stamped
+	// unreferenced), old enough that the grace and the write barrier both pass.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO blobs (digest, size_bytes) VALUES ($1, $2)`, d, int64(9),
+	); err != nil {
+		t.Fatalf("seed blob: %v", err)
+	}
+
+	time.Sleep(10 * time.Millisecond) // created_at strictly before the GC run's started_at
+
+	// tx A takes the PUT-side lock on the blob row and HOLDS the transaction open,
+	// exactly as blob.Service.Put does between GetBlobForWrite and COMMIT.
+	txA, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx A: %v", err)
+	}
+
+	defer func() { _ = txA.Rollback(ctx) }()
+
+	if _, err := repository.New(txA).GetBlobForWrite(ctx, d); err != nil {
+		t.Fatalf("GetBlobForWrite: %v", err)
+	}
+
+	// The GC marks. FOR UPDATE OF b SKIP LOCKED must SKIP the row tx A holds.
+	run, err := q.StartGCRun(ctx, zeroGrace())
+	if err != nil {
+		t.Fatalf("StartGCRun: %v", err)
+	}
+
+	marked, err := q.MarkBlobsPendingDelete(ctx, repository.MarkBlobsPendingDeleteParams{ID: run.ID, Limit: 100})
+	if err != nil {
+		t.Fatalf("MarkBlobsPendingDelete: %v", err)
+	}
+
+	if len(marked) != 0 {
+		t.Fatalf("the GC marked %d blobs while a PUT held GetBlobForWrite's FOR UPDATE lock, want 0 -- "+
+			"the SKIP LOCKED interlock is gone (FOR UPDATE removed from GetBlobForWrite?)", len(marked))
+	}
+
+	// NOT VACUOUS: once the PUT's transaction ends, the very same blob IS markable,
+	// so the zero above was the lock and not an unsweepable row.
+	if err := txA.Rollback(ctx); err != nil {
+		t.Fatalf("rollback tx A: %v", err)
+	}
+
+	if err := q.FinishGCRun(ctx, repository.FinishGCRunParams{
+		ID:             run.ID,
+		Status:         repository.GcRunStatusSucceeded,
+		Error:          pgtype.Text{String: "", Valid: false},
+		ObjectsDeleted: 0,
+		BlobsMarked:    0,
+		BlobsDeleted:   0,
+		BytesReclaimed: 0,
+	}); err != nil {
+		t.Fatalf("FinishGCRun: %v", err)
+	}
+
+	next, err := q.StartGCRun(ctx, zeroGrace())
+	if err != nil {
+		t.Fatalf("StartGCRun (second): %v", err)
+	}
+
+	marked, err = q.MarkBlobsPendingDelete(ctx, repository.MarkBlobsPendingDeleteParams{ID: next.ID, Limit: 100})
+	if err != nil {
+		t.Fatalf("MarkBlobsPendingDelete (second): %v", err)
+	}
+
+	if len(marked) != 1 {
+		t.Fatalf("after the PUT released, the GC marked %d blobs, want 1 -- the row was never sweepable "+
+			"and this test proves nothing", len(marked))
+	}
+}
+
+// TestGetBlobForPhysicalDeleteRechecksRevival is the recheck side of the invariant:
+// the physical-delete SELECT must return ZERO rows for a blob a concurrent PUT
+// revived while the GC queued for the digest lock, so storage.Delete never runs.
+//
+// A real revive flips BOTH the state ('pending_delete' -> 'live') and the refcount
+// (0 -> 1), so gutting the recheck guard entirely (SELECT ... WHERE digest = $1) is
+// what turns this red. See TestPendingDeleteImpliesRefcountZero for the constraint
+// that makes the refcount = 0 half of the guard load-bearing.
+func TestGetBlobForPhysicalDeleteRechecksRevival(t *testing.T) {
+	t.Parallel()
+
+	pool := dbtest.New(t)
+	ctx := t.Context()
+	q := repository.New(pool)
+	backendID := seedBackend(t, pool)
+
+	// A blob genuinely queued for deletion: pending_delete, refcount 0. Reapable.
+	reapable := digest(0xF1)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO blobs (digest, size_bytes, state, delete_started_at)
+		 VALUES ($1, $2, 'pending_delete', now())`, reapable, int64(4),
+	); err != nil {
+		t.Fatalf("seed pending_delete blob: %v", err)
+	}
+
+	if _, err := q.GetBlobForPhysicalDelete(ctx, reapable); err != nil {
+		t.Fatalf("GetBlobForPhysicalDelete on a pending_delete refcount=0 blob: err = %v, want it reapable", err)
+	}
+
+	// A revived blob: a PUT flips state back to 'live' (CreateOrReviveBlob) BEFORE the
+	// object insert bumps refcount to 1 -- that order is mandatory, or
+	// blobs_pending_delete_is_unreferenced rejects the bump.
+	revived := digest(0xF2)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO blobs (digest, size_bytes, state, delete_started_at)
+		 VALUES ($1, $2, 'pending_delete', now())`, revived, int64(4),
+	); err != nil {
+		t.Fatalf("seed pending_delete blob: %v", err)
+	}
+
+	if _, err := pool.Exec(ctx,
+		`UPDATE blobs SET state = 'live', delete_started_at = NULL WHERE digest = $1`, revived,
+	); err != nil {
+		t.Fatalf("revive blob (state -> live): %v", err)
+	}
+
+	if _, err := q.PutObjectImmutable(ctx, repository.PutObjectImmutableParams{
+		BackendID: backendID, Namespace: "", Key: "revived-key", Digest: revived, SizeBytes: 4,
+	}); err != nil {
+		t.Fatalf("PutObjectImmutable (revive): %v", err)
+	}
+
+	if _, err := q.GetBlobForPhysicalDelete(ctx, revived); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("GetBlobForPhysicalDelete on a revived blob: err = %v, want pgx.ErrNoRows -- "+
+			"the recheck would let the GC unlink bytes a live object names", err)
+	}
+}
+
+// TestPendingDeleteImpliesRefcountZero pins the constraint that makes the
+// `refcount = 0` clause in GetBlobForPhysicalDelete's recheck sound: a blob can never
+// be simultaneously pending_delete AND referenced. The two clauses of the recheck
+// (state = 'pending_delete' AND refcount = 0) are equivalent TODAY only because of
+// this CHECK; drop the constraint and refcount = 0 stops being redundant and becomes
+// the only thing standing between the GC and an unlink of referenced bytes.
+func TestPendingDeleteImpliesRefcountZero(t *testing.T) {
+	t.Parallel()
+
+	pool := dbtest.New(t)
+	ctx := t.Context()
+	backendID := seedBackend(t, pool)
+	d := digest(0xF3)
+
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO blobs (digest, size_bytes) VALUES ($1, $2)`, d, int64(6),
+	); err != nil {
+		t.Fatalf("seed blob: %v", err)
+	}
+
+	// One reference: the trigger raises refcount to 1 and clears unreferenced_since.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO cache_objects (backend_id, namespace, key, digest, size_bytes)
+		 VALUES ($1, '', 'k', $2, 6)`, backendID, d,
+	); err != nil {
+		t.Fatalf("seed object: %v", err)
+	}
+
+	// Tombstoning a still-referenced blob must be refused by
+	// blobs_pending_delete_is_unreferenced.
+	if _, err := pool.Exec(ctx,
+		`UPDATE blobs SET state = 'pending_delete', delete_started_at = now() WHERE digest = $1`, d,
+	); err == nil {
+		t.Fatal("the database let a referenced blob (refcount 1) enter pending_delete -- " +
+			"GetBlobForPhysicalDelete's refcount = 0 recheck rests on this being impossible")
+	}
+}
+
+// --- boot advisory lock: surviving a lost session ----------------------------
+
+// boot-lock advisory key, as the two int4s appear in pg_locks (classid, objid) for a
+// pg_advisory_lock(int4, int4): objsubid is 2 for the two-int4 form. These mirror the
+// unexported bootLockClassID / bootLockObjID.
+const (
+	bootLockTestClassID = 0x42414B45 // "BAKE"
+	bootLockTestObjID   = 0x5259     // "RY"
+)
+
+// bootLockHolderPID returns the pid of the backend that currently holds the granted
+// boot lock, if any.
+func bootLockHolderPID(t *testing.T, pool *pgxpool.Pool) (int32, bool) {
+	t.Helper()
+
+	var pid int32
+
+	// THE DATABASE FILTER IS LOAD-BEARING. Advisory locks are scoped to a database
+	// (the lock tag carries the database OID), but pg_locks is CLUSTER-WIDE and shows
+	// every database's locks. dbtest hands each test its own database on a SHARED
+	// server -- which is precisely what CI does with TEST_DB_URL -- so every boot-lock
+	// test holds this same (classid, objid) concurrently. Without the filter this
+	// LIMIT 1 returns an arbitrary one of them, and the caller then
+	// pg_terminate_backend()s ANOTHER TEST'S lock session: that test's boot lock is
+	// released early, its queued competitor is granted the lock instantly instead of
+	// waiting, and it fails with "condition not satisfied" nowhere near the real cause.
+	err := pool.QueryRow(t.Context(),
+		`SELECT pid FROM pg_locks
+		  WHERE locktype = 'advisory' AND classid = $1::oid AND objid = $2::oid
+		    AND objsubid = 2 AND granted
+		    AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+		  LIMIT 1`, bootLockTestClassID, bootLockTestObjID).Scan(&pid)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false
+	}
+
+	if err != nil {
+		t.Fatalf("query boot lock holder pid: %v", err)
+	}
+
+	return pid, true
+}
+
+// bootLockHasWaiter reports whether a session is queued (blocked) on the boot lock.
+func bootLockHasWaiter(t *testing.T, pool *pgxpool.Pool) bool {
+	t.Helper()
+
+	// Scoped to THIS test's database, for the reason spelled out on bootLockHolderPID:
+	// pg_locks is cluster-wide, and an unfiltered count here reports a waiter queued
+	// on a DIFFERENT test's boot lock as if it were our own.
+	var n int
+	if err := pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM pg_locks
+		  WHERE locktype = 'advisory' AND classid = $1::oid AND objid = $2::oid
+		    AND objsubid = 2 AND NOT granted
+		    AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`,
+		bootLockTestClassID, bootLockTestObjID).Scan(&n); err != nil {
+		t.Fatalf("query boot lock waiters: %v", err)
+	}
+
+	return n > 0
+}
+
+// terminateBackend kills one Postgres backend -- the sharp edge of a restart or
+// failover, and the exact event that silently drops a session-scoped advisory lock.
+func terminateBackend(t *testing.T, pool *pgxpool.Pool, pid int32) {
+	t.Helper()
+
+	if _, err := pool.Exec(t.Context(), `SELECT pg_terminate_backend($1)`, pid); err != nil {
+		t.Fatalf("terminate backend %d: %v", pid, err)
+	}
+}
+
+// waitUntil polls cond until it holds or within elapses.
+func waitUntil(t *testing.T, within time.Duration, cond func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatalf("condition not satisfied within %v", within)
+}
+
+// TestBootLockReacquiresAfterSessionDeath is the reproduction of the reported bug,
+// run as a test: a routine Postgres restart / failover (here, terminating the exact
+// backend that holds the lock) drops the session-scoped advisory lock, and the
+// running instance keeps serving unlocked -- so a SECOND instance boots alongside it.
+//
+// The watcher must notice the dead session and RE-ACQUIRE the lock on a fresh
+// connection, so the single-instance invariant survives the restart. Without the
+// watcher the lock is simply gone and the second AcquireBootLock below succeeds.
+func TestBootLockReacquiresAfterSessionDeath(t *testing.T) {
+	t.Parallel()
+
+	pool, dsn := dbtest.NewWithDSN(t)
+	ctx := t.Context()
+
+	lock, err := db.AcquireBootLock(ctx, pool, db.WithWatchInterval(50*time.Millisecond))
+	if err != nil {
+		t.Fatalf("AcquireBootLock: %v", err)
+	}
+
+	defer lock.Release()
+
+	oldPID, ok := bootLockHolderPID(t, pool)
+	if !ok {
+		t.Fatal("no backend holds the boot lock right after acquiring it")
+	}
+
+	terminateBackend(t, pool, oldPID)
+
+	// The lock must reappear, held by a DIFFERENT backend -- our watcher's fresh
+	// session, not the dead one.
+	waitUntil(t, 5*time.Second, func() bool {
+		pid, ok := bootLockHolderPID(t, pool)
+
+		return ok && pid != oldPID
+	})
+
+	// The invariant: a second instance still cannot boot, because we reclaimed it.
+	second, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open second pool: %v", err)
+	}
+
+	defer second.Close()
+
+	if _, err := db.AcquireBootLock(ctx, second); !errors.Is(err, db.ErrLocked) {
+		t.Fatalf("after the boot lock's session died a second instance booted: err = %v, want db.ErrLocked", err)
+	}
+
+	// The watcher recovered; it did not surrender.
+	select {
+	case <-lock.Lost():
+		t.Fatal("boot lock signalled irrecoverable loss when it should have re-acquired")
+	default:
+	}
+}
+
+// TestBootLockSignalsLossWhenStolen covers the narrower failure the recovery path
+// cannot fix: our session dies AND another instance takes the lock during the outage.
+// The watcher cannot re-acquire, and it must SIGNAL LOSS on Lost() so the server can
+// shut down instead of serving on as a phantom second writer.
+func TestBootLockSignalsLossWhenStolen(t *testing.T) {
+	t.Parallel()
+
+	pool, dsn := dbtest.NewWithDSN(t)
+	ctx := t.Context()
+
+	// A DELIBERATELY SLOW watch interval. The competitor below queues for the lock
+	// with a BLOCKING acquire, so PostgreSQL grants it the lock the instant our
+	// session dies -- within a millisecond. A short interval would let our watcher's
+	// own non-blocking re-acquire race that grant for the momentarily-free lock (and
+	// barge ahead of the queue); a slow interval guarantees the queued competitor is
+	// already the holder by the time the watcher next looks, making the steal
+	// deterministic rather than a coin flip.
+	lock, err := db.AcquireBootLock(ctx, pool, db.WithWatchInterval(2*time.Second))
+	if err != nil {
+		t.Fatalf("AcquireBootLock: %v", err)
+	}
+
+	defer lock.Release()
+
+	// A competitor -- a second instance -- QUEUES for the boot lock with a blocking
+	// acquire. It cannot get it yet (we hold it), so it waits in the lock's queue.
+	competitor, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open competitor pool: %v", err)
+	}
+
+	cconn, err := competitor.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire competitor conn: %v", err)
+	}
+
+	// The competitor's acquire blocks until it is granted the stolen lock (or the
+	// test tears down). It gets its OWN context so cleanup can unblock it, and we
+	// wait for the goroutine to finish touching cconn BEFORE releasing it -- otherwise
+	// a failing assertion would race the deferred Release against the live Exec.
+	compCtx, compCancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		_, _ = cconn.Exec(compCtx, `SELECT pg_advisory_lock($1, $2)`,
+			int32(bootLockTestClassID), int32(bootLockTestObjID))
+	}()
+
+	t.Cleanup(func() {
+		compCancel()
+		<-done
+		cconn.Release()
+		competitor.Close()
+	})
+
+	// Wait for the competitor to be queued behind our lock.
+	waitUntil(t, 20*time.Second, func() bool { return bootLockHasWaiter(t, pool) })
+
+	holderPID, ok := bootLockHolderPID(t, pool)
+	if !ok {
+		t.Fatal("no backend holds the boot lock")
+	}
+
+	// Kill our session. The queued competitor is granted the lock, and our watcher's
+	// next non-blocking re-acquire therefore finds it held by someone else.
+	terminateBackend(t, pool, holderPID)
+
+	select {
+	case <-lock.Lost():
+	case <-time.After(30 * time.Second):
+		t.Fatal("boot lock did not signal loss after another instance stole it")
+	}
+}
+
 // seedBackend creates the org -> project -> backend chain a cache_object needs.
 func seedBackend(t *testing.T, pool *pgxpool.Pool) int64 {
 	t.Helper()
