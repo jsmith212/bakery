@@ -20,28 +20,62 @@ web-test: web-deps
 web-check: web-deps
   cd web && npm run check
 
+# Generate the sqlc repository from internal/db/migrations + internal/db/query
+generate:
+  go tool sqlc -f internal/db/sqlc.yaml generate
+
+# Fail if the committed queries and the generated repository have drifted
+generate-check:
+  go tool sqlc -f internal/db/sqlc.yaml diff
+
+# Create a new migration pair (just add-migration add_widgets)
+add-migration migration:
+  #!/usr/bin/env bash
+  # The name is not cosmetic. sqlc reads the migrations dir as its schema and
+  # skips rollbacks BY FILENAME SUFFIX, so a down file that is not named
+  # *.down.sql gets parsed as schema and its DROP TABLEs corrupt sqlc's catalog.
+  # And sqlc applies up-files in LEXICAL order, so the sequence must be
+  # zero-padded or 10_ sorts before 9_.
+  set -euo pipefail
+  seq=$(printf '%06d' $(( $(ls internal/db/migrations/*.up.sql | wc -l) + 1 )))
+  touch "internal/db/migrations/${seq}_{{migration}}.up.sql"
+  touch "internal/db/migrations/${seq}_{{migration}}.down.sql"
+  echo "created internal/db/migrations/${seq}_{{migration}}.{up,down}.sql"
+
 # Build the server
-build: web
+build: web generate
   CGO_ENABLED=0 go build -o ./build/bakery .
 
 # Run the server
-run: web
+run: web generate
   go run .
 
-# Run unit tests (Go + frontend)
-test: web web-test
+# Run unit tests (Go + frontend). DB tests spawn an ephemeral Postgres via docker,
+# or use TEST_DB_URL if it is exported.
+test: web generate web-test
   go test -v ./...
 
 # Run the race detector
-race: web
+race: web generate
   go test -race ./...
 
 # Run tests with coverage (frontend unit tests run first so CI gates on them)
-coverage: web web-test
+coverage: web generate web-test
   mkdir -p build
   go test -v -coverprofile=build/coverage.out ./...
   go tool cover -func=build/coverage.out
   go tool cover -html=build/coverage.out -o build/coverage.html
+
+# Start a shared Postgres for the local test loop (faster than a container per package)
+db-up:
+  docker run -d --name bakery-testdb -p 127.0.0.1:5432:5432 \
+    -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=postgres \
+    postgres:18-alpine
+  @echo "export TEST_DB_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable"
+
+# Stop the shared test Postgres
+db-down:
+  -docker rm -f bakery-testdb
 
 # Run all code checks
 check: check-format vet lint web-check
@@ -51,11 +85,11 @@ check-format:
   if [ -n "$(gofmt -l .)" ]; then gofmt -l .; exit 1; fi
 
 # Run the vet tool
-vet: web
+vet: web generate
   go vet ./...
 
 # Run the golangci-lint tool
-lint: web
+lint: web generate
   go tool golangci-lint run
 
 # Format all code

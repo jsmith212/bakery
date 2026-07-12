@@ -25,6 +25,10 @@ COPY . .
 # all:dist resolves relative to web/embed.go, so this path is the contract.
 COPY --from=web /src/web/dist ./web/dist
 
+# internal/db/repository is sqlc output: generated, gitignored, and therefore not
+# in the build context. Without this the build fails on a missing package.
+RUN go tool sqlc -f internal/db/sqlc.yaml generate
+
 RUN CGO_ENABLED=0 go build -o /bakery .
 
 

@@ -39,6 +39,31 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
+
+    # dbtest uses TEST_DB_URL when it is set and never touches Docker. Without it,
+    # every package with DB tests would spawn its own postgres container on the
+    # runner -- correct, but slower and needlessly fragile.
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --health-start-period 10s
+
+    # The default postgres role is superuser and therefore has CREATEDB, which
+    # dbtest needs: it clones a migrated template with CREATE DATABASE ... TEMPLATE.
+    env:
+      TEST_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+
     steps:
       - uses: actions/checkout@v4
 

@@ -1,0 +1,24 @@
+{
+  "note": "Example group-to-org mapping. Point GROUP_MAP_FILE at a copy of this. JSON, not YAML: the keys below are OIDC group names from an external IdP, and YAML would coerce a group literally named `no`, `on`, `off` or `yes` into a boolean. `note` is the comment field JSON does not have.",
+
+  "site_admin_groups": ["bakery-admins"],
+
+  "orgs": [
+    {
+      "slug": "acme",
+      "note": "Org and site roles are derived from these groups and reconciled on EVERY login. Project roles are managed in-app and must never appear here: an org role granted by hand would be silently deleted by the user's next login, so the schema makes that state unrepresentable.",
+      "groups": {
+        "acme-engineering": "member",
+        "acme-leads": "admin",
+        "acme-directors": "owner"
+      }
+    },
+    {
+      "slug": "initech",
+      "groups": {
+        "initech-all": "member",
+        "initech-platform": "admin"
+      }
+    }
+  ]
+}
