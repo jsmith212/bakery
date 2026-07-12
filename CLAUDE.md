@@ -50,13 +50,18 @@ Modeled on `../kbi` (adapt, don't copy blindly — kbi uses templ/htmx and go-en
 
 **`DEV_LOGIN_ENABLED` is settable only via env var / CLI flag.** No UI or API path may enable it. Defaults off.
 
-## Frontend: do not design ahead of the handoff
+## Frontend: how it's structured
 
-The visual design system is being produced in Claude Design (see `docs/design/claude-design-brief.md`) and will be handed off into `web/tailwind.config.js` + `web/src/lib/components/`.
+The Claude Design handoff has **landed**. The design system is ported into the SvelteKit app under `web/` — build against it, don't redesign it.
 
-**Until that handoff lands, do not build UI.** The SvelteKit app should scaffold, build, embed, and serve — nothing more. No component library, no styled screens, no layout work, no color choices. A placeholder page is the correct amount of frontend.
+- **Tailwind v4, CSS-first.** No `tailwind.config.js`. Tokens are CSS variables in `web/src/lib/styles/tokens/` (colors dark on `:root`, light under `[data-theme="light"]`), mapped onto Tailwind's `--color-*`/`--radius-*`/font namespaces via an `@theme` block in `web/src/app.css`. Utilities like `bg-bg-1 text-text-2 border-border-0 rounded-2` resolve to those vars, so flipping `<html data-theme>` recolors live with no rebuild. **No raw hex in markup**; never use `dark:` variants.
+- **Theming** is `web/src/lib/theme.ts` (`dark|light|system`, persisted to `localStorage["bakery-theme"]`, default `system`), plus a no-FOUC script in `app.html`. The ConsoleNav footer toggle and User Settings "Appearance" control drive the same store — one source of truth.
+- **Component library** in `web/src/lib/components/<group>/` (buttons, inputs, badges, table, navigation, feedback, content, data). These rebuild the `.bk-*` recipes as `.svelte` components using token utilities. Reuse them; do not ship `.bk-*` classes or reintroduce inline primitives. Status is a typographic glyph + color, never an icon: `●` hit, `✕` miss, `▲` stale, `○` idle, `∅` empty.
+- **Routes**: a `(console)` group layout renders `<ConsoleNav/>` + the page; `/login` is full-screen outside it; `/` redirects to `/overview`. adapter-static SPA (`ssr=false`), built to `web/dist`, embedded via `//go:embed all:dist`.
+- **All screens are built with mock data — API wiring is still pending.** When you add a backend, replace the in-component mock arrays with real data; the visual layer stays as-is. `web/FOUNDATION.md` is the binding contract for the utility vocabulary and component prop APIs.
+- Fonts still load via a Google Fonts `@import`; production should self-host the woff2 for the offline embedded console (not a blocker).
 
-Anything built before the handoff gets thrown away. If a milestone seems to need a screen, build the API and stop.
+Voice/fidelity is fixed by the design system: sentence case, terse and technical, no emoji, no exclamation points, second person; metrics in tabular numerals, mono for hashes/keys/config.
 
 ## Domain model
 
