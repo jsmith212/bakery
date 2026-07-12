@@ -53,10 +53,14 @@ const (
 )
 
 // needsOrg reports whether the guard must resolve {org} before deciding.
+//
+// Note there is deliberately NO needsProject() gate. Whether {project} is resolved
+// is keyed on the ROUTE PATTERN (does it carry a {project} segment?), not on the
+// Access level -- see resolve(). Keying it on the Access ladder was a latent bug:
+// an AccessOrgAdmin route with a {project} segment (deleting a project) sits below
+// AccessProjectRead, so the project was never resolved and the handler operated on
+// the zero UUID.
 func (a Access) needsOrg() bool { return a >= AccessOrgView }
-
-// needsProject reports whether the guard must resolve {project} too.
-func (a Access) needsProject() bool { return a >= AccessProjectRead }
 
 // String is for the route-coverage test's failure messages.
 func (a Access) String() string {
@@ -328,26 +332,39 @@ func (a *API) resolve(ctx context.Context, r *http.Request, access Access, p Pri
 		return scope{}, errNotFound("organization not found")
 	}
 
-	if !access.needsProject() {
-		switch access {
-		case AccessOrgAdmin:
-			if !p.CanAdminOrg(org.ID) {
-				return scope{}, errForbidden("this action requires an organization administrator")
-			}
-		case AccessOrgOwner:
-			if !p.CanOwnOrg(org.ID) {
-				return scope{}, errForbidden("this action requires the organization owner")
-			}
-		case AccessPublic, AccessAuthenticated, AccessSiteAdmin, AccessOrgView,
-			AccessProjectRead, AccessProjectAdmin:
-			// AccessOrgView is satisfied by CanViewOrg above; the rest cannot reach
-			// here (needsOrg / needsProject already partitioned them).
+	// Org-level authorization. AccessOrgView is already satisfied by CanViewOrg
+	// above; the two project levels are checked after {project} resolves below.
+	//
+	// The org-level requirement is enforced here EVEN for a route that also carries
+	// {project}: DELETE .../projects/{project} is AccessOrgAdmin precisely so that
+	// only an org admin -- not the recipient of a delegated project-admin role --
+	// may destroy a project. Resolving the project (below) does not relax that.
+	switch access {
+	case AccessOrgAdmin:
+		if !p.CanAdminOrg(org.ID) {
+			return scope{}, errForbidden("this action requires an organization administrator")
 		}
-
-		return s, nil
+	case AccessOrgOwner:
+		if !p.CanOwnOrg(org.ID) {
+			return scope{}, errForbidden("this action requires the organization owner")
+		}
+	case AccessPublic, AccessAuthenticated, AccessSiteAdmin, AccessOrgView,
+		AccessProjectRead, AccessProjectAdmin:
+		// AccessOrgView: satisfied by CanViewOrg above. AccessProjectRead and
+		// AccessProjectAdmin are checked after project resolution. The rest cannot
+		// reach here (needsOrg already returned for them).
 	}
 
+	// Resolve {project} whenever the ROUTE carries it -- keyed on the path pattern,
+	// NOT on the Access ladder. r.PathValue returns "" when the matched pattern has
+	// no {project}, so a project-less route (POST /orgs/{org}/projects, the org
+	// members routes) falls through here untouched. A route that DOES carry
+	// {project} always gets a resolved id, so no handler can be handed the zero UUID
+	// and issue `... WHERE id = NULL`.
 	projectSlug := r.PathValue("project")
+	if projectSlug == "" {
+		return s, nil
+	}
 
 	route, err := a.store.ResolveRoute(ctx, repository.ResolveRouteParams{
 		Slug: orgSlug, Slug_2: projectSlug,
@@ -363,6 +380,8 @@ func (a *API) resolve(ctx context.Context, r *http.Request, access Access, p Pri
 	s.ProjectID = route.ProjectID
 	s.ProjectSlug = projectSlug
 
+	// Project existence is hidden behind read permission, same as the org above. An
+	// org admin or site admin passes by virtue of org membership implying read.
 	if !p.CanReadProject(org.ID, route.ProjectID) {
 		return scope{}, errNotFound("project not found")
 	}

@@ -3,6 +3,9 @@ package auth
 import (
 	"crypto/sha256"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"regexp"
 	"strings"
 	"testing"
@@ -97,6 +100,77 @@ func TestHashTokenAndConstantTimeCompare(t *testing.T) {
 				t.Errorf("TokenMatchesHash() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestAPIKeyHashComparisonIsConstantTime makes the SOURCE the enforcement
+// mechanism for the timing-safe hash comparison, the way
+// TestPrincipalHasNoExportedConstructor does for the sealed Principal.
+//
+// TokenMatchesHash and authenticateKey both compare a presented key's SHA-256
+// against the stored one, and both MUST do it with crypto/subtle.ConstantTimeCompare.
+// bytes.Equal -- and == on the hex form -- short-circuits on the first differing
+// byte, which turns the DURATION of a rejection into a byte-at-a-time oracle for
+// the very secret that guards every cache write.
+//
+// A behavioural test cannot catch a regression here: ConstantTimeCompare and
+// bytes.Equal return the identical boolean, so TestHashTokenAndConstantTimeCompare
+// stays green under either. The property is about HOW the comparison is made, not
+// what it returns, so it has to be asserted at the source level. A refactor to
+// bytes.Equal drops the crypto/subtle import and adds a "bytes" one -- either half
+// fails this test on its own.
+func TestAPIKeyHashComparisonIsConstantTime(t *testing.T) {
+	t.Parallel()
+
+	fset := token.NewFileSet()
+
+	file, err := parser.ParseFile(fset, "apikey.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse apikey.go: %v", err)
+	}
+
+	imports := map[string]bool{}
+	for _, imp := range file.Imports {
+		imports[strings.Trim(imp.Path.Value, `"`)] = true
+	}
+
+	if !imports["crypto/subtle"] {
+		t.Error("apikey.go no longer imports crypto/subtle: the API-key hash comparison is not constant-time, " +
+			"which makes rejection latency a byte-at-a-time oracle for the stored secret")
+	}
+
+	if imports["bytes"] {
+		t.Error("apikey.go imports \"bytes\": bytes.Equal short-circuits on the first differing byte and is a " +
+			"timing oracle on a secret hash -- the comparison must use crypto/subtle.ConstantTimeCompare")
+	}
+
+	// The primitive must not merely be imported, it must be CALLED at both sites --
+	// TokenMatchesHash and authenticateKey -- so an import kept alive by one call
+	// while the other reverts to bytes.Equal or == cannot pass.
+	calls := 0
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+
+		pkg, ok := sel.X.(*ast.Ident)
+		if ok && pkg.Name == "subtle" && sel.Sel.Name == "ConstantTimeCompare" {
+			calls++
+		}
+
+		return true
+	})
+
+	if calls < 2 {
+		t.Errorf("apikey.go calls subtle.ConstantTimeCompare %d time(s), want >= 2: both TokenMatchesHash and "+
+			"authenticateKey compare a key hash and both must be constant-time", calls)
 	}
 }
 

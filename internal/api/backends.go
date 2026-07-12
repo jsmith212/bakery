@@ -2,11 +2,8 @@ package api
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
-
-	"github.com/jackc/pgx/v5"
 
 	"github.com/jsmith212/bakery/internal/db/repository"
 )
@@ -92,7 +89,14 @@ func (a *API) handleCreateBackend(w http.ResponseWriter, r *http.Request) error 
 	})
 	if err != nil {
 		// UNIQUE (project_id, kind) => a second sstate mount on one project is a
-		// 409, not a 500. toAPIError maps 23505 for us.
+		// 409. The generic 23505 mapping in toAPIError says "that slug is already
+		// taken", which is nonsense here -- there is no slug in this request -- so
+		// name the real conflict before it reaches the generic mapping.
+		if isPGCode(err, pgUniqueViolation) {
+			return errConflict(CodeConflict,
+				fmt.Sprintf("this project already has a %s backend", kind))
+		}
+
 		return fmt.Errorf("create %s backend: %w", kind, err)
 	}
 
@@ -170,6 +174,15 @@ func (a *API) handleDeleteBackend(w http.ResponseWriter, r *http.Request) error 
 
 	n, err := a.store.DeleteBackend(ctx, current.ID)
 	if err != nil {
+		// ON DELETE RESTRICT from cache_objects => a 23503 while the backend still
+		// holds objects. The generic mapping says "that reference does not exist, or
+		// the user is not a member of the organization", which is the exact opposite
+		// of the truth (the reference very much exists), so name it here.
+		if isPGCode(err, pgForeignKeyViolation) {
+			return errConflict(CodeConflict,
+				"this backend still holds cache objects and cannot be deleted until it is emptied")
+		}
+
 		return fmt.Errorf("delete backend: %w", err)
 	}
 
@@ -188,6 +201,14 @@ func (a *API) handleDeleteBackend(w http.ResponseWriter, r *http.Request) error 
 // makes the {kind} path segment safe: the worst a caller can do with it is name a
 // kind, and the project it is looked up in is the one the guard already checked
 // them against.
+//
+// It returns the FULL row (via ListBackendsForProject), not a struct hand-built
+// from a partial one. An earlier version synthesised a repository.CacheBackend from
+// GetBackend's projection, which omits created_at/updated_at -- so the detail
+// endpoint serialised "0001-01-01T00:00:00Z" while the list endpoint (which selects
+// the timestamps) returned the real ones. A project configures at most five
+// backends, so scanning the project's list to find the kind is a bounded,
+// single-query lookup, and it carries every column.
 func (a *API) backendOf(r *http.Request) (repository.CacheBackend, error) {
 	ctx := r.Context()
 	s := scopeFrom(ctx)
@@ -197,22 +218,19 @@ func (a *API) backendOf(r *http.Request) (repository.CacheBackend, error) {
 		return repository.CacheBackend{}, err
 	}
 
-	row, err := a.store.GetBackend(ctx, repository.GetBackendParams{
-		ProjectID: s.ProjectID, Kind: kind,
-	})
+	backends, err := a.store.ListBackendsForProject(ctx, s.ProjectID)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return repository.CacheBackend{}, errNotFound(
-				fmt.Sprintf("this project has no %s backend configured", kind))
-		}
-
 		return repository.CacheBackend{}, fmt.Errorf("load backend: %w", err)
 	}
 
-	return repository.CacheBackend{
-		ID: row.ID, ProjectID: s.ProjectID, Kind: kind,
-		Enabled: row.Enabled, ReadAuthRequired: row.ReadAuthRequired, Config: row.Config,
-	}, nil
+	for _, b := range backends {
+		if b.Kind == kind {
+			return b, nil
+		}
+	}
+
+	return repository.CacheBackend{}, errNotFound(
+		fmt.Sprintf("this project has no %s backend configured", kind))
 }
 
 // backendConfig validates the jsonb payload.

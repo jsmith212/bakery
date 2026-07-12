@@ -219,6 +219,11 @@ type fakeStore struct {
 	revokedForMembership []repository.RevokeAPIKeysForMembershipParams
 	revokedKeys          []pgtype.UUID
 
+	// orgMemberReads records every ListOrgMembers(orgID). Key-owner decoration must
+	// resolve names through THIS (an org-scoped, bounded read), never through a
+	// whole-users-table scan -- so a test can assert the lookup stayed org-scoped.
+	orgMemberReads []pgtype.UUID
+
 	desiredErr error
 }
 
@@ -383,6 +388,8 @@ func (s *fakeStore) ResolveRoute(
 func (s *fakeStore) ListOrgMembers(
 	_ context.Context, orgID pgtype.UUID,
 ) ([]repository.ListOrgMembersRow, error) {
+	s.orgMemberReads = append(s.orgMemberReads, orgID)
+
 	return s.orgMembers[orgID], nil
 }
 
@@ -478,10 +485,6 @@ func (s *fakeStore) DeleteProjectMembership(
 	return 0, nil
 }
 
-func (s *fakeStore) ListUsers(_ context.Context) ([]repository.User, error) {
-	return s.users, nil
-}
-
 func (s *fakeStore) ListAPIKeysForProject(
 	_ context.Context, projectID pgtype.UUID,
 ) ([]repository.ListAPIKeysForProjectRow, error) {
@@ -501,21 +504,6 @@ func (s *fakeStore) RevokeAPIKey(_ context.Context, id pgtype.UUID) (int64, erro
 	s.revokedKeys = append(s.revokedKeys, id)
 
 	return 1, nil
-}
-
-func (s *fakeStore) GetBackend(
-	_ context.Context, arg repository.GetBackendParams,
-) (repository.GetBackendRow, error) {
-	for _, b := range s.backends {
-		if b.ProjectID == arg.ProjectID && b.Kind == arg.Kind {
-			return repository.GetBackendRow{
-				ID: b.ID, Enabled: b.Enabled,
-				ReadAuthRequired: b.ReadAuthRequired, Config: b.Config,
-			}, nil
-		}
-	}
-
-	return repository.GetBackendRow{}, pgx.ErrNoRows
 }
 
 func (s *fakeStore) ListBackendsForProject(
@@ -570,6 +558,10 @@ func (s *fakeStore) UpdateBackend(
 
 func (s *fakeStore) DeleteBackend(_ context.Context, id int64) (int64, error) {
 	s.note("DeleteBackend")
+
+	if s.desiredErr != nil {
+		return 0, s.desiredErr
+	}
 
 	for i := range s.backends {
 		if s.backends[i].ID == id {

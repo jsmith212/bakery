@@ -285,6 +285,67 @@ func TestListKeysHidesOtherPeoplesKeysFromNonAdmins(t *testing.T) {
 	}
 }
 
+// TestListKeysDecoratesOwnersFromOrgMembers pins finding: key rows carry the
+// owner's email and display name, and that decoration is resolved through an
+// ORG-SCOPED read (ListOrgMembers), never a scan of the whole users table.
+//
+// The old owners() called ListUsers -- an unbounded `SELECT * FROM users ORDER BY
+// email` -- on every key-list request, so an installation with 100k users
+// materialized all of them to name the two owners of a project's keys. Every key
+// owner is necessarily a member of the key's org, so the org roster is a complete
+// AND bounded source. This asserts both halves: the names are right, and the lookup
+// stayed scoped to the authorized org.
+func TestListKeysDecoratesOwnersFromOrgMembers(t *testing.T) {
+	store := keyFixture(t)
+	a := testAPI(t, store, nil)
+
+	admin := principals(t)["proj_admin"]
+
+	w := do(t, a, admin, http.MethodGet, Prefix+"/orgs/acme/projects/firmware/keys", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", w.Code, w.Body.String())
+	}
+
+	var body ListResponse[APIKey]
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	owners := make(map[string][2]string, len(body.Items))
+	for _, k := range body.Items {
+		owners[k.Name] = [2]string{k.OwnerEmail, k.OwnerName}
+	}
+
+	// The owners are named -- and the names came from the org roster, not from the
+	// key rows (which carry no email at all, by design).
+	if got := owners["ci-writer"]; got != [2]string{"anna@acme.dev", "Anna Keller"} {
+		t.Errorf("ci-writer owner = %v, want anna@acme.dev / Anna Keller", got)
+	}
+
+	if got := owners["marko-dev"]; got != [2]string{"marko@acme.dev", "Marko Ilic"} {
+		t.Errorf("marko-dev owner = %v, want marko@acme.dev / Marko Ilic", got)
+	}
+
+	// And the decoration read was org-scoped: ListOrgMembers(acme), never a
+	// whole-users-table scan. ListUsers is not even on the Store interface any more,
+	// so reintroducing the unbounded read is a compile error -- this pins the intent.
+	acme := mustUUID(t, orgAcmeID)
+
+	var scopedToAcme bool
+
+	for _, orgID := range store.orgMemberReads {
+		if orgID == acme {
+			scopedToAcme = true
+		} else {
+			t.Errorf("owner lookup read org %v, outside the authorized org acme", orgID)
+		}
+	}
+
+	if !scopedToAcme {
+		t.Error("listing keys did not resolve owners through an org-scoped ListOrgMembers read")
+	}
+}
+
 // TestCreateKeyRejectsAnInvalidScope: the scope vocabulary is closed.
 func TestCreateKeyRejectsAnInvalidScope(t *testing.T) {
 	tests := []struct {

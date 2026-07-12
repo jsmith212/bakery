@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/jsmith212/bakery/internal/auth"
 	"github.com/jsmith212/bakery/internal/db/repository"
 )
@@ -55,7 +57,7 @@ func (a *API) handleListKeys(w http.ResponseWriter, r *http.Request) error {
 		return fmt.Errorf("list api keys: %w", err)
 	}
 
-	owners, err := a.owners(ctx)
+	owners, err := a.owners(ctx, s.OrgID)
 	if err != nil {
 		return err
 	}
@@ -84,16 +86,22 @@ func (a *API) handleListKeys(w http.ResponseWriter, r *http.Request) error {
 // ListAPIKeysForProject does not join users -- the api_keys queries are written to
 // stay join-free because the validation query on that table is the sstate HEAD hot
 // path and nobody wants a second index to maintain there. So the join happens here,
-// on a cold console page, over a user table measured in tens.
-func (a *API) owners(ctx context.Context) (map[string][2]string, error) {
-	users, err := a.store.ListUsers(ctx)
+// on a cold console page.
+//
+// The lookup is scoped to THIS ORG's members, not the whole users table. Every key
+// owner is necessarily an org member (a key is minted for the caller, who holds a
+// project role, which requires org membership), so ListOrgMembers covers every
+// owner while reading a set bounded by the org the guard already authorized --
+// rather than materializing every user in the installation on each key-list request.
+func (a *API) owners(ctx context.Context, orgID pgtype.UUID) (map[string][2]string, error) {
+	members, err := a.store.ListOrgMembers(ctx, orgID)
 	if err != nil {
-		return nil, fmt.Errorf("list users: %w", err)
+		return nil, fmt.Errorf("list org members: %w", err)
 	}
 
-	out := make(map[string][2]string, len(users))
-	for _, u := range users {
-		out[uuidString(u.ID)] = [2]string{u.Email, u.DisplayName}
+	out := make(map[string][2]string, len(members))
+	for _, m := range members {
+		out[uuidString(m.UserID)] = [2]string{m.Email, m.DisplayName}
 	}
 
 	return out, nil

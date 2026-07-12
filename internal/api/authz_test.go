@@ -337,6 +337,95 @@ func TestGuardRejectsCrossTenantProject(t *testing.T) {
 	}
 }
 
+// TestProjectRoutesResolveProjectID pins finding: EVERY route whose pattern
+// carries a {project} segment must hand the handler a non-zero scope.ProjectID.
+//
+// The bug it guards: DELETE /orgs/{org}/projects/{project} is registered
+// AccessOrgAdmin, and the guard used to resolve {project} only for access levels at
+// or above AccessProjectRead. AccessOrgAdmin sits below it, so scope.ProjectID
+// stayed the zero (NULL) UUID and handleDeleteProject issued `DELETE ... WHERE id =
+// NULL`, matching no row -- a dead endpoint for every caller, site admin included.
+//
+// The matrix test only checks status codes, so it could never have caught a handler
+// that authorized correctly and then operated on the wrong (null) id. This drives
+// the real mounted route table and asserts the resolved scope directly.
+func TestProjectRoutesResolveProjectID(t *testing.T) {
+	store := fixtureStore(t)
+	a := testAPI(t, store, nil)
+	a.routes = nil
+	a.mount(http.NewServeMux())
+
+	// A site admin passes every authorization check, so any non-zero ProjectID
+	// afterwards is the guard's resolution, not a role accident.
+	admin := principals(t)["site_admin"]
+	firmware := mustUUID(t, projFirmwareID)
+
+	replacer := strings.NewReplacer(
+		"{org}", "acme",
+		"{project}", "firmware",
+		"{user}", "someone@acme.dev",
+		"{kind}", "sstate",
+		"{key}", keyAnnaID,
+	)
+
+	var covered int
+
+	for _, route := range a.routes {
+		if !strings.Contains(route.Pattern, "{project}") {
+			continue
+		}
+
+		covered++
+
+		t.Run(route.Pattern, func(t *testing.T) {
+			method, pattern, ok := strings.Cut(route.Pattern, " ")
+			if !ok {
+				t.Fatalf("malformed route pattern %q", route.Pattern)
+			}
+
+			var (
+				got     scope
+				reached bool
+			)
+
+			mux := http.NewServeMux()
+			mux.HandleFunc(pattern, a.guard(route.Access, func(_ http.ResponseWriter, r *http.Request) error {
+				got = scopeFrom(r.Context())
+				reached = true
+
+				return nil
+			}))
+
+			body := "{}"
+
+			req := httptest.NewRequest(method, replacer.Replace(pattern), strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req = req.WithContext(withPrincipal(req.Context(), admin))
+
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+
+			if !reached {
+				t.Fatalf("guard did not reach the handler: status=%d body=%s",
+					w.Code, strings.TrimSpace(w.Body.String()))
+			}
+
+			if !got.ProjectID.Valid || got.ProjectID == (pgtype.UUID{}) {
+				t.Fatalf("scope.ProjectID is the zero/NULL uuid for a {project} route; " +
+					"the handler would operate on WHERE id = NULL")
+			}
+
+			if got.ProjectID != firmware {
+				t.Errorf("scope.ProjectID = %v, want firmware %v", got.ProjectID, firmware)
+			}
+		})
+	}
+
+	if covered == 0 {
+		t.Fatal("no {project} routes were exercised; the route table or this test is wrong")
+	}
+}
+
 // TestStateChangingRequestsRequireJSON is the CSRF gate.
 //
 // The session cookie is SameSite=Lax, which blocks a cross-site POST from carrying

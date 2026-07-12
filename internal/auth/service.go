@@ -170,7 +170,7 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	req, err := s.provider.AuthCodeURL()
 	if err != nil {
 		s.log.ErrorContext(r.Context(), "build authorization URL", slog.Any("error", err))
-		http.Error(w, "authentication is unavailable", http.StatusInternalServerError)
+		writeAuthError(w, http.StatusInternalServerError, codeInternal, "authentication is unavailable")
 
 		return
 	}
@@ -181,7 +181,7 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	// token cannot be the one that ends up carrying the completed login.
 	if err := s.sessions.RenewToken(ctx); err != nil {
 		s.log.ErrorContext(ctx, "renew session token", slog.Any("error", err))
-		http.Error(w, "authentication is unavailable", http.StatusInternalServerError)
+		writeAuthError(w, http.StatusInternalServerError, codeInternal, "authentication is unavailable")
 
 		return
 	}
@@ -205,7 +205,7 @@ func (s *Service) HandleCallback(w http.ResponseWriter, r *http.Request) {
 
 	if errParam := r.URL.Query().Get("error"); errParam != "" {
 		s.observe(MethodSession, "denied")
-		http.Error(w, "the identity provider refused the login", http.StatusForbidden)
+		writeAuthError(w, http.StatusForbidden, codeForbidden, "the identity provider refused the login")
 
 		return
 	}
@@ -218,7 +218,7 @@ func (s *Service) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	if wantState == "" || subtle.ConstantTimeCompare([]byte(wantState), []byte(gotState)) != 1 {
 		s.observe(MethodSession, "error")
 		s.log.WarnContext(ctx, "oidc callback state mismatch")
-		http.Error(w, ErrStateMismatch.Error(), http.StatusBadRequest)
+		writeAuthError(w, http.StatusBadRequest, codeBadRequest, ErrStateMismatch.Error())
 
 		return
 	}
@@ -234,7 +234,7 @@ func (s *Service) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	if code == "" {
 		s.observe(MethodSession, "error")
-		http.Error(w, "the callback carried no authorization code", http.StatusBadRequest)
+		writeAuthError(w, http.StatusBadRequest, codeBadRequest, "the callback carried no authorization code")
 
 		return
 	}
@@ -243,7 +243,7 @@ func (s *Service) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.observe(MethodSession, "error")
 		s.log.WarnContext(ctx, "oidc code exchange failed", slog.Any("error", err))
-		http.Error(w, "authentication failed", http.StatusUnauthorized)
+		writeAuthError(w, http.StatusUnauthorized, codeUnauthorized, "authentication failed")
 
 		return
 	}
@@ -254,14 +254,14 @@ func (s *Service) HandleCallback(w http.ResponseWriter, r *http.Request) {
 			s.observe(MethodSession, "denied")
 			s.log.WarnContext(ctx, "login refused",
 				slog.String("subject", id.Subject), slog.Any("error", err))
-			http.Error(w, ErrLoginNotAllowed.Error(), http.StatusForbidden)
+			writeAuthError(w, http.StatusForbidden, codeForbidden, ErrLoginNotAllowed.Error())
 
 			return
 		}
 
 		s.observe(MethodSession, "error")
 		s.log.ErrorContext(ctx, "login reconciliation failed", slog.Any("error", err))
-		http.Error(w, "authentication failed", http.StatusInternalServerError)
+		writeAuthError(w, http.StatusInternalServerError, codeInternal, "authentication failed")
 
 		return
 	}
@@ -269,7 +269,7 @@ func (s *Service) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	if err := s.establish(ctx, userID); err != nil {
 		s.observe(MethodSession, "error")
 		s.log.ErrorContext(ctx, "establish session", slog.Any("error", err))
-		http.Error(w, "authentication failed", http.StatusInternalServerError)
+		writeAuthError(w, http.StatusInternalServerError, codeInternal, "authentication failed")
 
 		return
 	}
@@ -295,7 +295,7 @@ func (s *Service) establish(ctx context.Context, userID pgtype.UUID) error {
 func (s *Service) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	if err := s.sessions.Destroy(r.Context()); err != nil {
 		s.log.ErrorContext(r.Context(), "destroy session", slog.Any("error", err))
-		http.Error(w, "logout failed", http.StatusInternalServerError)
+		writeAuthError(w, http.StatusInternalServerError, codeInternal, "logout failed")
 
 		return
 	}
@@ -572,4 +572,47 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// Error codes for /api/v1/auth/* failures.
+//
+// internal/api owns the closed error-code vocabulary the SPA and CLI branch on
+// (api.CodeBadRequest, api.CodeUnauthorized, ...), but this package CANNOT import
+// it: internal/api imports internal/auth, so the dependency only runs one way. The
+// OIDC handlers live here rather than in the api layer, so the codes they emit are
+// restated here and MUST stay equal to their api.CodeX counterparts. A refactor
+// that reworded one and not the other would silently break a client's `switch
+// error.code`; TestAuthErrorEnvelope pins the strings.
+const (
+	codeBadRequest   = "bad_request"    // api.CodeBadRequest
+	codeUnauthorized = "unauthorized"   // api.CodeUnauthorized
+	codeForbidden    = "forbidden"      // api.CodeForbidden
+	codeInternal     = "internal_error" // api.CodeInternal
+)
+
+// authErrorBody mirrors api.ErrorBody on the wire, byte for byte, so every non-2xx
+// under /api/v1 -- including the OIDC handlers, which the api package delegates to
+// with its `raw` wrapper and never wraps in its own envelope -- is the one shape a
+// client can `res.json()` and read `.error.code` from. A text/plain http.Error body
+// here would make a SPA that does `const {error} = await res.json()` throw a parse
+// error instead of branching on the code.
+type authErrorBody struct {
+	Error authErrorDetail `json:"error"`
+}
+
+type authErrorDetail struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// writeAuthError renders the shared error envelope. It is the http.Error of this
+// package: same call shape (writer, status, message) plus the machine-readable code
+// the envelope requires.
+func writeAuthError(w http.ResponseWriter, status int, code, message string) {
+	// A 401 must advertise how to authenticate, exactly as api.writeError does.
+	if status == http.StatusUnauthorized {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="bakery"`)
+	}
+
+	writeJSON(w, status, authErrorBody{Error: authErrorDetail{Code: code, Message: message}})
 }

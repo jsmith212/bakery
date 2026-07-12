@@ -78,8 +78,21 @@ func TestCreateOrgRejectsReservedSlugs(t *testing.T) {
 					w.Code, http.StatusUnprocessableEntity, reserved)
 			}
 
-			if got := decodeErr(t, w).Code; got != CodeReservedSlug {
-				t.Errorf("error code = %q, want %q", got, CodeReservedSlug)
+			detail := decodeErr(t, w)
+			if detail.Code != CodeReservedSlug {
+				t.Errorf("error code = %q, want %q", detail.Code, CodeReservedSlug)
+			}
+
+			// The message must name the OFFENDING SLUG, not the field. The bug was
+			// fmt.Sprintf(..., field), which produced the self-referential nonsense
+			// `"slug" is reserved`, telling the user the word "slug" is reserved
+			// rather than that "cache" is.
+			if !strings.Contains(detail.Message, `"`+reserved+`"`) {
+				t.Errorf("message %q does not name the offending slug %q", detail.Message, reserved)
+			}
+
+			if strings.Contains(detail.Message, `"slug"`) && reserved != "slug" {
+				t.Errorf("message %q names the field, not the value: %q", detail.Message, reserved)
 			}
 
 			// And nothing was written. A 422 that still created the org would be a

@@ -15,9 +15,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/alexedwards/scs/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -319,6 +321,72 @@ func (f *fakeKeyStore) touchKeys(_ context.Context, ids []pgtype.UUID) error {
 	f.touched = append(f.touched, ids...)
 
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// fakeSessionStore: an in-memory scs.Store whose Delete can be armed to fail, so
+// the session-handler error paths (HandleLogout's 500) can be driven without a
+// database. It stores data in a map so a real login can be established against it
+// and the session token loaded back on the next request.
+// ---------------------------------------------------------------------------
+
+type fakeSessionStore struct {
+	mu        sync.Mutex
+	data      map[string][]byte
+	deleteErr error // when non-nil, Delete fails -- HandleLogout must 500
+}
+
+func newFakeSessionStore() *fakeSessionStore {
+	return &fakeSessionStore{data: map[string][]byte{}, deleteErr: nil}
+}
+
+// The compiler pins the contract, exactly as SessionStore does for the real one.
+var (
+	_ scs.Store    = (*fakeSessionStore)(nil)
+	_ scs.CtxStore = (*fakeSessionStore)(nil)
+)
+
+func (f *fakeSessionStore) FindCtx(_ context.Context, token string) ([]byte, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	b, ok := f.data[token]
+
+	return b, ok, nil
+}
+
+func (f *fakeSessionStore) CommitCtx(_ context.Context, token string, b []byte, _ time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.data[token] = b
+
+	return nil
+}
+
+func (f *fakeSessionStore) DeleteCtx(_ context.Context, token string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+
+	delete(f.data, token)
+
+	return nil
+}
+
+func (f *fakeSessionStore) Find(token string) ([]byte, bool, error) {
+	return f.FindCtx(context.Background(), token)
+}
+
+func (f *fakeSessionStore) Commit(token string, b []byte, expiry time.Time) error {
+	return f.CommitCtx(context.Background(), token, b, expiry)
+}
+
+func (f *fakeSessionStore) Delete(token string) error {
+	return f.DeleteCtx(context.Background(), token)
 }
 
 // uuid makes a deterministic, valid pgtype.UUID from a byte, for table tests.

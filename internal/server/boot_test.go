@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -175,6 +177,14 @@ func TestBootEndToEnd(t *testing.T) {
 		t.Errorf("metrics port did not serve the exposition")
 	}
 
+	// The storage layer must actually be WIRED at boot, not just configured: if
+	// Boot never constructs the byte store, --storage-dir is dead config and the
+	// bakery_storage_* family never appears. The instrumented store pre-registers
+	// its op series at zero, so this line proves the store was built.
+	if body := get(t, private+"/metrics"); !strings.Contains(body, `bakery_storage_operations_total{driver="local",op="put",result="hit"} 0`) {
+		t.Errorf("metrics port did not expose the local storage series -- the byte store was not wired at boot")
+	}
+
 	if body := get(t, public+"/metrics"); strings.Contains(body, "bakery_auth_attempts_total") {
 		t.Error("the PUBLIC listener served the metrics exposition")
 	}
@@ -260,6 +270,73 @@ func TestBootRefusesASecondInstance(t *testing.T) {
 
 	cancel()
 	<-first
+}
+
+// TestBootRejectsAnUnusableStorageDir proves --storage-dir is LIVE config, not
+// decoration: an unwritable or nonsensical path must be a loud boot failure, not a
+// green boot that EACCESes the first time a cache backend writes an object.
+//
+// The bad path is chosen so it fails for every uid, root included: it is a
+// directory nested UNDER a regular file, so the store's MkdirAll gets ENOTDIR
+// rather than a permission error a root-run CI would sail past.
+func TestBootRejectsAnUnusableStorageDir(t *testing.T) {
+	t.Parallel()
+
+	_, dsn := dbtest.NewWithDSN(t)
+
+	notADir := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
+		t.Fatalf("seed a regular file: %v", err)
+	}
+
+	// A path whose parent is a file: MkdirAll cannot create it (ENOTDIR) no matter
+	// who runs the test.
+	badDir := filepath.Join(notADir, "objects")
+
+	// Boot must FAIL, and must fail before it binds a listener. Run it in a
+	// goroutine with its own cancelable context so that a regression -- Boot
+	// sailing past the storage dir and serving forever -- is a prompt test failure
+	// (Ready fires, or the deadline elapses) rather than a ten-minute package hang.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	ready := make(chan struct{}, 1)
+	done := make(chan error, 1)
+
+	go func() {
+		done <- Boot(ctx, BootParams{
+			Cmd: config.ServeCmd{
+				DBFlags:         config.DBFlags{DBURL: dsn},
+				Host:            "127.0.0.1",
+				Port:            0,
+				MetricsAddr:     "127.0.0.1:0",
+				StorageDir:      badDir,
+				DevLoginEnabled: true,
+			},
+			Version: "test",
+			Dist:    testDist(),
+			// If Boot ever binds a listener with this storage dir, it validated nothing.
+			Ready: func(_, _ net.Addr) { ready <- struct{}{} },
+		})
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Boot returned nil for an unusable --storage-dir; the directory was never constructed or probed")
+		}
+
+		if !strings.Contains(err.Error(), "storage") {
+			t.Fatalf("Boot: got %v, want a storage-directory failure", err)
+		}
+	case <-ready:
+		cancel()
+		<-done
+		t.Fatal("Boot bound a listener with an unusable --storage-dir; the path was never validated")
+	case <-time.After(30 * time.Second):
+		cancel()
+		t.Fatal("Boot neither failed nor became ready with an unusable --storage-dir")
+	}
 }
 
 // do issues one API call. token, when set, is presented as a Bearer API key; body,

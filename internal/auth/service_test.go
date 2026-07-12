@@ -1,7 +1,10 @@
 package auth
 
 import (
+	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/jsmith212/bakery/internal/db/repository"
+	"github.com/jsmith212/bakery/internal/metrics"
 )
 
 // seedMember gives the reconciled user a project and a membership at role, and
@@ -408,6 +412,114 @@ func TestCallbackRejectsAForgedState(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("callback with a forged state = %d, want 400", rec.Code)
+	}
+
+	// The refusal is the shared JSON envelope, not a text/plain http.Error body:
+	// the SPA drives this over fetch and decodes every non-2xx from /api/v1 the same
+	// way. A bare-text body makes `await res.json()` throw instead of branching.
+	assertAuthErrorEnvelope(t, rec.Result(), codeBadRequest)
+}
+
+// assertAuthErrorEnvelope pins the contract that every /api/v1/auth/* non-2xx is
+// the same JSON error envelope internal/api emits: Content-Type application/json,
+// a body that decodes cleanly to {"error":{"code","message"}}, and the expected
+// machine-readable code. This is the assertion a text/plain http.Error body fails.
+func assertAuthErrorEnvelope(t *testing.T, res *http.Response, wantCode string) {
+	t.Helper()
+
+	if ct := res.Header.Get("Content-Type"); ct != "application/json; charset=utf-8" {
+		t.Errorf("Content-Type = %q, want the JSON envelope's %q", ct, "application/json; charset=utf-8")
+	}
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	_ = res.Body.Close()
+
+	// This is exactly what a client's `await res.json()` does. A text/plain body
+	// ("logout failed\n") fails right here, which is the bug.
+	var env authErrorBody
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("body is not the JSON error envelope (a client's res.json() would throw): %v\nbody: %q", err, body)
+	}
+
+	if env.Error.Code != wantCode {
+		t.Errorf("error.code = %q, want %q (clients branch on the code, never the message)", env.Error.Code, wantCode)
+	}
+
+	if env.Error.Message == "" {
+		t.Error("error.message is empty; the envelope must carry a human-readable message")
+	}
+}
+
+// TestLogoutRendersTheErrorEnvelope: when Destroy fails, HandleLogout must return
+// the shared JSON envelope with a 500, not a bare text/plain http.Error body.
+//
+// This is the exact reproduction from the finding: a session store whose Delete is
+// broken, driven through the real LoadAndSave -> HandleLogout chain. The happy path
+// (204, empty) is asserted alongside it so the test also proves the envelope is
+// reserved for the failure.
+func TestLogoutRendersTheErrorEnvelope(t *testing.T) {
+	t.Parallel()
+
+	store := newFakeSessionStore()
+
+	svc := &Service{
+		sessions: NewSessionManager(store, false),
+		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metrics:  metrics.New(),
+	}
+
+	// Establish a real session so logout has a token to destroy. Without one, Destroy
+	// is a no-op and never reaches the store.
+	seedRec := httptest.NewRecorder()
+	svc.LoadAndSave(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		if err := svc.sessions.RenewToken(r.Context()); err != nil {
+			t.Fatalf("seed RenewToken: %v", err)
+		}
+
+		svc.sessions.Put(r.Context(), sessionUserKey, uuid(0x01).String())
+	})).ServeHTTP(seedRec, httptest.NewRequest(http.MethodGet, "/api/v1/seed", nil))
+
+	var sessionCookie *http.Cookie
+
+	for _, c := range seedRec.Result().Cookies() {
+		if c.Name == "bakery_session" {
+			sessionCookie = c
+		}
+	}
+
+	if sessionCookie == nil {
+		t.Fatal("seed did not set a session cookie; the test cannot exercise logout")
+	}
+
+	logout := func() *http.Response {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
+		req.AddCookie(sessionCookie)
+		svc.LoadAndSave(http.HandlerFunc(svc.HandleLogout)).ServeHTTP(rec, req)
+
+		return rec.Result()
+	}
+
+	// Arm the failure and log out.
+	store.deleteErr = errFake
+
+	res := logout()
+	if res.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("logout with a broken store = %d, want 500", res.StatusCode)
+	}
+
+	assertAuthErrorEnvelope(t, res, codeInternal)
+
+	// And the happy path is a clean 204 with no body -- the envelope is for failures.
+	store.deleteErr = nil
+
+	ok := logout()
+	if ok.StatusCode != http.StatusNoContent {
+		t.Fatalf("a successful logout = %d, want 204", ok.StatusCode)
 	}
 }
 

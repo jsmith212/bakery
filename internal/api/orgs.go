@@ -81,7 +81,7 @@ func (a *API) handleCreateOrg(w http.ResponseWriter, r *http.Request) error {
 	// is deliberately not the only guard: the CHECK still fires if this is ever
 	// skipped, on any writer, including a psql session.
 	if err := slug.Check(req.Slug); err != nil {
-		return errSlug("slug", err)
+		return errSlug("slug", req.Slug, err)
 	}
 
 	if req.Name == "" {

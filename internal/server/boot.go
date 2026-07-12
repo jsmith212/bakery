@@ -14,6 +14,7 @@ import (
 	"github.com/jsmith212/bakery/internal/config"
 	"github.com/jsmith212/bakery/internal/db"
 	"github.com/jsmith212/bakery/internal/metrics"
+	"github.com/jsmith212/bakery/internal/storage"
 )
 
 const (
@@ -97,6 +98,21 @@ func Boot(ctx context.Context, p BootParams) error {
 		return fmt.Errorf("register pool collector: %w", err)
 	}
 
+	// The byte store. Constructing it here is load-bearing even though no cache
+	// backend reads it yet in M1: NewLocal creates and probes --storage-dir, so a
+	// typo'd or unwritable path is a LOUD boot failure rather than an EACCES the
+	// first time M2 tries to write an object into a directory that was never
+	// there. The instrumented decorator both times every future storage call and
+	// makes bakery_storage_operations_total exist from boot.
+	localStore, err := storage.NewLocal(cmd.StorageDir)
+	if err != nil {
+		return fmt.Errorf("prepare storage directory: %w", err)
+	}
+
+	byteStore := storage.NewInstrumented(localStore, m, metrics.DriverLocal)
+
+	log.Info("storage ready", "driver", metrics.DriverLocal, "root", localStore.Root())
+
 	store := db.NewStore(pool)
 
 	authSvc, sessions, err := buildAuth(ctx, cmd, store, m, log)
@@ -148,6 +164,7 @@ func Boot(ctx context.Context, p BootParams) error {
 		API:         apiSrv.Handler(),
 		Pool:        pool,
 		Metrics:     m,
+		Storage:     byteStore,
 		Ready:       p.Ready,
 	}).Run(ctx)
 }

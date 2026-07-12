@@ -31,6 +31,7 @@ import (
 	"github.com/jsmith212/bakery/internal/api"
 	"github.com/jsmith212/bakery/internal/metrics"
 	"github.com/jsmith212/bakery/internal/middleware"
+	"github.com/jsmith212/bakery/internal/storage"
 )
 
 const (
@@ -72,6 +73,14 @@ type Config struct {
 
 	// Metrics is served on MetricsAddr and nowhere else.
 	Metrics *metrics.Metrics
+
+	// Storage is the byte store the cache backends will write through. M1 has no
+	// backend yet, so nothing READS it here -- but constructing it is what turns a
+	// bad --storage-dir into a boot failure instead of a latent EACCES on the first
+	// object written, and holding it on the server keeps the instrumented series
+	// alive for the lifetime of the process. Nil is permitted only in tests that
+	// exercise the static routes without a store.
+	Storage storage.Store
 
 	// Ready, when set, is called once BOTH listeners are bound and before either
 	// serves, with the addresses they actually got. It exists because port 0 is the

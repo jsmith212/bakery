@@ -158,14 +158,14 @@ func (s *Service) HandleDevLogin(w http.ResponseWriter, r *http.Request) {
 	userID, err := s.seedDevUser(ctx)
 	if err != nil {
 		s.log.ErrorContext(ctx, "dev login seed failed", slog.Any("error", err))
-		http.Error(w, "dev login failed", http.StatusInternalServerError)
+		writeAuthError(w, http.StatusInternalServerError, codeInternal, "dev login failed")
 
 		return
 	}
 
 	if err := s.establish(ctx, userID); err != nil {
 		s.log.ErrorContext(ctx, "dev login session failed", slog.Any("error", err))
-		http.Error(w, "dev login failed", http.StatusInternalServerError)
+		writeAuthError(w, http.StatusInternalServerError, codeInternal, "dev login failed")
 
 		return
 	}

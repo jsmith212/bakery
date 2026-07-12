@@ -112,7 +112,7 @@ func (a *API) handleCreateProject(w http.ResponseWriter, r *http.Request) error 
 	// `cas` would make /cache/{org}/cas/... ambiguous with the Bazel CAS namespace,
 	// and `sstate`, `ac` and `blobs` are all live segments of the cache grammar.
 	if err := slug.Check(req.Slug); err != nil {
-		return errSlug("slug", err)
+		return errSlug("slug", req.Slug, err)
 	}
 
 	if req.Name == "" {

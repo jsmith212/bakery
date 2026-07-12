@@ -48,10 +48,6 @@ type Store interface {
 	) (repository.ProjectMembership, error)
 	DeleteProjectMembership(ctx context.Context, arg repository.DeleteProjectMembershipParams) (int64, error)
 
-	// Users. ListUsers is how an email in an invite becomes a user id; users are
-	// JIT-provisioned at first login, so a member must already have signed in once.
-	ListUsers(ctx context.Context) ([]repository.User, error)
-
 	// API keys. Note what is ABSENT: there is no query that returns a token or a
 	// hash, because the schema has no plaintext column and this interface does not
 	// expose token_sha256. "Shown exactly once" is not a discipline here, it is a
@@ -61,8 +57,10 @@ type Store interface {
 	) ([]repository.ListAPIKeysForProjectRow, error)
 	RevokeAPIKey(ctx context.Context, id pgtype.UUID) (int64, error)
 
-	// Cache backends.
-	GetBackend(ctx context.Context, arg repository.GetBackendParams) (repository.GetBackendRow, error)
+	// Cache backends. Reads go through ListBackendsForProject (a project has at most
+	// a handful of backends) so every row carries its full column set -- created_at
+	// and updated_at included. A single-kind GetBackend projection used to omit the
+	// timestamps and the detail endpoint serialized the zero time.
 	ListBackendsForProject(ctx context.Context, projectID pgtype.UUID) ([]repository.CacheBackend, error)
 	CreateBackend(ctx context.Context, arg repository.CreateBackendParams) (repository.CacheBackend, error)
 	UpdateBackend(ctx context.Context, arg repository.UpdateBackendParams) (repository.CacheBackend, error)

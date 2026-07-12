@@ -106,12 +106,16 @@ func errInternal(msg string, cause error) *apiError {
 // errSlug turns a slug.Check failure into the right 4xx. The database CHECK is
 // the authority (bakery_slug_ok); this only buys a friendly message instead of a
 // raw 23514, so it must never be the ONLY place a slug is validated.
-func errSlug(field string, err error) *apiError {
+//
+// value is the offending slug the caller sent, NOT the field name: the message has
+// to name what is wrong ("cache" is reserved), and interpolating `field` instead
+// produced the self-referential nonsense `"slug" is reserved`.
+func errSlug(field, value string, err error) *apiError {
 	switch {
 	case errors.Is(err, slug.ErrReserved):
 		return &apiError{
 			status: http.StatusUnprocessableEntity, code: CodeReservedSlug, field: field,
-			message: fmt.Sprintf("%q is reserved by the cache URL grammar and cannot be used as a slug", field),
+			message: fmt.Sprintf("%q is reserved by the cache URL grammar and cannot be used as a slug", value),
 			cause:   err,
 		}
 	case errors.Is(err, slug.ErrInvalid):
@@ -182,6 +186,18 @@ const (
 	pgCheckViolation      = "23514"
 	pgForeignKeyViolation = "23503"
 )
+
+// isPGCode reports whether err wraps a Postgres error with the given SQLSTATE.
+//
+// It lets a handler recognise a specific constraint violation and return an
+// endpoint-specific message BEFORE toAPIError's generic mapping runs -- the generic
+// 23505/23503 messages are written for the slug and membership tables and are
+// actively misleading on, say, a cache-backend uniqueness conflict.
+func isPGCode(err error, code string) bool {
+	var pg *pgconn.PgError
+
+	return errors.As(err, &pg) && pg.Code == code
+}
 
 // writeError renders an error onto the wire and logs it.
 //
