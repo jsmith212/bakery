@@ -55,6 +55,21 @@ run: web generate
 test: web generate web-test
   go test -v ./...
 
+# Run every Go test and FAIL if any of them SKIPPED (a skipped suite is not a passing suite)
+test-db: generate
+  # dbtest SKIPS -- it does not fail -- when it can find neither docker nor
+  # TEST_DB_URL. That is right on a laptop and catastrophic in CI: the entire
+  # database half of the suite would go green without executing a single query,
+  # and nothing in the log would say so. So CI runs THIS recipe, where a skip is
+  # a failure.
+  #
+  # bash, and pipefail, on purpose: with `sh` the exit status of `go test | tee`
+  # is tee's, so a failing test would be reported as a pass.
+  mkdir -p build
+  bash -euo pipefail -c 'go test -v -count=1 ./internal/... 2>&1 | tee build/test-db.log'
+  ! grep -q -- '--- SKIP' build/test-db.log || { grep -- '--- SKIP' build/test-db.log; echo 'FAIL: tests were SKIPPED. They did not run, so they did not pass. Start docker, or export TEST_DB_URL.'; exit 1; }
+  @echo "no skipped tests"
+
 # Run the race detector
 race: web generate
   go test -race ./...

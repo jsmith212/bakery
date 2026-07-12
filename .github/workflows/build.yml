@@ -83,6 +83,15 @@ jobs:
       - name: Build
         run: just build
 
+      # `just test-db` fails the job if ANY test skipped. dbtest skips -- it does
+      # not fail -- when it can reach neither docker nor TEST_DB_URL, so without
+      # this the whole database half of the suite could go green in CI without
+      # executing a single query, and the log would not say so. The skip check is
+      # the only thing that proves the postgres service above is actually wired to
+      # the tests.
+      - name: Tests (DB-backed; a skip fails the job)
+        run: just test-db
+
       - name: Coverage
         run: just coverage
 
@@ -91,6 +100,13 @@ jobs:
         with:
           name: coverage-report
           path: build/coverage*
+
+      - name: Upload the test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log
+          path: build/test-db.log
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
