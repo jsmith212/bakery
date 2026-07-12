@@ -473,18 +473,22 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("RemoveProjectMember: %v", err)
 	}
 
-	// DeleteProject is NOT exercised here, and that is a finding, not an omission.
-	//
-	// `DELETE /orgs/{org}/projects/{project}` is registered AccessOrgAdmin, and
-	// api.resolve() populates scope.ProjectID only when access >= AccessProjectRead
-	// (see Access.needsProject). So handleDeleteProject calls DeleteProject with the
-	// ZERO uuid, matches no row, and returns 404 -- for every caller, including a
-	// site admin who owns the org. The route cannot work.
-	//
-	// The fix is one word in internal/api (register it AccessProjectAdmin, which
-	// also resolves the project), and internal/api is outside this task's write
-	// boundary, so it is reported rather than patched here. `bakery project delete`
-	// sends the right request and starts working the moment the route is fixed.
+	// DeleteProject works end to end. It did NOT before: the route is registered
+	// AccessOrgAdmin, and the guard used to resolve {project} only for access levels
+	// at or above AccessProjectRead -- so scope.ProjectID stayed the zero uuid,
+	// handleDeleteProject issued `DELETE ... WHERE id = NULL`, matched no row, and
+	// 404'd for every caller including the org's own owner. The guard now resolves
+	// {project} from the path pattern regardless of the Access level, so an org
+	// admin/owner can destroy a project -- exactly what `bakery project delete` does.
+	if err := c.DeleteProject(ctx, testOrg, "yocto"); err != nil {
+		t.Fatalf("DeleteProject: %v", err)
+	}
+
+	// It is really gone: the project no longer resolves.
+	if _, err := c.GetProject(ctx, testOrg, "yocto"); err == nil {
+		t.Error("GetProject succeeded after DeleteProject; the project was not deleted")
+	}
+
 	if err := c.DeleteOrg(ctx, "widgets-co"); err != nil {
 		t.Fatalf("DeleteOrg: %v", err)
 	}

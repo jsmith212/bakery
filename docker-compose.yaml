@@ -23,10 +23,12 @@ services:
       - bakery-data:/var/lib/bakery
       # GROUP_MAP_FILE. Site and org roles are derived from OIDC group claims via
       # this file, so it IS the authorization policy; a malformed one is a boot
-      # failure, not a warning. Copy groups.example.json and edit it. Commented out
-      # because a bind mount of a file that does not exist makes docker create a
-      # DIRECTORY at that path, and the resulting boot error ("is a directory")
-      # sends you looking in the wrong place entirely.
+      # failure, not a warning. Commented out because a bind mount of a file that
+      # does not exist makes docker create a DIRECTORY at that path, and the boot
+      # error ("is a directory") sends you looking in the wrong place entirely --
+      # and because GROUP_MAP_FILE ships commented out in stack.env.tmpl to match.
+      # Enabling group mapping is the three-part act documented next to
+      # GROUP_MAP_FILE in stack.env.tmpl; this mount is step 2 of it.
       # - ./groups.json:/etc/bakery/groups.json:ro
 
     # Still no healthcheck, and it is still deliberate. The image is
@@ -55,8 +57,15 @@ services:
       interval: 1s
       timeout: 5s
       retries: 5
+    # BOUND TO LOOPBACK ON PURPOSE. bakery reaches the database over the compose
+    # network (DB_URL host is `db`), so the stack needs nothing published here. A
+    # bare "5432:5432" binds 0.0.0.0 -- on any host with a public NIC that puts the
+    # database, holding every session, api_key hash and org/project row, one weak
+    # POSTGRES_PASSWORD away from the internet. 127.0.0.1 keeps the port reachable
+    # for a local `psql`/debugger and nothing else. To scrape it from another host,
+    # widen this deliberately; do not drop the 127.0.0.1.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     env_file:
       - stack.env
     # Postgres 18 moved PGDATA to a major-version-specific subdirectory

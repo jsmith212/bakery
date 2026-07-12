@@ -46,9 +46,13 @@ add-migration migration:
 build: web generate
   CGO_ENABLED=0 go build -o ./build/bakery .
 
-# Run the server
+# Run the server (needs Postgres: `just db-up` then export DB_URL -- see the README)
 run: web generate
-  go run .
+  # `serve` is not optional: the binary is also the API client, so `go run .` with
+  # no verb is a Kong usage error, not a server. serve reads DB_URL (and the rest)
+  # from the environment; it does not load stack.env, which is the compose stack's
+  # file and whose DB host is `db`, not localhost.
+  go run . serve
 
 # Run unit tests (Go + frontend). DB tests spawn an ephemeral Postgres via docker,
 # or use TEST_DB_URL if it is exported.

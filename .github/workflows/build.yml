@@ -92,6 +92,16 @@ jobs:
       - name: Tests (DB-backed; a skip fails the job)
         run: just test-db
 
+      # The race detector is the ONLY thing that enforces the concurrency tests'
+      # reason to exist: TestLRU_ConcurrentAccessIsRaceFree has no assertions, and
+      # TestRefcountRace_IncrefDecrefDelete's value is what -race reports while the
+      # goroutines contend. `just test-db` and `just coverage` both run without
+      # -race, so without this step an unsynchronised int64 counter or a torn read
+      # of a Meta value sails through CI green. TEST_DB_URL is set for this job, so
+      # the DB-backed race test runs against the postgres service too.
+      - name: Race
+        run: just race
+
       - name: Coverage
         run: just coverage
 

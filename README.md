@@ -14,14 +14,36 @@ for the image and compose stack.
 
 ## Quickstart
 
+M1 needs Postgres: the server takes an advisory boot lock, applies its embedded migrations, and only
+then binds a listener, so it will not start without a database. The local loop is:
+
 ```sh
 just bootstrap        # install the pre-commit hooks
-cp stack.env.tmpl stack.env
-just run              # builds the frontend, then runs the server
+
+just db-up            # ephemeral Postgres on 127.0.0.1:5432; prints the export line below
+export DB_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+export DEV_LOGIN_ENABLED=true   # optional: seeds a dev site admin + an unauthenticated dev-login
+                                # endpoint so you can get a session with no OIDC provider. Dev only.
+
+just run              # builds the frontend, migrates, then `bakery serve`
 ```
 
-The server listens on `$HOST:$PORT` (default `0.0.0.0:8080`) and serves `GET /healthz` plus the
-embedded SPA at `/`.
+`DB_URL` is required — `bakery serve` refuses to start without it — and `just run` does **not** read
+`stack.env` (that file is the compose stack's, and its DB host is `db`, not localhost), so export the
+variables into your shell. When you are done, `just db-down` removes the test database.
+
+The server listens on `$HOST:$PORT` (default `0.0.0.0:8080`) and serves the control-plane API under
+`/api/v1`, the embedded SPA at `/`, and the liveness/readiness probes `GET /healthz` and `GET /readyz`
+(`/readyz` really does ping the pool). Metrics live on a **separate**, loopback-by-default listener
+(`--metrics-addr`, default `127.0.0.1:9090`); `/metrics` leaks org and project slugs and byte counts,
+so it is deliberately never on the public listener.
+
+Migrations are applied automatically at boot, but you can also drive them directly with
+`bakery migrate up`, `bakery migrate down --yes`, and `bakery migrate version` (each takes `DB_URL`).
+
+To run the full stack in containers instead, `cp stack.env.tmpl stack.env`, fill in
+`POSTGRES_PASSWORD` and the matching password in `DB_URL`, then `just start` (`just stop` to tear it
+down). See the comments in `stack.env.tmpl` for the OIDC and group-map settings.
 
 ## Common tasks
 
