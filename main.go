@@ -7,9 +7,11 @@ import (
 	"log/slog"
 	"os"
 	"runtime/debug"
+	"strings"
 
 	"github.com/alecthomas/kong"
 
+	clicmd "github.com/jsmith212/bakery/internal/cli"
 	"github.com/jsmith212/bakery/internal/config"
 	"github.com/jsmith212/bakery/internal/db"
 	"github.com/jsmith212/bakery/internal/server"
@@ -30,14 +32,59 @@ func main() {
 
 	kctx := kong.Parse(&cli,
 		kong.Name("bakery"),
-		kong.Description("A multi-tenant build cache server."),
+		kong.Description("A multi-tenant build cache server, and its API client."),
 		kong.UsageOnError(),
 	)
 
-	if err := run(kctx.Command(), cli); err != nil {
-		slog.Error("fatal", "error", err)
+	if err := run(commandPath(kctx), cli); err != nil {
+		fail(err)
+	}
+}
+
+// fail reports a fatal error and exits.
+//
+// The SERVER's errors go through slog, because they are read out of a log
+// aggregator. A CLIENT's errors are read by a person looking at their terminal
+// two lines below the command they just typed, and a JSON envelope with a
+// timestamp and a level is worse than a sentence. `bakery key list` against an
+// expired token prints "not signed in to this server: run bakery login", and
+// nothing else.
+func fail(err error) {
+	var ce clientError
+
+	if errors.As(err, &ce) {
+		fmt.Fprintln(os.Stderr, "bakery: "+ce.err.Error())
 		os.Exit(1)
 	}
+
+	slog.Error("fatal", "error", err)
+	os.Exit(1)
+}
+
+// clientError marks an error as coming from a client command, so fail renders it
+// for a human rather than for a log aggregator.
+type clientError struct{ err error }
+
+func (e clientError) Error() string { return e.err.Error() }
+func (e clientError) Unwrap() error { return e.err }
+
+// commandPath is the selected command as a space-joined path of command names.
+//
+// kong.Context.Command() would also splice in the positional arguments -- it
+// renders `bakery org create acme` as "org create <slug>" -- which makes the
+// dispatch switch below depend on the spelling of every argument. Joining only
+// the command nodes means renaming an argument cannot silently route a command
+// into the default case.
+func commandPath(kctx *kong.Context) string {
+	parts := make([]string, 0, len(kctx.Path))
+
+	for _, p := range kctx.Path {
+		if p.Command != nil {
+			parts = append(parts, p.Command.Name)
+		}
+	}
+
+	return strings.Join(parts, " ")
 }
 
 func run(command string, cli config.CLI) error {
@@ -57,7 +104,13 @@ func run(command string, cli config.CLI) error {
 
 		return nil
 	default:
-		return fmt.Errorf("unknown command: %q", command)
+		// Everything else is a client command. It needs no database pool and no
+		// server config -- just an HTTP client and the token cache.
+		if err := clicmd.Run(ctx, command, cli); err != nil {
+			return clientError{err: err}
+		}
+
+		return nil
 	}
 }
 
