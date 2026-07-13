@@ -50,10 +50,18 @@ func (a *API) handleListOrgMembers(w http.ResponseWriter, r *http.Request) error
 //
 // # Why this endpoint exists only to say no
 //
-// Org roles (and the site role) are 100% derived from OIDC group claims and are
-// RECONCILED ON EVERY LOGIN: auth.Service.Reconcile computes the user's whole org
-// set from the group map and then calls ReconcileOrgMembershipsRemove with that
-// set as the keep-list, deleting everything else. The reconciler owns the table.
+// STALE, AND ONLY UNTIL THE NEXT COMMIT. Since the hybrid role model landed, org
+// membership has TWO sources -- an OIDC half and a local half -- and the reconciler
+// owns only the first: it writes oidc_role/oidc_group, deletes a membership solely
+// when NEITHER source justifies it, and cannot touch local_role at all. Granting a
+// role in-app is therefore no longer a change the next login reverts, which is the
+// whole premise of the refusal below. The endpoint that grants it is the next task
+// in docs/design/specs/2026-07-12-hybrid-role-model-plan.md; this handler and this
+// comment go with it.
+//
+// What follows is the M1 reasoning, preserved because it explains what the local
+// half had to be built to be safe FROM. In M1, org roles were 100% claim-derived
+// and reconciled on every login, so:
 //
 // So an API that let an admin hand-edit an org role would produce one of exactly
 // two outcomes, and both are bad:

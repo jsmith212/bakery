@@ -25,6 +25,11 @@ const (
 	DevDisplayName = "Dev"
 	DevOrgSlug     = "dev-org"
 	DevProjectSlug = "playground"
+
+	// DevLoginGroup is what the dev membership records in oidc_group. The dev login
+	// is a synthetic CLAIM, not a local grant: it is written to the OIDC half so it
+	// reconciles away like any other, and the audit trail says where it came from.
+	DevLoginGroup = "dev-login"
 )
 
 // DevLoginEnabled reports the flag. It is READ here and set NOWHERE: the only
@@ -91,9 +96,10 @@ func (s *Service) seedDevUser(ctx context.Context) (pgtype.UUID, error) {
 		// oidc_role: the dev login is a synthetic CLAIM, not a local grant. It must
 		// reconcile away like any other claim-derived membership.
 		if err := q.ReconcileOrgMembershipUpsert(ctx, repository.ReconcileOrgMembershipUpsertParams{
-			UserID:   user.ID,
-			OrgID:    orgID,
-			OidcRole: repository.NullOrgRole{OrgRole: OrgRoleOwner, Valid: true},
+			UserID:    user.ID,
+			OrgID:     orgID,
+			OidcRole:  repository.NullOrgRole{OrgRole: OrgRoleOwner, Valid: true},
+			OidcGroup: pgtype.Text{String: DevLoginGroup, Valid: true},
 		}); err != nil {
 			return fmt.Errorf("upsert dev org membership: %w", err)
 		}

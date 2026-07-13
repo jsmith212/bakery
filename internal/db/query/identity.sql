@@ -37,9 +37,14 @@ SELECT * FROM users WHERE issuer = $1 AND subject = $2;
 -- name: ListUsers :many
 SELECT * FROM users ORDER BY email;
 
--- ORG MEMBERSHIP RECONCILIATION -- the security-critical write. Org roles are
--- 100% claim-derived, so the reconciler owns the whole set for that user. Run both
--- statements in ONE transaction.
+-- ORG MEMBERSHIP RECONCILIATION -- the security-critical write.
+--
+-- Org membership is HYBRID since 000008: an OIDC half the claims own, and a local
+-- half the API owns. The reconciler owns EXACTLY ONE of them. These three queries
+-- run in ONE transaction and among them they name oidc_role and oidc_group and
+-- nothing else -- never local_role, never granted_by, never granted_at, never
+-- project_memberships. A local grant survives a login because the reconciler does
+-- not name the column that holds it. That is structural, not conventional.
 --
 -- The DELETE cascades org_memberships -> project_memberships -> api_keys: a user
 -- dropped from an OIDC group loses EVERY key they hold anywhere in that org, in one
@@ -47,36 +52,59 @@ SELECT * FROM users ORDER BY email;
 -- ever be revoked without a live group lookup?" -- it is revoked at RECONCILIATION
 -- time, not at validation time.
 --
--- FAIL CLOSED: if the group claim is ABSENT or maps to ZERO orgs, do NOT run this
--- with an empty array -- REJECT THE LOGIN. Azure AD truncates >200 groups into a
--- _claim_names overage, and an empty keep-set here would silently and irreversibly
--- wipe every project role and API key the user has. Re-adding the org membership
--- does NOT restore them. This guard is mandatory.
+-- FAIL CLOSED, IN THE CALLER: if the groups claim is UNREADABLE (absent, or an
+-- Azure AD `_claim_names` overage), do not call these AT ALL -- refuse the login.
+-- An unreadable claim is not an empty keep-set; it is no answer. A genuinely empty
+-- claim (`groups: []`) IS an answer and an empty keep-set is exactly right for it:
+-- reconcile the OIDC half away and leave every local grant standing.
+
+-- Removes the memberships NOTHING justifies any more: the claims have dropped them
+-- and no local grant stands in their place. This is the revocation half of the
+-- design, and the `local_role IS NULL` guard is what keeps it from being the
+-- destruction half.
 --
--- INCOMPLETE SINCE 000008, AND DELIBERATELY LEFT SO. This DELETE is blind to
--- local_role: it removes every row outside the keep-set regardless of whether a
--- local grant justifies it, which is precisely what the hybrid model forbids. It
--- is still CORRECT TODAY only because nothing can write local_role yet -- no API
--- path grants one -- so there is no local grant for it to destroy.
+-- IT MUST RUN BEFORE the UPDATE below, and that order is a schema fact, not a
+-- preference: `role` is GENERATED NOT NULL AS greatest(oidc_role, local_role), so
+-- NULLing oidc_role on a row with no local grant makes the generated column NULL
+-- and Postgres rejects the statement with 23502. The rows this DELETE removes are
+-- precisely the rows that UPDATE could not have touched.
 --
--- It MUST be replaced (set oidc_role/oidc_group to NULL, then delete the row iff
--- local_role IS NULL) BEFORE any endpoint writes local_role, or the first local
--- grant a user receives is silently cascade-deleted by their next login, taking
--- their project roles and API keys with it. See the reconciler task in
--- docs/design/specs/2026-07-12-hybrid-role-model-plan.md.
---
--- name: ReconcileOrgMembershipsRemove :execrows
+-- name: ReconcileOrgMembershipsDelete :execrows
 DELETE FROM org_memberships
- WHERE user_id = $1 AND org_id <> ALL(sqlc.arg(keep)::uuid[]);
+ WHERE user_id = $1
+   AND org_id <> ALL(sqlc.arg(keep)::uuid[])
+   AND local_role IS NULL;
+
+-- Clears the OIDC half of the memberships the claims no longer justify but a LOCAL
+-- GRANT still does. The row survives, the effective role falls back to the local
+-- grant, and the user keeps their project roles and their API keys -- because they
+-- are still, deliberately, a member of the org.
+--
+-- This is the statement a blind `DELETE ... WHERE org_id <> ALL(keep)` replaces,
+-- and replacing it is data loss: it cascades away project roles and API keys the
+-- user is entitled to, and re-adding the membership does not bring them back.
+--
+-- name: ReconcileOrgMembershipsClearOIDC :execrows
+UPDATE org_memberships
+   SET oidc_role = NULL, oidc_group = NULL
+ WHERE user_id = $1
+   AND org_id <> ALL(sqlc.arg(keep)::uuid[])
+   AND local_role IS NOT NULL;
 
 -- Writes oidc_ROLE, never role. Since 000008 `role` is GENERATED as
 -- greatest(oidc_role, local_role) and refuses a direct write, so the reconciler
 -- cannot clobber a local grant: it does not name the column that holds one.
 --
+-- oidc_group records WHICH group justified the role. It is audit, not
+-- authorization: when a membership outlives an LDAP change an admin needs to know
+-- which half is holding it up.
+--
 -- name: ReconcileOrgMembershipUpsert :exec
-INSERT INTO org_memberships (user_id, org_id, oidc_role)
-VALUES ($1, $2, $3)
-ON CONFLICT (user_id, org_id) DO UPDATE SET oidc_role = EXCLUDED.oidc_role;
+INSERT INTO org_memberships (user_id, org_id, oidc_role, oidc_group)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (user_id, org_id) DO UPDATE
+   SET oidc_role  = EXCLUDED.oidc_role,
+       oidc_group = EXCLUDED.oidc_group;
 
 -- name: ListOrgMembershipsForUser :many
 SELECT om.org_id, om.role, o.slug, o.name

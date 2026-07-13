@@ -15,41 +15,69 @@ import (
 )
 
 // ErrLoginNotAllowed means the identity verified, but Bakery will not admit them:
-// the ID token carried no group claim, or none of their groups maps to an
-// organization. It is the allowed-groups gate, and it FAILS CLOSED.
+// their groups claim was UNREADABLE, or the login gate is configured and they are
+// in none of its groups. It FAILS CLOSED.
 //
-// This is not pedantry. The alternative -- "no groups, so reconcile them to zero
-// orgs" -- calls ReconcileOrgMembershipsRemove with an empty keep-set, which
-// deletes every org membership the user has, which CASCADES to every project role
-// and every API key they hold in those orgs. That is irreversible: re-adding the
-// org membership does not bring the keys back. And "no groups" is not a
-// hypothetical -- Azure AD replaces a >200-group claim with a `_claim_names`
-// overage, so it happens to real, correctly-configured users. A login we cannot
-// authorize must be REFUSED, never silently reconciled to nothing.
+// What it no longer means -- and this is the M1.5 change -- is "they resolved to
+// zero orgs". A user whose orgs are all granted in-app legitimately resolves to
+// zero CLAIM-derived orgs, and refusing them was the bug. The fail-closed rule did
+// not go away; it moved to the sharper question:
+//
+//	"the IdP says this user is in zero groups"  -> an ANSWER. Admit.
+//	"we could not read this user's groups"      -> NO answer. Refuse, write nothing.
+//
+// Azure AD replaces a >200-group claim with a `_claim_names` overage pointing at
+// Graph, so the second happens to real, correctly-configured users. Reading it as
+// the first NULLs every oidc_role, deletes every membership no local grant
+// justifies, and cascades away the user's project roles and API keys. Re-adding the
+// membership does not bring the keys back.
 var ErrLoginNotAllowed = errors.New("auth: this account is not authorized to use Bakery")
 
-// Reconcile JIT-provisions the user and reconciles their site and org roles from
-// the ID token's group claim. It runs on EVERY login, and returns the user id.
+// Reconcile JIT-provisions the user and reconciles the OIDC HALF of their site and
+// org roles from the ID token's groups claim. It runs on EVERY login, and returns
+// the user id.
 //
-// Org roles and the site role are 100% claim-derived: the IdP is the source of
-// truth and this function makes the database agree with it, adding what appeared
-// and REMOVING what did not. Project roles are managed in-app and are deliberately
-// untouched here -- the reconciler must never write project_memberships.
+// It owns exactly one of the two sources. It writes site_role_oidc, oidc_role and
+// oidc_group; it NEVER writes site_role_local, local_role, granted_by, granted_at,
+// or project_memberships. A local grant therefore survives a login structurally --
+// because this function does not name the column that holds it -- and the effective
+// role stays greatest(oidc, local), computed by the database, recomputed by nobody.
+//
+// The order below is the whole safety argument:
+//
+//  1. an unreadable claim is refused BEFORE the first write. Not rolled back after
+//     one -- never written.
+//  2. memberships nothing justifies are DELETED (cascading project roles and API
+//     keys, which is the revocation half of the design).
+//  3. memberships a local grant still justifies have only their OIDC half cleared.
 func (s *Service) Reconcile(ctx context.Context, id Identity) (pgtype.UUID, error) {
 	if s.groups == nil {
 		return pgtype.UUID{}, fmt.Errorf("%w: no group mapping is configured", ErrLoginNotAllowed)
 	}
 
-	// The gate. Resolve fails closed on an UNREADABLE groups claim (absent, or an
-	// Azure AD `_claim_names` overage) and on a user outside every login group.
+	// STEP 1, AND IT IS FIRST FOR A REASON. An unreadable groups claim is refused
+	// here, before ensureOrgs, before the transaction, before a single row is
+	// touched. "Reconcile and roll back on error" is NOT equivalent and is NOT
+	// acceptable: the requirement is that a login we cannot authorize writes nothing
+	// at all, and the only way to be sure of that is to not start.
+	//
+	// Resolve checks the same thing and would return ErrGroupsUnreadable. That is the
+	// BACKSTOP, not the gate -- it is one refactor away from being called after a
+	// write, and this check is not.
+	if !id.GroupsPresent {
+		return pgtype.UUID{}, fmt.Errorf(
+			"%w: the groups claim for %s is unreadable (absent, or an overage reference), so we "+
+				"do not know their groups and will not reconcile against a guess", ErrLoginNotAllowed, id.Subject)
+	}
+
+	// STEP 2, the login gate. Resolve refuses an unreadable claim (again -- see
+	// above) and a user outside every login group. It no longer refuses a zero-org
+	// resolution: that is a local-only user, and it is an ordinary state.
 	//
 	// GroupsPresent is what carries the distinction across this call, and it is the
 	// only thing that does: `id.Groups` is empty in both the admissible case (the
 	// IdP asserts zero groups) and the catastrophic one (we never read the claim),
 	// so passing the slice alone would hand Resolve a lie it cannot detect.
-	//
-	// This runs BEFORE ensureOrgs and before the transaction, so a refusal here
-	// writes nothing -- which is the requirement, not a convenience.
 	res, err := s.groups.Resolve(config.GroupsClaim{Groups: id.Groups, Present: id.GroupsPresent})
 	if err != nil {
 		return pgtype.UUID{}, fmt.Errorf("%w: %w", ErrLoginNotAllowed, err)
@@ -95,9 +123,10 @@ func (s *Service) Reconcile(ctx context.Context, id Identity) (pgtype.UUID, erro
 			// knows nothing about survives -- structurally, because the column that
 			// holds it is never named here.
 			err := q.ReconcileOrgMembershipUpsert(ctx, repository.ReconcileOrgMembershipUpsertParams{
-				UserID:   user.ID,
-				OrgID:    orgID,
-				OidcRole: repository.NullOrgRole{OrgRole: orgRole(role), Valid: true},
+				UserID:    user.ID,
+				OrgID:     orgID,
+				OidcRole:  repository.NullOrgRole{OrgRole: orgRole(role), Valid: true},
+				OidcGroup: pgtype.Text{String: res.OrgGroups[slug], Valid: res.OrgGroups[slug] != ""},
 			})
 			if err != nil {
 				return fmt.Errorf("upsert org membership: %w", err)
@@ -106,32 +135,43 @@ func (s *Service) Reconcile(ctx context.Context, id Identity) (pgtype.UUID, erro
 			keep = append(keep, orgID)
 		}
 
-		// Resolve NO LONGER refuses a zero-org resolution -- under the hybrid role
-		// model a user whose orgs are all granted in-app legitimately resolves to zero
-		// CLAIM-derived orgs, and refusing them is the bug. This reconciler still
-		// cannot admit them, and the reason is one query below, not one policy above:
-		// ReconcileOrgMembershipsRemove with an empty keep-set is an UNCONDITIONAL
-		// cascade delete of every org membership the user holds, and with it every
-		// project role and every API key. It has no notion of a local grant to spare.
+		// AN EMPTY KEEP-SET IS NOW LEGITIMATE, and the guard that used to refuse it is
+		// gone on purpose. It was the fail-closed backstop from when zero orgs meant
+		// "we could not authorize this login"; under the hybrid model zero CLAIM-derived
+		// orgs is what a local-only user has, and refusing them is the bug. Its job
+		// moved to the GroupsPresent check at the top -- which fires on "we do not know
+		// your groups" rather than on "you have none", and which is the correct place
+		// because it fires before any write.
 		//
-		// So the refusal stays until the local-grant-aware remove lands and this
-		// reconciler learns to write the oidc_role column and keep rows a local grant
-		// justifies. Refusing a legitimate login is a denial; admitting it against
-		// this query is an irreversible deletion. We take the denial.
-		if len(keep) == 0 {
-			return fmt.Errorf("%w: refusing to reconcile %s to zero organizations", ErrLoginNotAllowed, id.Subject)
-		}
+		// What makes the empty keep-set safe is not a guard, it is the two statements
+		// below: neither can touch a local grant.
 
-		// Removes exactly the memberships the IdP no longer asserts. This is the
-		// revocation half of the design: it cascades org_memberships ->
-		// project_memberships -> api_keys, so a user dropped from an OIDC group
-		// loses every key they hold anywhere in that org, in one statement. That
-		// cascade is what makes a join-free API key grant safe to trust.
-		if _, err := q.ReconcileOrgMembershipsRemove(ctx, repository.ReconcileOrgMembershipsRemoveParams{
+		// Deletes only what NOTHING justifies: dropped by the claims AND holding no
+		// local grant. It cascades org_memberships -> project_memberships -> api_keys,
+		// so a user dropped from an OIDC group loses every key they hold anywhere in
+		// that org, in one statement. That cascade is what makes a join-free API key
+		// grant safe to trust on the sstate HEAD storm.
+		//
+		// It runs BEFORE the clear, and it must: `role` is GENERATED NOT NULL AS
+		// greatest(oidc_role, local_role), so clearing oidc_role on a row with no local
+		// grant is a 23502. These are exactly the rows this statement has already
+		// removed.
+		if _, err := q.ReconcileOrgMembershipsDelete(ctx, repository.ReconcileOrgMembershipsDeleteParams{
 			UserID: user.ID,
 			Keep:   keep,
 		}); err != nil {
-			return fmt.Errorf("reconcile org memberships: %w", err)
+			return fmt.Errorf("delete unjustified org memberships: %w", err)
+		}
+
+		// And for the rest -- dropped by the claims but held up by a LOCAL grant -- we
+		// clear our half and leave theirs. The row survives, the effective role falls
+		// back to the local grant, and the user's project roles and API keys survive
+		// with it. They are still a member; an admin said so.
+		if _, err := q.ReconcileOrgMembershipsClearOIDC(ctx, repository.ReconcileOrgMembershipsClearOIDCParams{
+			UserID: user.ID,
+			Keep:   keep,
+		}); err != nil {
+			return fmt.Errorf("clear the oidc half of locally-granted org memberships: %w", err)
 		}
 
 		return nil

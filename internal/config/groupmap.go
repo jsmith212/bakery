@@ -163,6 +163,14 @@ type Resolution struct {
 	// which is a real instruction, not a missing answer -- Resolve returns
 	// ErrGroupsUnreadable when the answer is missing.
 	Orgs map[string]OrgRole
+
+	// OrgGroups maps org slug -> the group that JUSTIFIED the winning role in Orgs.
+	//
+	// It is written to org_memberships.oidc_group and it is audit, not authorization:
+	// when a membership survives an LDAP change, or when an admin asks why someone is
+	// in an org, "acme-leads" is the answer and "the claims said so" is not. Same key
+	// set as Orgs, always.
+	OrgGroups map[string]string
 }
 
 // GroupsClaim is the `groups` claim as read from the ID token, plus the one bit
@@ -312,6 +320,7 @@ func (g *GroupMap) Resolve(claim GroupsClaim) (Resolution, error) {
 	}
 
 	orgs := make(map[string]OrgRole)
+	groups := make(map[string]string)
 
 	for _, org := range g.Orgs {
 		for group, role := range org.Groups {
@@ -319,8 +328,14 @@ func (g *GroupMap) Resolve(claim GroupsClaim) (Resolution, error) {
 				continue
 			}
 
+			// STRICTLY greater, so the winner is the highest role -- and, among equal
+			// roles, the first the map yields. Map iteration is randomised, so two groups
+			// granting the SAME role leave oidc_group non-deterministic. That is honest:
+			// either group justifies the membership, and the effective role is identical
+			// whichever we record.
 			if role.rank() > orgs[org.Slug].rank() {
 				orgs[org.Slug] = role
+				groups[org.Slug] = group
 			}
 		}
 	}
@@ -330,7 +345,7 @@ func (g *GroupMap) Resolve(claim GroupsClaim) (Resolution, error) {
 		site = SiteRoleAdmin
 	}
 
-	return Resolution{SiteRole: site, Orgs: orgs}, nil
+	return Resolution{SiteRole: site, Orgs: orgs, OrgGroups: groups}, nil
 }
 
 // anyClaimed reports whether the user holds any of want.
