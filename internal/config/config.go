@@ -135,22 +135,26 @@ type ProjectDeleteCmd struct {
 	Yes     bool   `help:"Required. Confirms that deleting this project's keys and cached objects is intended." name:"yes"`
 }
 
-// MemberCmd groups the membership verbs.
+// MemberCmd groups the membership verbs. `set` and `remove` are PROJECT roles.
 //
-// Note what is missing: there is no `member set` for an ORG role. Org and site
-// roles are derived from OIDC group claims and reconciled on every login, so a
-// hand-edit would either evaporate at the user's next login or -- worse, in the
-// granting direction -- confer authority the IdP never granted, with the audit
-// trail living in Bakery rather than in the IdP where the access review looks.
-// The API refuses those writes with a 409; the CLI does not offer them.
+// Note what is missing: there is no `member set` for an ORG role, and since M1.5
+// that is a gap in the CLI rather than a property of the model. The API grants org
+// membership in-app now (PUT /orgs/{org}/members/{user} writes the LOCAL half), and
+// the console is the surface for it. The CLI simply has not grown the verb yet.
+//
+// What has NOT changed, and is the reason it is safe to add: an org role is HYBRID,
+// so a hand-edit here writes local_role and nothing else. It cannot forge a claim,
+// and the next login cannot evaporate it -- the reconciler owns the oidc_* columns
+// and only those. Site roles are the same shape (see `bakery user site-admin`).
 type MemberCmd struct {
 	List   MemberListCmd   `cmd:"" help:"List an organization's or a project's members."`
 	Set    MemberSetCmd    `cmd:"" help:"Grant or change someone's project role."`
 	Remove MemberRemoveCmd `cmd:"" help:"Remove someone's project role."`
 }
 
-// MemberListCmd lists members. With no project, it lists the org's roster and
-// their claim-derived org roles.
+// MemberListCmd lists members. With no project, it lists the org's roster and their
+// EFFECTIVE org roles -- greatest(oidc_role, local_role), whichever source is behind
+// them.
 type MemberListCmd struct {
 	Org     string `arg:""             help:"Organization slug."`
 	Project string `arg:"" optional:"" help:"Project slug. Omit to list the organization's members."`
@@ -233,15 +237,20 @@ type OIDCFlags struct {
 	OIDCClientSecret string `env:"OIDC_CLIENT_SECRET" help:"OIDC client secret."`
 	OIDCRedirectURL  string `env:"OIDC_REDIRECT_URL"  help:"Redirect URL registered with the provider, e.g. https://bakery.example.com/api/v1/auth/callback."`
 
-	// offline_access buys the refresh token the CLI's device grant needs; groups is
-	// what the site role and every org role are derived from.
+	// offline_access buys the refresh token the CLI's device grant needs.
+	//
+	// `groups` carries the login gate and the OIDC half of the site and org roles.
+	// It is not optional even for a deployment that grants every role in-app: a
+	// groups claim we cannot READ refuses the login (see internal/auth/reconcile.go),
+	// and dropping the scope is one way to make it unreadable.
 	OIDCScopes []string `default:"openid,profile,email,groups,offline_access" env:"OIDC_SCOPES" help:"Scopes requested on the browser and device flows."`
 
-	// The group -> org mapping, parsed and validated by LoadGroupMap.
+	// The group map -- login gate, site-admin groups, group -> org mapping -- parsed
+	// and validated by LoadGroupMap.
 	//
-	// Org and site roles are 100% claim-derived and reconciled on EVERY login, so
-	// this file IS the authorization policy. A malformed one is a boot failure, not
-	// a warning.
+	// This file IS the claim-derived half of the authorization policy, so a malformed
+	// one is a boot failure, not a warning. It is OPTIONAL: with no group map, any
+	// successful OIDC auth is admitted and every role is an in-app grant.
 	GroupMapFile string `env:"GROUP_MAP_FILE" help:"Path to the JSON group-to-org mapping file." type:"path"`
 }
 

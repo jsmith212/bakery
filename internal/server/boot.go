@@ -199,10 +199,15 @@ func Boot(ctx context.Context, p BootParams) error {
 // buildAuth assembles the auth service: the pgxpool-backed session store, the
 // OIDC provider (when an issuer is configured), and the group -> org map.
 //
-// A malformed group map is a BOOT FAILURE, not a warning. Site and org roles are
-// 100% claim-derived and reconciled on every login, so this file IS the
-// authorization policy; booting without it, or with half of it, would silently
-// admit users at the wrong role or refuse them all.
+// A malformed group map is a BOOT FAILURE, not a warning. It carries the login gate
+// and the OIDC half of the site and org roles, so it IS the claim-derived half of the
+// authorization policy; booting with HALF of it would silently admit users at the
+// wrong role or refuse them all.
+//
+// Booting with NONE of it is fine and supported: with no group map, any successful
+// OIDC auth is admitted (the login gate is empty) and every role is an in-app grant.
+// That is a deployment choice, not a misconfiguration -- which is exactly why the
+// malformed case must be distinguished from the absent one and hard-fail.
 func buildAuth(
 	ctx context.Context,
 	cmd config.ServeCmd,

@@ -293,7 +293,7 @@ func projectDelete(ctx context.Context, c *Client, out io.Writer, cmd config.Pro
 // ---------------------------------------------------------------------------
 
 func memberList(ctx context.Context, c *Client, r renderer, cmd config.MemberListCmd) error {
-	// With no project, list the org's roster and its claim-derived org roles. With
+	// With no project, list the org's roster and its effective org roles. With
 	// one, list the same people plus their project role -- including the members
 	// who have none, because those are exactly the people you are about to grant
 	// one to.

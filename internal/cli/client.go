@@ -412,8 +412,12 @@ func (c *Client) DeleteProject(ctx context.Context, org, project string) error {
 	return c.do(ctx, http.MethodDelete, projectPath(org, project), nil, nil, withAuth)
 }
 
-// ListOrgMembers is GET /orgs/{org}/members. Org roles are claim-derived and
-// read-only over this API -- there is deliberately no Set/Remove counterpart.
+// ListOrgMembers is GET /orgs/{org}/members. The role it reports is the EFFECTIVE
+// one: greatest(oidc_role, local_role).
+//
+// There is no Set/Remove counterpart HERE, but since M1.5 the API has them
+// (PUT/DELETE /orgs/{org}/members/{user}, which write the local half). The CLI has
+// not grown the verbs yet; the console is the surface for them.
 func (c *Client) ListOrgMembers(ctx context.Context, org string) ([]api.Member, error) {
 	var out api.ListResponse[api.Member]
 	err := c.do(ctx, http.MethodGet, "/orgs/"+seg(org)+"/members", nil, &out, withAuth)

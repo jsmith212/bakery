@@ -43,9 +43,10 @@ import (
 // or, worse, a comparison that quietly stops matching. An alias cannot drift from
 // the schema because it IS the schema's type.
 type (
-	// SiteRole is the site-wide role, derived from OIDC group claims.
+	// SiteRole is the site-wide role: the EFFECTIVE one, greatest(oidc, local).
 	SiteRole = repository.SiteRole
-	// OrgRole is a role within an organization, derived from OIDC group claims.
+	// OrgRole is a role within an organization: the EFFECTIVE one, greatest(oidc,
+	// local). The database generates it; nothing here recomputes it.
 	OrgRole = repository.OrgRole
 	// ProjectRole is a role within a project. Managed in-app, never from claims.
 	ProjectRole = repository.ProjectRole
