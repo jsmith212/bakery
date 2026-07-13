@@ -332,9 +332,15 @@ func putOne(ctx context.Context, c *Client, kind mirrorKind, org, project string
 
 // walkSstate recursively walks an SSTATE_DIR. The cache key is the path relative to
 // dir, preserving the [universal/]<hh>/<hh>/ layout and the sstate: colons. It uploads
-// the served objects -- *.tar.zst and their always-probed *.tar.zst.siginfo sidecars,
-// plus *.tar.zst.sig when signing is on -- and skips *.done, the client-side donestamp
-// that is never served from a mirror.
+// the served objects and their always-probed *.siginfo sidecars, plus *.sig when
+// signing is on, and skips *.done, the client-side donestamp that is never served from
+// a mirror.
+//
+// Both extension families are accepted: kirkstone+ (SSTATE_VERSION >= 10) ships
+// *.tar.zst, while pre-kirkstone releases (Dunfell/Gatesgarth/Hardknott/Honister) ship
+// gzip *.tgz -- see docs/design/protocols/yocto.md 1.5. The read handler is
+// extension-agnostic (classifySstate serves any non-sidecar key), so the push tool must
+// discover both or a Dunfell/Honister sstate-cache uploads nothing.
 func walkSstate(dir string) ([]entry, error) {
 	var entries []entry
 
@@ -384,9 +390,17 @@ func servedSstateName(name string) bool {
 		return false
 	}
 
-	return strings.HasSuffix(name, ".tar.zst") ||
+	// kirkstone+ zstd objects and their sidecars.
+	if strings.HasSuffix(name, ".tar.zst") ||
 		strings.HasSuffix(name, ".tar.zst.siginfo") ||
-		strings.HasSuffix(name, ".tar.zst.sig")
+		strings.HasSuffix(name, ".tar.zst.sig") {
+		return true
+	}
+
+	// pre-kirkstone (Dunfell/Gatesgarth/Hardknott/Honister) gzip objects and sidecars.
+	return strings.HasSuffix(name, ".tgz") ||
+		strings.HasSuffix(name, ".tgz.siginfo") ||
+		strings.HasSuffix(name, ".tgz.sig")
 }
 
 // walkDownloads walks the TOP LEVEL of a DL_DIR only. The cache key is the flat

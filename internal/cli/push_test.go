@@ -289,6 +289,53 @@ func TestDownloadsWalkSkipsDirsAndControlFiles(t *testing.T) {
 	}
 }
 
+// TestSstateWalkAcceptsPreKirkstoneTgz: a pre-kirkstone (Dunfell/Honister, SSTATE_VERSION
+// 3/7) sstate-cache ships gzip *.tgz objects with *.tgz.siginfo/.tgz.sig sidecars, not
+// *.tar.zst. The read handler is extension-agnostic (classifySstate serves any non-sidecar
+// key), so the walk must discover the .tgz family too -- otherwise `bakery sstate push`
+// against a Dunfell cache uploads nothing (Scanned N, Uploaded 0) and the mirror provides
+// zero acceleration. See docs/design/protocols/yocto.md 1.5.
+func TestSstateWalkAcceptsPreKirkstoneTgz(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	// A Dunfell object and its always-probed sidecars.
+	obj := "aa/bb/sstate:zlib:x86_64:3:deadbeef_populate_sysroot.tgz"
+	sig := obj + ".siginfo"
+	gpg := obj + ".sig"
+	done := obj + ".done" // client-only donestamp, must be skipped
+	// A modern zstd object still walks, to prove a mixed cache uploads both.
+	zst := "cc/dd/sstate:busybox:aarch64:14:cafef00d_populate_sysroot.tar.zst"
+
+	writeFile(t, dir, obj, []byte("tgz object bytes"))
+	writeFile(t, dir, sig, []byte("tgz siginfo"))
+	writeFile(t, dir, gpg, []byte("tgz gpg sig"))
+	writeFile(t, dir, done, []byte("donestamp -- client only"))
+	writeFile(t, dir, zst, []byte("zst object bytes"))
+
+	entries := mustWalkSstate(t, dir)
+
+	got := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		got[e.key] = true
+	}
+
+	for _, want := range []string{obj, sig, gpg, zst} {
+		if !got[want] {
+			t.Errorf("walkSstate dropped %q; a pre-kirkstone .tgz cache would upload nothing", want)
+		}
+	}
+
+	if got[done] {
+		t.Errorf("walkSstate included the .done donestamp %q; it must never be served", done)
+	}
+
+	if len(entries) != 4 {
+		t.Errorf("entries = %d, want 4 (the .tgz + 2 sidecars + the .tar.zst; the .done excluded)", len(entries))
+	}
+}
+
 func mustWalkSstate(t *testing.T, dir string) []entry {
 	t.Helper()
 
