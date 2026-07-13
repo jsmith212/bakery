@@ -83,6 +83,24 @@ func TestHEADMiss(t *testing.T) {
 	}
 }
 
+// TestGETMiss: a GET of an absent object is 404 -- NEVER a 200 with an empty body.
+// bitbake's wget post-check treats a 200-with-no-bytes as a corrupt fetch, so it either
+// errors the build or unpacks an empty sysroot object. This guards the GET ErrNotFound
+// branch of serveObject, which TestHEADMiss does NOT reach: HEAD is answered from Stat,
+// GET from blob.Service.Get, and the two take different code paths to the 404. Reachable
+// in production as a TOCTOU -- a HEAD hits, the object is GC'd, the follow-up GET misses.
+func TestGETMiss(t *testing.T) {
+	blobs := newTestBlobs(t) // nothing seeded
+	h := mount(t, blobs, testRoute(), &fakeAuthenticator{})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, sstatePath, nil))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("GET miss status = %d, want 404 (never 200 with an empty body)", rec.Code)
+	}
+}
+
 // TestGET covers the whole ServeContent seam over a real *os.File: full body, a
 // satisfiable Range -> 206 with the exact partial bytes, and an unsatisfiable Range
 // -> 416.
