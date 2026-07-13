@@ -69,6 +69,57 @@ Vite's dev server.
 The binary is configured by flags or environment variables (Kong binds both). `stack.env.tmpl` is
 the template for the compose stack's `stack.env`, which is gitignored.
 
+## Cache backends — Yocto sstate + downloads
+
+The first backends that serve traffic. Both are one HTTP handler over a per-backend policy; configure
+one per project (`POST /api/v1/orgs/{org}/projects/{project}/backends` with `{"kind":"sstate"}` or
+`{"kind":"downloads"}`). A project with no configured row for that kind returns `404` cleanly — it never
+serves a mount point that does not exist.
+
+Addressing:
+
+```
+/cache/{org}/{project}/sstate/{path...}       # key has slashes: [universal/]hh/hh/name, colons percent-encoded
+/cache/{org}/{project}/downloads/{basename}   # flat
+```
+
+**Reads** are what bitbake does, and it speaks only HTTP Basic. Point `conf/local.conf` at the mirror:
+
+```sh
+SSTATE_MIRRORS ?= "file://.* https://bakery.example.com/cache/{org}/{project}/sstate/PATH;downloadfilename=PATH"
+INHERIT += "own-mirrors"
+SOURCE_MIRROR_URL ?= "https://bakery.example.com/cache/{org}/{project}/downloads"
+```
+
+`HEAD` is the hot path (bitbake fires a `BB_NUMBER_THREADS`-parallel HEAD storm at build start); a miss is
+`404`, never `403`; `GET` honors `Range`. If the backend's reads are gated (`read_auth_required`, default on),
+put the key in `~/.netrc` keyed by hostname — a Bakery key is one opaque `bkry_…` token, so it goes in the
+password field:
+
+```
+machine bakery.example.com login bkry_… password bkry_…
+```
+
+The console's **config-snippet generator** (`POST /api/v1/orgs/{org}/projects/{project}/snippet`) emits all of
+the above with the right host and a freshly-minted key baked in — copy, paste, build.
+
+**Writes are our invention** — bitbake has no upload path. After a build, push the cache with an API key that
+has **write** scope (reads may be open; writes always need a key):
+
+```sh
+export BAKERY_API_KEY=bkry_…
+bakery sstate push    {org} {project} build/sstate-cache
+bakery downloads push {org} {project} build/downloads
+```
+
+Each `push` walks the on-disk cache, `HEAD`s every object, and `PUT`s only the misses (`-j` sets parallelism,
+`--dry-run` reports without uploading), so a warm cache is a cheap no-op. It walks the local cache only — it
+does not talk to hashserv.
+
+`/metrics` (on `--metrics-addr`, loopback by default — never the public listener) carries
+`bakery_cache_requests_total{org,project,backend,kind,op,result}`, labeled from the resolved route, so a HEAD
+storm over thousands of keys stays one series per `(kind,op,result)` instead of one per object.
+
 ## Authorization
 
 Roles live on four independent planes. One OIDC group lookup used to answer three questions at once;
