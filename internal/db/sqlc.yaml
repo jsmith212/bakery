@@ -1,0 +1,31 @@
+# sqlc reads the schema straight out of the migrations directory -- there is no
+# separate schema.sql to drift from it. Every path below is relative to THIS
+# file's directory, which is why they are bare.
+#
+# Two rules the migrations directory must keep, or codegen breaks in ways that
+# look like schema bugs:
+#   * down migrations must be named *.down.sql. sqlc skips them BY FILENAME
+#     SUFFIX. Any other rollback convention gets parsed as schema, applies the
+#     DROP TABLEs to sqlc's virtual catalog, and every later migration fails with
+#     `relation "x" does not exist`.
+#   * sequence numbers must be zero-padded. sqlc applies up-files in LEXICAL
+#     order, so `10_x.up.sql` would sort before `9_x.up.sql`.
+#
+# Output lands in internal/db/repository/, which is GENERATED and GITIGNORED.
+# `just generate` (go tool sqlc generate) must run before anything compiles.
+version: "2"
+
+sql:
+  - engine: "postgresql"
+    schema: "migrations"
+    queries: "query"
+    gen:
+      go:
+        package: "repository"
+        out: "repository"
+        # pgx-native output: pgconn.CommandTag / pgx.Rows / pgx.Row, and
+        # WithTx(pgx.Tx). No database/sql anywhere. *pgxpool.Pool satisfies the
+        # generated DBTX interface directly.
+        sql_package: "pgx/v5"
+        emit_interface: true
+        emit_empty_slices: true

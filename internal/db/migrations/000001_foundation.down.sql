@@ -1,0 +1,10 @@
+DROP FUNCTION IF EXISTS bakery_touch_updated_at();
+DROP FUNCTION IF EXISTS bakery_blob_lock_key(bytea);
+DROP FUNCTION IF EXISTS bakery_slug_ok(text);
+DROP TYPE IF EXISTS gc_run_status;
+DROP TYPE IF EXISTS blob_state;
+DROP TYPE IF EXISTS api_key_scope;
+DROP TYPE IF EXISTS project_role;
+DROP TYPE IF EXISTS org_role;
+DROP TYPE IF EXISTS site_role;
+DROP TYPE IF EXISTS backend_kind;

@@ -154,7 +154,7 @@ The asymmetry that dictates the design:
 - Drop a unihash, keep the sstate object → dead bytes nobody can name. *Wasteful.*
 - Drop the sstate object, keep the unihash → hashserv says "don't rebuild", bitbake 404s, rebuilds anyway. *Correct, but a silent performance cliff.*
 
-⇒ **The unihash is the GC root; sstate objects are reachable-from-unihash. Always sweep hashserv before sstate, in one transaction per chunk.** Every sweep predicate carries a **write barrier** (`created_at < gc_run.started_at`) so a build that starts mid-GC can't have its freshly-minted unihashes deleted. Blob bytes are refcounted with a grace period **and** a `FOR UPDATE` + `refcount = 0` recheck (the grace period alone is luck, not correctness).
+⇒ **The unihash is the GC root; sstate objects are reachable-from-unihash. Always sweep hashserv before sstate, in one transaction per chunk.** Every sweep predicate carries a **write barrier** so a build that starts mid-GC can't have its freshly-minted unihashes deleted. M1's schema shows the barrier has **two halves, and the timestamp alone is not enough**: `created_at < gc_run.started_at` *plus* `pg_visible_in_snapshot(live_xid, gc_runs.snapshot)`. A row inserted by a transaction that began before the GC run but committed after it satisfies the timestamp predicate and must still be spared; `TestGCWriteBarrierSparesAConcurrentBuild` asserts exactly that, and it is the snapshot half that saves it. Blob bytes are refcounted with a grace period **and** a `FOR UPDATE` + `refcount = 0` recheck (the grace period alone is luck, not correctness).
 
 **Invariant: on delete, metadata first then bytes; on create, bytes first then metadata.** Orphaned bytes are always recoverable; dangling metadata is a permanent 500.
 
@@ -168,13 +168,86 @@ Label with **slugs, never keys or digests** (`{org, project, backend, kind}`). H
 
 Each is independently shippable and leaves the tree green.
 
-- **M0 — Scaffolding.** Repo, Kong CLI, Justfile, pre-commit, commitizen, `.golangci.yml`, GitHub Actions (build/check/commit/image, ported from the gitea workflows), multi-stage Dockerfile (node → go → distroless), compose, `stack.env.tmpl`, SvelteKit skeleton embedded via `//go:embed all:dist` (the `all:` is **mandatory** — plain `//go:embed dist` silently skips SvelteKit's `_app/` and you ship a white page). Boots, serves `/healthz`.
-- **M1 — Control plane + storage.** Postgres schema + sqlc; orgs, projects, users, roles, memberships, API keys; OIDC login + DEV_LOGIN; `storage.Store` (local, then S3) + `blob.Service` (dedup, refcount, LRU, singleflight). **Benchmark the HEAD path here, before any backend exists.**
+- **M0 — Scaffolding. ✅ DONE.** Repo, Kong CLI, Justfile, pre-commit, commitizen, `.golangci.yml`, GitHub Actions (build/check/commit/image, ported from the gitea workflows), multi-stage Dockerfile (node → go → distroless), compose, `stack.env.tmpl`, SvelteKit skeleton embedded via `//go:embed all:dist` (the `all:` is **mandatory** — plain `//go:embed dist` silently skips SvelteKit's `_app/` and you ship a white page). Boots, serves `/healthz`.
+- **M1 — Control plane + storage. ✅ DONE** (see "M1 as landed" below). Postgres schema + sqlc; orgs, projects, users, roles, memberships, API keys; OIDC login + DEV_LOGIN; `storage.Store` (**local only — S3 is deferred**) + `blob.Service` (dedup, refcount, LRU, singleflight). The HEAD-path benchmark and its three gates landed with it, before any backend exists.
+- **M1.5 — Hybrid role model. ✅ DONE** (see "M1.5 as landed" below). ([spec](specs/2026-07-12-hybrid-role-model.md)) M1 derives site *and* org roles purely from OIDC group claims, which forces a group-per-org into the directory and leaves a freshly-created org unusable by its own creator. M1.5 splits the one group lookup that was answering three questions into four planes: a **login gate** (`login_groups`, independent of org mapping — empty admits any successful OIDC auth), a **hybrid site role**, **hybrid org membership** (claims *and* in-app grants, effective role `greatest(oidc, local)` computed by the database), and **project roles in-app only**. Org creation grants the creator a local owner role. Fail-closed moves from *"no orgs ⇒ refuse"* to *"an **unreadable** groups claim ⇒ refuse and reconcile nothing"* — empty is not unreadable, and only the former is safe to act on. Also fixes `RevokeAPIKeysForMembership`, which has never worked (pgx cannot encode an enum array without the type registered on the pool). **Lands before the SPA→API wiring wave**, which depends on its membership screens.
 - **M2 — Yocto sstate + downloads.** `httpblob` + two Policies + `bakery sstate push`. First thing a user can actually point bitbake at.
 - **M3 — hashserv.** Framing-first, pure and DB-free, with an exhaustive table-driven suite. **Run upstream's own hashserv test suite and the real `bitbake-hashclient` against our server in CI — this is non-negotiable.**
 - **M4 — Bazel REAPI (gRPC) + `/ac` `/cas` HTTP.** Ships moon, ccache, and sccache together.
 - **M5 — Docker OCI pull-through proxy.** Byte-exact manifests, stale-while-revalidate, own 401 challenge.
 - **M6 — GC, retention, quotas + UI polish.** (The GC *write barrier* and refcount tests land with M1, not here.)
+
+### M1 as landed
+
+The plan above is what M1 aimed at. This is what it *is*, so the next session onboards from the code rather than from the intention.
+
+**Packages.** `internal/db` (pgxpool + embedded golang-migrate + the boot advisory lock + `Store`, whose `Tx` really rebinds sqlc's `Queries` onto the `pgx.Tx`) · `internal/db/dbtest` (a private, migrated Postgres per test, cloned from a template, over docker or `TEST_DB_URL`) · `internal/slug` (mirrors the DB's `bakery_slug_ok`, so the reserved-slug denylist cannot drift) · `internal/storage` (content-addressed local disk + an instrumented decorator) · `internal/blob` (dedup, refcount, 64-shard LRU with **negative caching**, singleflight) · `internal/cache` (`Route`/`Deps`/`Backend` — the seams M2+ plug into; no backend exists yet) · `internal/metrics` · `internal/auth` · `internal/api` · `internal/cli` (the binary is also the API client) · `internal/server` (the wiring: `server.Boot` is what `bakery serve` runs, and what the end-to-end test boots).
+
+**Storage is LOCAL ONLY. S3 is deferred** — there is no storage-driver column in the schema, no S3 code in the binary, and `--storage-dir` is the only knob. `storage.Store` is the interface a future S3 driver implements; nothing above it knows which driver it has.
+
+**Serve modes.** `bakery serve` = SPA + `/api/v1` + `/healthz` + `/readyz` on the public listener, `/metrics` on `--metrics-addr` (loopback by default). `bakery serve --headless` = the same minus the SPA, which is simply **not routed** (an unknown path is a 404 from the mux, never a 500). `/readyz` really pings the pool; `/healthz` does not, because liveness and readiness must not be the same answer.
+
+**Boot order** (`internal/server/boot.go`): connect and **ping** → take `pg_try_advisory_lock` (refuse a second instance unless `--allow-multi-instance`) → migrate → metrics → auth → `EnsureOrgs` → `SeedDevLogin` → API → bind both listeners → serve. The lock is taken *before* the migrations so two instances starting together cannot race through the same migration.
+
+**The API surface** (`/api/v1`; every route declares its required role at registration, and a handler never sees a path id — `guard` resolves slugs to ids and authorizes them):
+
+| Route | Access |
+|---|---|
+| `GET /auth/config` · `GET /auth/login` · `GET /auth/callback` · `POST /auth/logout` | public |
+| `POST /auth/dev-login` | public, **and only registered when `DEV_LOGIN_ENABLED`** (otherwise the route does not exist: a 404, not a 403) |
+| `GET /me` | any principal |
+| `GET /orgs` · `POST /orgs` | authenticated · **site admin** |
+| `GET|PATCH|DELETE /orgs/{org}` | org view · org admin · org owner |
+| `GET /orgs/{org}/members` · `PUT|DELETE .../members/{user}` | org view · **409, always** — org roles are claim-derived *(M1 only — **M1.5 makes these real writes**; see the route table below)* |
+| `GET|POST /orgs/{org}/projects`, `GET|PATCH|DELETE /orgs/{org}/projects/{project}` | org view · org admin · project read/admin |
+| `GET|PUT|DELETE /orgs/{org}/projects/{project}/members[/{user}]` | project read · project admin |
+| `GET|POST|DELETE /orgs/{org}/projects/{project}/keys[/{key}]` | project read |
+| `GET|POST|GET|PATCH|DELETE /orgs/{org}/projects/{project}/backends[/{kind}]` | project read · project admin |
+
+Every non-2xx carries the same envelope, `{"error":{"code","message","field?"}}`, with a **closed** code vocabulary. Branch on `code`, never on `message`.
+
+**The auth model, as built.**
+
+- Humans: OIDC authorization-code flow (state + nonce + PKCE; we verify the nonce ourselves, because go-oidc does not) → an scs session in Postgres, over a hand-written pgxpool store.
+- CLI: OIDC **device grant**; `bakery login` caches tokens 0600 under `~/.config/bakery`, presents the ID token as a Bearer, and the server verifies it per request.
+- **Site and org roles come from OIDC group claims and are reconciled on EVERY login, fail-closed.** A login that resolves to no groups or no mapped orgs is *refused* — it is not treated as "zero memberships", which would delete every membership the user has. This is why the org-membership write endpoints return 409: an org role hand-edited here is either reverted at the next login or grants authority the IdP never granted. **A brand-new org therefore has no members until the group map names it — not even the site admin who created it.**
+  > **⚠ SUPERSEDED BY M1.5.** That last sentence *is* the dead-end M1.5 exists to abolish, and the fail-closed rule as stated here is now wrong in its second half: a local-only user legitimately resolves to **zero mapped orgs** and must be admitted. The rule moved to *"an **unreadable** groups claim ⇒ refuse and reconcile nothing"*. See "M1.5 as landed".
+- **Project roles are managed in-app** and are the only roles a human edits. *(Still true under M1.5 — deliberately. They are the one plane that never comes from a claim.)*
+- API keys are `bkry_` + 256 random bits, stored as raw SHA-256, shown exactly once, project-scoped **and** per-user, capped at the holder's project role *at creation* (validation deliberately does not join `project_memberships` — that would put a second probe on the sstate HEAD storm). An API-key principal never inherits its owner's site admin.
+- `auth.Principal` is an interface sealed by an unexported method: it cannot be constructed or implemented outside `internal/auth`. M5's OCI upstream fetch depends on that.
+
+### M1.5 as landed
+
+[Spec.](specs/2026-07-12-hybrid-role-model.md) M1's single group lookup answered three questions at once — *may this human use Bakery? may they run the platform? which orgs are they in?* — so the only way to answer the first was to answer the third. M1.5 splits them into **four independent planes**:
+
+| Plane | Question | Source of truth |
+|---|---|---|
+| **Login gate** | May this human use Bakery at all? | `login_groups` (claims). **Empty/unset ⇒ any successful OIDC auth is admitted.** |
+| **Site role** | May they run the platform? | Hybrid: `site_admin_groups` **+** local grants. |
+| **Org membership** | Which orgs are they in, and how? | Hybrid: the group map **+** local grants. Effective = `greatest(oidc_role, local_role)`. |
+| **Project role** | What may they do in a project? | **In-app only.** Unchanged from M1, deliberately. |
+
+**Schema (000008, 000009).** `org_memberships` gains `oidc_role`, `oidc_group`, `local_role`, `granted_by`, `granted_at`; `role` becomes `org_role GENERATED ALWAYS AS (greatest(oidc_role, local_role)) STORED` — the enums are declared in privilege order, so `greatest()` *is* the max-wins rule and no Go code can get it wrong. `users` gets the same treatment (`site_role_oidc`, `site_role_local`, `site_granted_by`, `site_granted_at`, generated `site_role`). Two CHECKs hold the shape: a row must have at least one source, and `granted_at` is present iff `local_role` is.
+
+**It is ONE ROW per `(user, org)`, and that is the whole architecture.** `project_memberships` carries `FOREIGN KEY (user_id, org_id) REFERENCES org_memberships (user_id, org_id) ON DELETE CASCADE`, and that cascade — org membership → project roles → API keys — is what revokes every key a user holds in an org when they leave it, which is what makes the join-free key validation on the sstate HEAD storm safe. It needs `(user_id, org_id)` UNIQUE. A `PRIMARY KEY (user_id, org_id, source)` would destroy it and silently reopen the revocation hole. **The two sources are columns. Never rows.**
+
+**Reconciliation.** The reconciler writes **only** the `oidc_*` columns — so a login *cannot* clobber a local grant, structurally rather than by convention. When claims no longer justify a membership it NULLs `oidc_role`/`oidc_group` and deletes the row **iff `local_role IS NULL`** (which fires the cascade). Fail-closed **moved**: *"resolves to no mapped orgs ⇒ refuse"* is gone (a local-only user legitimately maps to zero orgs, and refusing them was the bug); it is replaced by **"an *unreadable* groups claim ⇒ refuse the login and reconcile nothing"**. `groups: []` is admissible and means "local memberships only"; an absent claim, or Azure AD's `_claim_names`/`_claim_sources` overage, is *not knowing* — and reconciling *that* as "zero groups" would cascade a real user's entire access away. `auth.Identity` carries `GroupsPresent` because a bare `[]string` cannot express the difference. The rule holds whether or not the login gate is enabled.
+
+**New/changed API:**
+
+| Route | Access |
+|---|---|
+| `POST /orgs` | **any signed-in user** (`--allow-self-serve-orgs`, default on; off ⇒ site admin). The creator gets a **local owner grant in the same transaction** — this is the fix for M1's dead-end. Never reachable by an API key. |
+| `PUT|DELETE /orgs/{org}/members/{user}` | org admin. **Real writes now** (M1: 409 always). `PUT` writes `local_role` + provenance; `DELETE` clears the local half only, and **says so in the response when a claim-derived membership survives it** — LDAP owns that one and the API cannot remove it. |
+| `GET /site-admins` · `PUT|DELETE /site-admins/{user}` | site admin (`--allow-local-site-admins`, default on). The listing reports **source** — `ldap: platform-admins` vs `local: granted by …` — because a local grant that outlives an LDAP revocation must be visible, or it is a backdoor. |
+
+Membership responses expose provenance: `role`, `oidc_role`, `oidc_group`, `local_role`, `granted_by`, `granted_at`.
+
+**Break-glass.** With `login_groups` empty and no `site_admin_groups`, a fresh deployment has no site admin and every path to making one requires already being one. `bakery user site-admin <email>` writes `site_role_local` straight to the database, needs `DB_URL`, and has **no HTTP or API path at all** — mirroring `DEV_LOGIN_ENABLED`. Reaching it requires infrastructure access, not a session, and anyone with that could `UPDATE` the column by hand anyway. `--allow-local-site-admins` does not gate it (gating it would make a fresh deployment unbootstrappable — the exact deadlock it exists for).
+
+**Also fixed:** `RevokeAPIKeysForMembership` had **never worked** — pgx cannot build an encode plan for a slice of a custom enum unless the type is registered on the connection, and it had no caller, so nothing proved it. `db.NewPool`'s `AfterConnect` now `LoadType`s and registers every custom enum **and its array type**, failing the connection if one is absent. This was a whole class of bug: any future sqlc query taking an enum array failed identically, at encode time, on its first caller.
+
+**What M1.5 did NOT build:** group→project mapping (the group explosion this exists to escape), SCIM, a third identity source (the column-per-source shape does not scale past two — a third is a migration to a grants table, and that is a fine trade for YAGNI today), and the SPA wiring for any of it. That is the next wave.
 
 **Frontend track (parallel):** design system + screens in Claude Design during M0–M1; implement in SvelteKit one milestone behind the backend so screens are built against real endpoints. Screens: login · org/project lists · project detail (overview / backends / members / keys / settings) · backend config + hit-rate charts · API keys (show-once) · admin. **The highest-value screen is a config snippet generator** — per backend, emit the exact `local.conf` / `workspace.yml` / `ccache.conf` / `hosts.toml` with a freshly-minted key baked in. Every one of these clients has a vicious config gotcha; this is what drives adoption.
 

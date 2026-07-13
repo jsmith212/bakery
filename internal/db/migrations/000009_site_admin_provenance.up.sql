@@ -1,0 +1,23 @@
+-- Bakery M1.5: the site-admin listing has to be able to say WHICH GROUP made a
+-- user a site admin.
+--
+-- 000008 gave users.site_role two sources -- site_role_oidc and site_role_local --
+-- and a generated effective role. It recorded the PROVENANCE of the local half
+-- (site_granted_by, site_granted_at) but not of the claim half, so a site-admin
+-- listing could say "local: granted by jsmith on 2026-07-12" and could only say
+-- "oidc_groups" in the other direction. org_memberships.oidc_group already carries
+-- exactly this for an org role; this is the same column for the site role, and for
+-- the same reason.
+--
+-- Why it is not a nicety. A HYBRID site admin trades safety for the ability to
+-- bootstrap, and the trade is only sound if it is VISIBLE: the one real risk in the
+-- design is a local grant that outlives the LDAP revocation that was supposed to
+-- remove it. Someone reviewing the site admins has to be able to see, per row,
+-- which half is holding the role up -- `ldap: platform-admins` or `local: granted
+-- by jsmith`. A listing that reports only the effective role makes a stale local
+-- grant indistinguishable from a live directory membership, and a backdoor nobody
+-- can see on a screen is just a backdoor.
+--
+-- NULL means "no claim justifies this site role". It is audit, never authorization:
+-- site_role_oidc is what confers the role, and this only says which group asked.
+ALTER TABLE users ADD COLUMN site_oidc_group text;
