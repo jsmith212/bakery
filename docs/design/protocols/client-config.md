@@ -57,8 +57,8 @@ What you give up: no local sqlite cache, so every lookup is a network round trip
 BitBake cannot write to an sstate mirror — no upload path exists. After a build:
 
 ```bash
-bakery sstate push --project {org}/{proj} build/sstate-cache
-bakery downloads push --project {org}/{proj} build/downloads
+bakery sstate push {org} {proj} build/sstate-cache
+bakery downloads push {org} {proj} build/downloads
 ```
 
 The CLI HEADs (or batch-`_exists`) to skip what's already there, then PUTs the rest in parallel.
