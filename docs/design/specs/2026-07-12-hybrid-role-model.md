@@ -133,19 +133,30 @@ only the first is safe to act on:
 This must hold **whether or not the login gate is enabled** — the gate and the reconciler consume the same
 claim, and disabling the gate must not disable the trap detection.
 
-## Effective role and API keys — the consequence nobody asks about
+## Effective role and API keys
 
-Effective role is now `greatest(oidc_role, local_role)`, so it can **drop when either source changes**: an
-LDAP group removal on the *reconciler's* path, or a local grant revoked on the *UI's* path.
+API-key scope is capped by the **project** role, and the reconciler never touches project roles — it only
+touches org membership. So what protects keys here is not new revocation logic; it is the **FK cascade**:
 
-The M1 invariant stands — a role downgrade revokes over-scoped keys **in the same transaction** — but it now
-has to:
+```
+org_memberships DELETE → project_memberships CASCADE → api_keys CASCADE
+```
 
-1. recompute the **effective** role from both columns, not read one column, and
-2. fire on **the reconciler's path too**, not only the API's.
+Two requirements follow, and they are the whole of it:
 
-A writer demoted via LDAP who keeps their write key because the downgrade did not come through the UI is a
-silent hole straight through to the cache.
+1. **The one-row design must preserve that cascade.** It does — `(user_id, org_id)` stays unique, so the
+   composite FK survives. This is the entire reason the sources are columns and not rows.
+2. **The row is deleted exactly when BOTH sources are gone.** `oidc_role` going NULL while `local_role` is
+   set must NOT delete the row: the user still holds a deliberate local grant, so their membership, their
+   project roles, and their keys all survive — **by design, not by accident.**
+
+The existing project-role-downgrade-revokes-keys transaction in `internal/api/members.go` is unchanged:
+project roles remain single-source and in-app, so there is no "effective" project role to recompute.
+
+The one genuinely new behavior is on the API: `DELETE /orgs/{org}/members/{user}` clears only `local_role`.
+If the user is *also* in a mapped LDAP group, the row survives and they remain a member. The response must
+say so, or an admin will remove someone, see a success, and reasonably believe they are gone when they are
+not.
 
 ### Prerequisite bug fix (blocks this work)
 
@@ -207,8 +218,9 @@ Flags: `--allow-self-serve-orgs` (default on), `--allow-local-site-admins` (defa
   recomputes it.
 - **An unreadable groups claim refuses the login and reconciles nothing** — regardless of whether the login
   gate is enabled. Empty ≠ unreadable. Conflating them cascade-deletes a real user's entire access.
-- **A role downgrade revokes over-scoped API keys in the same transaction, on BOTH the UI path and the
-  reconciler path**, against the *effective* role.
+- **An org membership row is deleted exactly when BOTH sources are gone.** Deleting it while a local grant
+  survives revokes keys the user is still entitled to; failing to delete it when neither source justifies it
+  suppresses the cascade and leaves keys alive that should be dead.
 - **A row with neither `oidc_role` nor `local_role` must not exist.** Its existence would suppress the
   project-membership cascade.
 
