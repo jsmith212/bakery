@@ -37,10 +37,25 @@ var ErrUnauthenticated = errors.New("auth: the request carried no credential")
 type Deps struct {
 	Store    *db.Store
 	Sessions *scs.SessionManager
-	Provider *Provider        // nil when no OIDC issuer is configured
-	Groups   *config.GroupMap // nil when no mapping file is configured
-	Metrics  *metrics.Metrics // may be nil
-	Log      *slog.Logger
+	Provider *Provider // nil when no OIDC issuer is configured
+
+	// Groups is the parsed mapping file, or nil when none is configured.
+	//
+	// NIL IS A SUPPORTED DEPLOYMENT, NOT A REFUSAL. New normalizes it to an EMPTY
+	// GroupMap, which resolves to exactly what the file's own documentation promises:
+	// an empty login gate (any successful OIDC auth is admitted), no site-admin
+	// groups, and zero claim-derived orgs. That is the deployment the hybrid model
+	// exists to enable -- every role handed out in-app, the IdP asked only "who are
+	// you". Refusing every login here instead would be unrecoverable: with dev login
+	// off, nobody can obtain a session, and the CLI break-glass can only promote a
+	// user who has already logged in once.
+	//
+	// It does NOT weaken the fail-closed rule. An unreadable groups claim is refused
+	// by Reconcile's GroupsPresent gate and again by Resolve, and neither of those
+	// consults the map -- the trap detection is independent of whether a map exists.
+	Groups  *config.GroupMap
+	Metrics *metrics.Metrics // may be nil
+	Log     *slog.Logger
 
 	// DevLogin mirrors DEV_LOGIN_ENABLED. It arrives from the Kong flag / env var
 	// and NOWHERE else. There is no setter, no API route and no database column
@@ -79,11 +94,23 @@ func New(d Deps) (*Service, error) {
 
 	keys := pgKeyStore{pool: d.Store.Pool()}
 
+	// An absent mapping file IS a policy: "the IdP decides who authenticates, Bakery
+	// decides what they may do, and every role is an in-app grant." The empty
+	// GroupMap says precisely that, so the rest of the service can stop asking
+	// whether a map exists -- there is always one, and it is honest about being
+	// empty. This is the one normalization; there is deliberately no `if s.groups ==
+	// nil` anywhere downstream, because such a branch is where the two meanings of
+	// "no groups" get re-conflated.
+	groups := d.Groups
+	if groups == nil {
+		groups = &config.GroupMap{}
+	}
+
 	return &Service{
 		store:    d.Store,
 		sessions: d.Sessions,
 		provider: d.Provider,
-		groups:   d.Groups,
+		groups:   groups,
 		metrics:  d.Metrics,
 		log:      log,
 		devLogin: d.DevLogin,

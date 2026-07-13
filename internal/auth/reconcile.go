@@ -50,11 +50,18 @@ var ErrLoginNotAllowed = errors.New("auth: this account is not authorized to use
 //  2. memberships nothing justifies are DELETED (cascading project roles and API
 //     keys, which is the revocation half of the design).
 //  3. memberships a local grant still justifies have only their OIDC half cleared.
+//
+// There is deliberately NO "is a group map configured?" check. s.groups is never
+// nil -- auth.New normalizes an absent mapping file to an EMPTY GroupMap -- and an
+// empty map resolves to the documented thing: empty login gate (admit any
+// successful OIDC auth), no site admins, zero claim-derived orgs. Refusing here
+// instead would break the one deployment the hybrid model exists for, the one that
+// runs entirely on local grants, and it would be unrecoverable: no login means no
+// user row means nothing for the CLI break-glass to promote.
+//
+// The fail-closed rule lives in the GroupsPresent check below, not in the presence
+// of a file. An unreadable claim is refused whether or not a map is configured.
 func (s *Service) Reconcile(ctx context.Context, id Identity) (pgtype.UUID, error) {
-	if s.groups == nil {
-		return pgtype.UUID{}, fmt.Errorf("%w: no group mapping is configured", ErrLoginNotAllowed)
-	}
-
 	// STEP 1, AND IT IS FIRST FOR A REASON. An unreadable groups claim is refused
 	// here, before ensureOrgs, before the transaction, before a single row is
 	// touched. "Reconcile and roll back on error" is NOT equivalent and is NOT
@@ -197,11 +204,10 @@ func (s *Service) Reconcile(ctx context.Context, id Identity) (pgtype.UUID, erro
 // refused -- and the only way to create an org is through the API, which requires
 // a logged-in site admin. The mapping file IS the declaration that these orgs
 // exist; this makes the database agree.
+//
+// With no mapping file (or one that names no orgs) it ensures nothing, which is
+// correct: those orgs are created in-app by a site admin.
 func (s *Service) EnsureOrgs(ctx context.Context) error {
-	if s.groups == nil {
-		return nil
-	}
-
 	_, err := s.ensureOrgs(ctx, s.groups.OrgSlugs())
 
 	return err

@@ -622,16 +622,109 @@ func TestLoadPrincipalReadsRolesLive(t *testing.T) {
 	}
 }
 
-// TestReconcileRefusesWithoutAGroupMap: no policy means no logins. Failing open
-// here would admit everyone.
-func TestReconcileRefusesWithoutAGroupMap(t *testing.T) {
+// TestNoGroupMapAdmitsAnySuccessfulOIDCAuth pins the deployment the hybrid model
+// exists to enable: an IdP that answers "who are you", and Bakery answering "what
+// may you do" entirely from in-app grants. No mapping file at all.
+//
+// This is the shape README, config.go, boot.go and groupmap.go all promise, and it
+// is unrecoverable when it is broken: with dev login off, a refused login means no
+// user row, and the CLI break-glass (`bakery user site-admin <email>`) can only
+// promote a user who has already logged in once. Every login refused, forever, with
+// no way out -- so the assertion is that a login SUCCEEDS.
+//
+// The absent map is NOT the fail-closed guard, and the subtests below prove the
+// real one is untouched: an unreadable claim is still refused, and it is refused
+// exactly as hard with no map as with one.
+func TestNoGroupMapAdmitsAnySuccessfulOIDCAuth(t *testing.T) {
 	t.Parallel()
 
-	ts := newTestService(t, "", false)
+	ts := newTestService(t, "", false) // GROUP_MAP_FILE unset: Deps.Groups is nil.
+	ctx := t.Context()
 
-	_, err := ts.Reconcile(t.Context(), identity("s1", "dev@acme.example", "acme-devs"))
-	if !errors.Is(err, ErrLoginNotAllowed) {
-		t.Fatalf("Reconcile() with no group map = %v, want ErrLoginNotAllowed", err)
+	// The empty map is an empty LOGIN GATE, so a readable claim -- any readable
+	// claim -- is admitted.
+	userID, err := ts.Reconcile(ctx, identity("s1", "boss@acme.example", "engineering"))
+	if err != nil {
+		t.Fatalf("Reconcile() with no group map = %v, want admission: an absent mapping file "+
+			"means every role is an in-app grant, not that nobody may log in", err)
+	}
+
+	user, err := ts.store.GetUser(ctx, userID)
+	if err != nil {
+		t.Fatalf("the admitted user was not provisioned: %v", err)
+	}
+
+	if user.Email != "boss@acme.example" {
+		t.Errorf("Email = %q, want boss@acme.example", user.Email)
+	}
+
+	// An empty map grants nothing, which is the other half of the promise: no
+	// site_admin_groups means no claim-derived site admin, and no orgs means no
+	// claim-derived membership. The first login is an ordinary user.
+	p, err := ts.loadPrincipal(ctx, userID, MethodSession)
+	if err != nil {
+		t.Fatalf("loadPrincipal() error = %v", err)
+	}
+
+	if p.IsSiteAdmin() {
+		t.Error("an empty group map minted a site admin; it must grant nothing")
+	}
+
+	if got := countRows(t, ts, "org_memberships"); got != 0 {
+		t.Errorf("org_memberships = %d, want 0: an empty group map grants no org membership", got)
+	}
+
+	// EnsureOrgs over no map ensures nothing, rather than exploding at boot.
+	if err := ts.EnsureOrgs(ctx); err != nil {
+		t.Fatalf("EnsureOrgs() with no group map = %v, want nil", err)
+	}
+
+	if got := countRows(t, ts, "organizations"); got != 0 {
+		t.Errorf("organizations = %d, want 0: an absent mapping file names no orgs", got)
+	}
+
+	// And this is the point of the whole deployment: a site admin grants the org
+	// membership locally, and it SURVIVES every subsequent login -- the reconciler
+	// resolves zero claim-derived orgs and must not read that as "drop everything".
+	org, err := ts.store.CreateOrganization(ctx, repository.CreateOrganizationParams{
+		Slug: "acme", Name: "acme",
+	})
+	if err != nil {
+		t.Fatalf("CreateOrganization: %v", err)
+	}
+
+	grantLocalRole(t, ts, userID, org.ID, OrgRoleAdmin)
+
+	if _, err := ts.Reconcile(ctx, identity("s1", "boss@acme.example", "engineering")); err != nil {
+		t.Fatalf("Reconcile() on a second login = %v", err)
+	}
+
+	role, ok := orgRoleOf(t, ts, userID, "acme")
+	if !ok {
+		t.Fatal("the local grant was deleted by a login against no group map: " +
+			"zero CLAIM-derived orgs is not zero orgs")
+	}
+
+	if role != OrgRoleAdmin {
+		t.Errorf("acme role = %q, want %q: the local half must survive the reconcile", role, OrgRoleAdmin)
+	}
+
+	// The fail-closed rule is about the CLAIM, never about the file. An unreadable
+	// groups claim is still refused, and still writes nothing -- the local grant, and
+	// the user's whole authorization, must be exactly where they were.
+	before := countRows(t, ts, "org_memberships")
+
+	if _, err := ts.Reconcile(ctx, unreadableIdentity("s1", "boss@acme.example")); !errors.Is(err, ErrLoginNotAllowed) {
+		t.Fatalf("Reconcile() with an unreadable claim and no group map = %v, want ErrLoginNotAllowed: "+
+			"the trap detection does not depend on a mapping file existing", err)
+	}
+
+	if got := countRows(t, ts, "org_memberships"); got != before {
+		t.Errorf("org_memberships = %d, want %d: a REFUSED login mutated the database", got, before)
+	}
+
+	if role, ok := orgRoleOf(t, ts, userID, "acme"); !ok || role != OrgRoleAdmin {
+		t.Errorf("acme role = (%q, %v), want (admin, true): a refused login destroyed a local grant", role, ok)
 	}
 }
 
