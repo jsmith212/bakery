@@ -41,6 +41,9 @@ const (
 
 	userAnnaID  = "55555555-5555-5555-5555-555555555555"
 	userMarkoID = "66666666-6666-6666-6666-666666666666"
+	// userOlgaID is not on the shared roster: she is the TARGET a test adds at a
+	// chosen role and provenance, to drive the target half of the authz matrix.
+	userOlgaID = "99999999-9999-9999-9999-999999999999"
 
 	keyAnnaID  = "77777777-7777-7777-7777-777777777777"
 	keyMarkoID = "88888888-8888-8888-8888-888888888888"
@@ -413,18 +416,36 @@ func (s *fakeStore) GetUserByEmail(_ context.Context, email string) (repository.
 // any of it. So they record the call and refuse, and every behavioural test for them
 // is DB-backed. What the fake IS for is the authorization boundary: a test can still
 // assert that a denied caller never reached the write at all.
+// GetOrgMembership reads the roster row back as a membership, PROVENANCE AND ALL --
+// the fixture states which half (claim, local, or both) holds the membership up, and
+// the fake reports exactly that. It must: the target-role guard on the membership
+// endpoints keys on the EFFECTIVE role, and the delete endpoint's three outcomes key
+// on which halves are present, so a fake that flattened every row to "claim-derived"
+// would make a whole class of target-authority tests unexpressible.
+//
+// A row that states neither source is claim-derived, which is what every M1
+// membership was.
 func (s *fakeStore) GetOrgMembership(
 	_ context.Context, arg repository.GetOrgMembershipParams,
 ) (repository.OrgMembership, error) {
 	s.note("GetOrgMembership")
 
 	for _, m := range s.orgMembers[arg.OrgID] {
-		if m.UserID == arg.UserID {
-			return repository.OrgMembership{
-				UserID: m.UserID, OrgID: arg.OrgID, Role: m.Role,
-				OidcRole: repository.NullOrgRole{OrgRole: m.Role, Valid: true},
-			}, nil
+		if m.UserID != arg.UserID {
+			continue
 		}
+
+		oidc := m.OidcRole
+		if !oidc.Valid && !m.LocalRole.Valid {
+			oidc = repository.NullOrgRole{OrgRole: m.Role, Valid: true}
+		}
+
+		return repository.OrgMembership{
+			UserID: m.UserID, OrgID: arg.OrgID, Role: m.Role,
+			OidcRole: oidc, OidcGroup: m.OidcGroup, LocalRole: m.LocalRole,
+			GrantedBy: m.GrantedBy, GrantedAt: m.GrantedAt,
+			CreatedAt: pgtype.Timestamptz{}, UpdatedAt: pgtype.Timestamptz{},
+		}, nil
 	}
 
 	return repository.OrgMembership{}, pgx.ErrNoRows

@@ -70,13 +70,20 @@ func (a *API) handleListOrgMembers(w http.ResponseWriter, r *http.Request) error
 // oidc_group -- so the next login reconciles the claim half as usual and leaves
 // this grant standing.
 //
-// # Granting OWNER requires being one
+// # Granting OWNER requires being one, and so does writing OVER one
 //
 // The route is AccessOrgAdmin, but an org ADMIN may not mint an org OWNER: an owner
 // can delete the org and everything cached in it, so admin -> owner would be a
 // self-service escalation to a strictly greater authority than the granter holds.
 // The check is on CanOwnOrg, so an owner and a site admin may do it and nobody else
 // can. This narrows the route; it does not widen any.
+//
+// The mirror image is just as important and is the half that was missing: an org
+// admin may not write over an EXISTING owner either. `PUT {"role":"member"}` against
+// the owner is the same escalation run backwards -- it unmakes an authority strictly
+// greater than the caller's, and (before the local role model, when every org role
+// was claim-derived) it was not a reachable write at all. So the TARGET's effective
+// role is checked, not only the requested one. See requireAuthorityOverTarget.
 func (a *API) handlePutOrgMember(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	s := scopeFrom(ctx)
@@ -102,6 +109,10 @@ func (a *API) handlePutOrgMember(w http.ResponseWriter, r *http.Request) error {
 
 	user, err := a.resolveUser(ctx, r.PathValue("user"))
 	if err != nil {
+		return err
+	}
+
+	if err := a.requireAuthorityOverTarget(ctx, p, s, user.ID, "change an owner's role"); err != nil {
 		return err
 	}
 
@@ -149,9 +160,25 @@ func (a *API) handlePutOrgMember(w http.ResponseWriter, r *http.Request) error {
 //     nothing here to remove. This is a 409, not a 200 and not a 204, because a
 //     success on a request that changed nothing is the same lie as (2): the user is
 //     still in the org, and the only way to remove them is in the IdP.
+//
+// # Removing an OWNER requires being one
+//
+// The route is AccessOrgAdmin, and removing an owner is an escalation past the
+// caller's own authority in the most destructive direction there is: the DELETE
+// cascades org_memberships -> project_memberships -> api_keys, so an admin could
+// strip the owner of every project role and every API key they hold in the org, and
+// re-adding the membership does not bring the keys back. Worse, it can leave the org
+// with NO owner at all -- DELETE /orgs/{org} is AccessOrgOwner and granting owner
+// needs CanOwnOrg, so nobody short of a site admin could own or delete it again. The
+// same CanOwnOrg check that stops an admin MINTING an owner stops them unmaking one.
 func (a *API) handleDeleteOrgMember(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	s := scopeFrom(ctx)
+
+	p, ok := principalFrom(ctx)
+	if !ok {
+		return errUnauthorized("authentication required")
+	}
 
 	user, err := a.resolveUser(ctx, r.PathValue("user"))
 	if err != nil {
@@ -167,6 +194,13 @@ func (a *API) handleDeleteOrgMember(w http.ResponseWriter, r *http.Request) erro
 		}
 
 		return fmt.Errorf("load org membership: %w", err)
+	}
+
+	// The target's authority, BEFORE the claim-derived branch: an admin who may not
+	// touch this membership must not learn anything about it either, and must not
+	// reach either write below.
+	if current.Role == auth.OrgRoleOwner && !p.CanOwnOrg(s.OrgID) {
+		return errForbidden("only an organization owner may remove an organization owner")
 	}
 
 	if !current.LocalRole.Valid {
@@ -233,6 +267,40 @@ func (a *API) handleDeleteOrgMember(w http.ResponseWriter, r *http.Request) erro
 		Message: "The user was removed from the organization. Their project roles and every " +
 			"API key they held in it were revoked with the membership.",
 	})
+
+	return nil
+}
+
+// requireAuthorityOverTarget refuses a write against a member whose EFFECTIVE org
+// role outranks the caller's authority: an org OWNER, written by someone who is not
+// one.
+//
+// It reads the EFFECTIVE role (`role`, the generated greatest(oidc, local)), never
+// local_role alone -- an owner by group claim is exactly as much an owner as an owner
+// by local grant, and checking the local half only would leave the claim-derived case
+// open. An owner and a site admin both pass, which is precisely CanOwnOrg's existing
+// semantics: this narrows the route, it widens nothing.
+//
+// A target who holds no membership at all is not an owner, so there is nothing to
+// protect and pgx.ErrNoRows is a pass -- that is the first grant, which is the whole
+// point of the endpoint.
+func (a *API) requireAuthorityOverTarget(
+	ctx context.Context, p Principal, s scope, userID pgtype.UUID, action string,
+) error {
+	current, err := a.store.GetOrgMembership(ctx, repository.GetOrgMembershipParams{
+		UserID: userID, OrgID: s.OrgID,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+
+		return fmt.Errorf("load org membership: %w", err)
+	}
+
+	if current.Role == auth.OrgRoleOwner && !p.CanOwnOrg(s.OrgID) {
+		return errForbidden("only an organization owner may " + action)
+	}
 
 	return nil
 }

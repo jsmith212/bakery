@@ -349,9 +349,168 @@ func TestEndToEndDeleteAPurelyClaimDerivedMembershipIsRefused(t *testing.T) {
 	}
 }
 
-// TestGrantOrgRoleRequiresAnOrgAdmin: the authz matrix is intact, and a denied
-// request writes NOTHING. An API-key principal is refused on the control plane
-// entirely -- a delegation must not become a master key.
+// membershipWrites lists the mutating membership calls the fake recorded. A refused
+// request must have made NONE of them: a 403 that still performed the write is the
+// failure a status-code-only assertion cannot see.
+func membershipWrites(calls []string) []string {
+	var out []string
+
+	for _, call := range calls {
+		switch call {
+		case "GrantOrgMembershipLocal", "RevokeOrgMembershipLocal", "DeleteLocalOrgMembership", "Tx":
+			out = append(out, call)
+		}
+	}
+
+	return out
+}
+
+// TestEndToEndAnOrgAdminCannotDemoteOrEvictTheOwner drives the real handlers against
+// a real Postgres, over the real schema and its real cascade.
+//
+// The scenario is the one M1.5 exists to enable and therefore the one it must not
+// break: a user creates an org (and receives a LOCAL owner grant), then adds an org
+// admin -- the documented workflow. The admin must not be able to turn round and
+// unmake them. Before the target-role guard, they could, and it was irreversible:
+// the membership DELETE cascades org_memberships -> project_memberships -> api_keys,
+// so the owner lost every project role and every API key they held in the org, and
+// the org was left with NO owner (DELETE /orgs is AccessOrgOwner, and granting owner
+// needs CanOwnOrg -- so nobody but a site admin could ever own or delete it again).
+//
+// The caller is a FAKE api.Principal against the REAL store, which is the only way to
+// be an org admin who is not also a site admin here: a real auth.Principal is sealed,
+// and the harness's only real login is the dev site admin. What is under test is the
+// handler's decision, and the handler asks the principal exactly two questions --
+// CanAdminOrg (the guard) and CanOwnOrg (the target check) -- both asserted below.
+func TestEndToEndAnOrgAdminCannotDemoteOrEvictTheOwner(t *testing.T) {
+	h := newHarness(t)
+	h.devLogin()
+
+	// The creator gets a local owner grant on the org they make. (Here that is the
+	// dev-login user; that they are also a site admin is irrelevant -- what is under
+	// test is what an admin may do to a row whose EFFECTIVE role is owner.)
+	if status, body := h.req(http.MethodPost, Prefix+"/orgs",
+		`{"slug":"acme","name":"Acme"}`, nil); status != http.StatusCreated {
+		t.Fatalf("create org: status = %d, body %s", status, body)
+	}
+
+	acme := h.orgID("acme")
+
+	var owner pgtype.UUID
+	if err := h.store.Pool().QueryRow(t.Context(),
+		`SELECT id FROM users WHERE email = $1`, auth.DevEmail).Scan(&owner); err != nil {
+		t.Fatalf("find the owner: %v", err)
+	}
+
+	// The owner holds a project role and an API key in the org. These are what the
+	// cascade destroys, and re-adding the membership does not bring the key back.
+	if status, body := h.req(http.MethodPost, Prefix+"/orgs/acme/projects",
+		`{"slug":"firmware","name":"Firmware"}`, nil); status != http.StatusCreated {
+		t.Fatalf("create project: status = %d, body %s", status, body)
+	}
+
+	if status, body := h.req(http.MethodPost, Prefix+"/orgs/acme/projects/firmware/keys",
+		`{"name":"ci","scope":"write"}`, nil); status != http.StatusCreated {
+		t.Fatalf("mint a key: status = %d, body %s", status, body)
+	}
+
+	// Mallory: an org ADMIN, granted by the owner. The documented workflow.
+	malloryID := h.seedUser("mallory@acme.dev", "Mallory Vance")
+
+	if status, body := h.req(http.MethodPut, Prefix+"/orgs/acme/members/mallory@acme.dev",
+		`{"role":"admin"}`, nil); status != http.StatusOK {
+		t.Fatalf("grant admin: status = %d, body %s", status, body)
+	}
+
+	carlID := h.seedUser("carl@acme.dev", "Carl Reiss")
+
+	if status, body := h.req(http.MethodPut, Prefix+"/orgs/acme/members/carl@acme.dev",
+		`{"role":"member"}`, nil); status != http.StatusOK {
+		t.Fatalf("grant member: status = %d, body %s", status, body)
+	}
+
+	mallory := &fakePrincipal{
+		userID: malloryID, email: "mallory@acme.dev", displayName: "Mallory Vance",
+		method: auth.MethodSession, siteRole: auth.SiteRoleUser,
+		orgs:     map[pgtype.UUID]auth.OrgRole{acme: auth.OrgRoleAdmin},
+		projects: map[pgtype.UUID]auth.ProjectRole{},
+		key:      nil,
+	}
+
+	if !mallory.CanAdminOrg(acme) || mallory.CanOwnOrg(acme) {
+		t.Fatalf("the caller is not the case under test: CanAdminOrg = %v, CanOwnOrg = %v; "+
+			"want true, false", mallory.CanAdminOrg(acme), mallory.CanOwnOrg(acme))
+	}
+
+	keysHeld := func() int {
+		t.Helper()
+
+		var n int
+		if err := h.store.Pool().QueryRow(t.Context(),
+			`SELECT count(*) FROM api_keys k JOIN projects p ON p.id = k.project_id
+			  WHERE k.user_id = $1 AND p.org_id = $2`, owner, acme).Scan(&n); err != nil {
+			t.Fatalf("count the owner's keys: %v", err)
+		}
+
+		return n
+	}
+
+	if got := keysHeld(); got != 1 {
+		t.Fatalf("the owner holds %d keys, want 1: the cascade under test has nothing to destroy", got)
+	}
+
+	// (1) Demote the owner.
+	if w := do(t, h.api, mallory, http.MethodPut,
+		Prefix+"/orgs/acme/members/"+auth.DevEmail, `{"role":"member"}`); w.Code != http.StatusForbidden {
+		t.Fatalf("PUT: status = %d, want 403. An org admin has overwritten the OWNER's "+
+			"local_role. (body %s)", w.Code, w.Body.String())
+	}
+
+	// (2) Evict the owner.
+	if w := do(t, h.api, mallory, http.MethodDelete,
+		Prefix+"/orgs/acme/members/"+auth.DevEmail, ""); w.Code != http.StatusForbidden {
+		t.Fatalf("DELETE: status = %d, want 403. An org admin has EVICTED the owner: the "+
+			"cascade has taken their project roles and every API key they held in the org, "+
+			"and the org now has no owner at all. (body %s)", w.Code, w.Body.String())
+	}
+
+	// Nothing moved. The owner is still an owner, by the same local grant, and still
+	// holds the key.
+	m, ok := h.membership(owner, acme)
+	if !ok {
+		t.Fatal("the owner's membership row is GONE")
+	}
+
+	if m.Role != auth.OrgRoleOwner || !m.LocalRole.Valid || m.LocalRole.OrgRole != auth.OrgRoleOwner {
+		t.Errorf("the owner's membership was mutated: role = %q, local_role = %+v; want owner/owner",
+			m.Role, m.LocalRole)
+	}
+
+	if got := keysHeld(); got != 1 {
+		t.Errorf("the owner holds %d keys, want 1: a refused request cascaded them away", got)
+	}
+
+	// And the guard narrows nothing else: the same admin may still remove an ordinary
+	// member, which is what the endpoint is FOR.
+	if w := do(t, h.api, mallory, http.MethodDelete,
+		Prefix+"/orgs/acme/members/carl@acme.dev", ""); w.Code != http.StatusOK {
+		t.Fatalf("removing an ordinary member: status = %d, want 200 (body %s)",
+			w.Code, w.Body.String())
+	}
+
+	if _, ok := h.membership(carlID, acme); ok {
+		t.Error("the ordinary member survived a removal that should have gone through")
+	}
+}
+
+// TestGrantOrgRoleRequiresAnOrgAdmin: the CALLER half of the authz matrix is intact,
+// on BOTH writes, and a denied request writes NOTHING. An API-key principal is
+// refused on the control plane entirely -- a delegation must not become a master key.
+//
+// This test varies only the caller. That is deliberate and it is only half the
+// matrix: the TARGET half -- whom an authorized caller may write OVER -- is
+// TestOrgMemberWritesRespectTheTargetsAuthority below, and it is the half whose
+// absence let an org admin evict the org's owner.
 func TestGrantOrgRoleRequiresAnOrgAdmin(t *testing.T) {
 	tests := []struct {
 		role string
@@ -367,39 +526,173 @@ func TestGrantOrgRoleRequiresAnOrgAdmin(t *testing.T) {
 		{"anonymous", http.StatusUnauthorized},
 	}
 
+	methods := []struct {
+		method string
+		body   string
+	}{
+		{http.MethodPut, `{"role":"member"}`},
+		{http.MethodDelete, ""},
+	}
+
 	cast := principals(t)
 
 	for _, tt := range tests {
-		t.Run(tt.role, func(t *testing.T) {
-			store := fixtureStore(t)
-			a := testAPI(t, store, nil)
+		for _, m := range methods {
+			t.Run(tt.role+"/"+m.method, func(t *testing.T) {
+				store := fixtureStore(t)
+				a := testAPI(t, store, nil)
 
-			w := do(t, a, cast[tt.role], http.MethodPut,
-				Prefix+"/orgs/acme/members/marko@acme.dev", `{"role":"member"}`)
+				w := do(t, a, cast[tt.role], m.method,
+					Prefix+"/orgs/acme/members/marko@acme.dev", m.body)
 
-			// The authorized cases reach the handler, which needs a transaction the
-			// fake store refuses -- so they surface as a 500, not a 200. What is
-			// asserted here is only the AUTHORIZATION boundary; the transactional
-			// behaviour is asserted DB-backed above.
-			if tt.want == http.StatusOK {
-				if w.Code == http.StatusForbidden || w.Code == http.StatusNotFound ||
-					w.Code == http.StatusUnauthorized {
-					t.Fatalf("status = %d: an authorized caller was refused", w.Code)
+				// The authorized cases reach the handler, which needs writes the fake
+				// store refuses -- so they surface as a 500 (or, for the DELETE of a
+				// claim-derived membership, a 409), not a 200. What is asserted here is
+				// only the AUTHORIZATION boundary; the behaviour is asserted DB-backed
+				// above.
+				if tt.want == http.StatusOK {
+					if w.Code == http.StatusForbidden || w.Code == http.StatusNotFound ||
+						w.Code == http.StatusUnauthorized {
+						t.Fatalf("status = %d: an authorized caller was refused", w.Code)
+					}
+
+					return
 				}
 
-				return
-			}
-
-			if w.Code != tt.want {
-				t.Fatalf("status = %d, want %d (body %s)", w.Code, tt.want, w.Body.String())
-			}
-
-			for _, call := range store.calls {
-				if call == "Tx" {
-					t.Errorf("a refused grant opened a transaction: %v", store.calls)
+				if w.Code != tt.want {
+					t.Fatalf("status = %d, want %d (body %s)", w.Code, tt.want, w.Body.String())
 				}
+
+				if wrote := membershipWrites(store.calls); len(wrote) != 0 {
+					t.Errorf("a refused request wrote anyway: %v", wrote)
+				}
+			})
+		}
+	}
+}
+
+// TestOrgMemberWritesRespectTheTargetsAuthority is the TARGET half of the matrix,
+// and it is the one that was missing.
+//
+// Both membership writes sit at AccessOrgAdmin, so an org ADMIN passes the guard on
+// both. The guard says nothing about WHOM they may write over -- and the org's OWNER
+// is a strictly greater authority than the caller holds. Without a target-role check:
+//
+//	PUT    /orgs/acme/members/<owner> {"role":"member"}  -> 200, the owner is demoted
+//	DELETE /orgs/acme/members/<owner>                    -> 200, the row is DELETED,
+//	  cascading org_memberships -> project_memberships -> api_keys: the owner loses
+//	  every project role and every API key they hold in the org, irreversibly, and the
+//	  org is left with no owner at all.
+//
+// An admin cannot MINT an owner (the CanOwnOrg check on the requested role). This
+// asserts they cannot unmake one either -- in either direction, at either provenance
+// (a claim-derived owner is just as much an owner as a locally granted one), and
+// without reaching the write.
+func TestOrgMemberWritesRespectTheTargetsAuthority(t *testing.T) {
+	acme := mustUUID(t, orgAcmeID)
+	olga := mustUUID(t, userOlgaID)
+
+	base := repository.ListOrgMembersRow{
+		UserID: olga, Role: auth.OrgRoleOwner, Email: "olga@acme.dev", DisplayName: "Olga Novak",
+		OidcRole: repository.NullOrgRole{}, OidcGroup: pgtype.Text{}, LocalRole: repository.NullOrgRole{},
+		GrantedBy: pgtype.UUID{}, GrantedAt: pgtype.Timestamptz{}, GrantedByEmail: pgtype.Text{},
+	}
+
+	localOwner := base
+	localOwner.LocalRole = repository.NullOrgRole{OrgRole: auth.OrgRoleOwner, Valid: true}
+
+	claimOwner := base
+	claimOwner.OidcRole = repository.NullOrgRole{OrgRole: auth.OrgRoleOwner, Valid: true}
+	claimOwner.OidcGroup = pgtype.Text{String: "acme-leads", Valid: true}
+
+	// The control. Same caller, same route, an ordinary member -- and it must still
+	// go through, or the guard has simply broken the endpoint.
+	localMember := base
+	localMember.Role = auth.OrgRoleMember
+	localMember.LocalRole = repository.NullOrgRole{OrgRole: auth.OrgRoleMember, Valid: true}
+
+	targets := []struct {
+		name string
+		row  repository.ListOrgMembersRow
+		// deniedTo lists the callers who must be REFUSED against this target.
+		deniedTo map[string]bool
+	}{
+		{"an owner by local grant", localOwner, map[string]bool{"org_admin": true}},
+		{"an owner by group claim", claimOwner, map[string]bool{"org_admin": true}},
+		{"an ordinary member", localMember, map[string]bool{}},
+	}
+
+	methods := []struct {
+		method string
+		body   string
+	}{
+		{http.MethodPut, `{"role":"member"}`},
+		{http.MethodDelete, ""},
+	}
+
+	cast := principals(t)
+	callers := []string{"site_admin", "org_owner", "org_admin"}
+
+	for _, target := range targets {
+		for _, caller := range callers {
+			for _, m := range methods {
+				t.Run(target.name+"/"+caller+"/"+m.method, func(t *testing.T) {
+					store := fixtureStore(t)
+					store.orgMembers[acme] = append(store.orgMembers[acme], target.row)
+					store.users = append(store.users, repository.User{
+						ID: olga, Email: "olga@acme.dev", DisplayName: "Olga Novak",
+					})
+
+					a := testAPI(t, store, nil)
+
+					w := do(t, a, cast[caller], m.method,
+						Prefix+"/orgs/acme/members/olga@acme.dev", m.body)
+
+					if target.deniedTo[caller] {
+						if w.Code != http.StatusForbidden {
+							t.Fatalf("status = %d, want 403: %s wrote over %s. An org admin "+
+								"must not be able to demote or evict the org's owner -- the DELETE "+
+								"cascades the owner's project roles and API keys away and leaves "+
+								"the org ownerless. (body %s)",
+								w.Code, caller, target.name, w.Body.String())
+						}
+
+						if wrote := membershipWrites(store.calls); len(wrote) != 0 {
+							t.Errorf("the refused request reached the write anyway: %v", wrote)
+						}
+
+						return
+					}
+
+					// Permitted. The fake refuses the hybrid writes, so this surfaces as a
+					// 500 (or a 409 on the claim-derived DELETE). Only "was not REFUSED" is
+					// asserted; the behaviour is DB-backed above.
+					if w.Code == http.StatusForbidden {
+						t.Fatalf("status = 403: %s was refused against %s (body %s)",
+							caller, target.name, w.Body.String())
+					}
+				})
 			}
-		})
+		}
+	}
+}
+
+// TestAnOrgAdminMayNotMintAnOwner pins the other direction of the same boundary --
+// the guard that DID exist -- so the two halves cannot drift apart.
+func TestAnOrgAdminMayNotMintAnOwner(t *testing.T) {
+	store := fixtureStore(t)
+	a := testAPI(t, store, nil)
+
+	w := do(t, a, principals(t)["org_admin"], http.MethodPut,
+		Prefix+"/orgs/acme/members/marko@acme.dev", `{"role":"owner"}`)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403: an org admin minted an owner (body %s)",
+			w.Code, w.Body.String())
+	}
+
+	if wrote := membershipWrites(store.calls); len(wrote) != 0 {
+		t.Errorf("the refused grant wrote anyway: %v", wrote)
 	}
 }
 
