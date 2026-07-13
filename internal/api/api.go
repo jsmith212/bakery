@@ -301,6 +301,13 @@ func (a *API) mount(mux *http.ServeMux) {
 	a.route(mux, AccessProjectRead, "DELETE "+p+"/orgs/{org}/projects/{project}/keys/{key}",
 		a.handleRevokeKey)
 
+	// ---- config-snippet generator. DESIGN.md's highest-value screen: it mints a key
+	// and emits a ready-to-paste client config with it embedded. ProjectRead is the
+	// floor -- the write-scope cap lives in auth.CreateAPIKey, exactly as for the raw
+	// key mint above -- so a reader can generate a read snippet but not a write one.
+	a.route(mux, AccessProjectRead, "POST "+p+"/orgs/{org}/projects/{project}/snippet",
+		a.handleGenerateSnippet)
+
 	// ---- cache backends. Config rows only; no backend serves traffic in M1.
 	a.route(mux, AccessProjectRead, "GET "+p+"/orgs/{org}/projects/{project}/backends",
 		a.handleListBackends)

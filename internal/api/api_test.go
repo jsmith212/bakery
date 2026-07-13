@@ -88,6 +88,8 @@ func TestRouteTable(t *testing.T) {
 		{AccessProjectRead, "POST /api/v1/orgs/{org}/projects/{project}/keys"},
 		{AccessProjectRead, "DELETE /api/v1/orgs/{org}/projects/{project}/keys/{key}"},
 
+		{AccessProjectRead, "POST /api/v1/orgs/{org}/projects/{project}/snippet"},
+
 		{AccessProjectRead, "GET /api/v1/orgs/{org}/projects/{project}/backends"},
 		{AccessProjectAdmin, "POST /api/v1/orgs/{org}/projects/{project}/backends"},
 		{AccessProjectRead, "GET /api/v1/orgs/{org}/projects/{project}/backends/{kind}"},
