@@ -8,14 +8,24 @@
 -- within an issuer, and email is mutable and reassignable in the IdP, so keying a
 -- user on it is an account-takeover vector.
 --
+-- Writes site_role_OIDC, never site_role. Since 000008 site_role is GENERATED as
+-- coalesce(greatest(site_role_oidc, site_role_local), 'user') -- the database
+-- computes the effective role and refuses a direct write, so a login cannot
+-- clobber a local site-admin grant even by accident. The reconciler owns exactly
+-- one of the two sources and names only that one.
+--
+-- NULLIF: 'user' is the ORDINARY site role, i.e. the ABSENCE of a grant, not a
+-- claim of one. Storing it would assert the IdP affirmatively claimed it, and
+-- would make an ordinary user indistinguishable from one the IdP had demoted.
+--
 -- name: UpsertUser :one
-INSERT INTO users (issuer, subject, email, display_name, site_role, last_login_at)
-VALUES ($1, $2, $3, $4, $5, now())
+INSERT INTO users (issuer, subject, email, display_name, site_role_oidc, last_login_at)
+VALUES ($1, $2, $3, $4, NULLIF(sqlc.arg(site_role)::site_role, 'user'), now())
 ON CONFLICT (issuer, subject) DO UPDATE
-   SET email         = EXCLUDED.email,
-       display_name  = EXCLUDED.display_name,
-       site_role     = EXCLUDED.site_role,
-       last_login_at = now()
+   SET email          = EXCLUDED.email,
+       display_name   = EXCLUDED.display_name,
+       site_role_oidc = EXCLUDED.site_role_oidc,
+       last_login_at  = now()
 RETURNING *;
 
 -- name: GetUser :one
@@ -43,14 +53,30 @@ SELECT * FROM users ORDER BY email;
 -- wipe every project role and API key the user has. Re-adding the org membership
 -- does NOT restore them. This guard is mandatory.
 --
+-- INCOMPLETE SINCE 000008, AND DELIBERATELY LEFT SO. This DELETE is blind to
+-- local_role: it removes every row outside the keep-set regardless of whether a
+-- local grant justifies it, which is precisely what the hybrid model forbids. It
+-- is still CORRECT TODAY only because nothing can write local_role yet -- no API
+-- path grants one -- so there is no local grant for it to destroy.
+--
+-- It MUST be replaced (set oidc_role/oidc_group to NULL, then delete the row iff
+-- local_role IS NULL) BEFORE any endpoint writes local_role, or the first local
+-- grant a user receives is silently cascade-deleted by their next login, taking
+-- their project roles and API keys with it. See the reconciler task in
+-- docs/design/specs/2026-07-12-hybrid-role-model-plan.md.
+--
 -- name: ReconcileOrgMembershipsRemove :execrows
 DELETE FROM org_memberships
  WHERE user_id = $1 AND org_id <> ALL(sqlc.arg(keep)::uuid[]);
 
+-- Writes oidc_ROLE, never role. Since 000008 `role` is GENERATED as
+-- greatest(oidc_role, local_role) and refuses a direct write, so the reconciler
+-- cannot clobber a local grant: it does not name the column that holds one.
+--
 -- name: ReconcileOrgMembershipUpsert :exec
-INSERT INTO org_memberships (user_id, org_id, role)
+INSERT INTO org_memberships (user_id, org_id, oidc_role)
 VALUES ($1, $2, $3)
-ON CONFLICT (user_id, org_id) DO UPDATE SET role = EXCLUDED.role;
+ON CONFLICT (user_id, org_id) DO UPDATE SET oidc_role = EXCLUDED.oidc_role;
 
 -- name: ListOrgMembershipsForUser :many
 SELECT om.org_id, om.role, o.slug, o.name

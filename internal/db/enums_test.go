@@ -232,8 +232,9 @@ func seedKeyholder(t *testing.T, ctx context.Context, pool *pgxpool.Pool) (userI
 		t.Fatalf("seed user: %v", err)
 	}
 
+	// oidc_role, not role: since 000008 `role` is generated and refuses a write.
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO org_memberships (user_id, org_id, role) VALUES ($1, $2, 'member')`,
+		`INSERT INTO org_memberships (user_id, org_id, oidc_role) VALUES ($1, $2, 'member')`,
 		userID, orgID,
 	); err != nil {
 		t.Fatalf("seed org membership: %v", err)

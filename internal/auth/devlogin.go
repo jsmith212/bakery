@@ -88,10 +88,12 @@ func (s *Service) seedDevUser(ctx context.Context) (pgtype.UUID, error) {
 		// Org membership must exist before the project membership: the composite FK
 		// from project_memberships to org_memberships makes "a project member is an
 		// org member" a fact the database enforces, not one we remember.
+		// oidc_role: the dev login is a synthetic CLAIM, not a local grant. It must
+		// reconcile away like any other claim-derived membership.
 		if err := q.ReconcileOrgMembershipUpsert(ctx, repository.ReconcileOrgMembershipUpsertParams{
-			UserID: user.ID,
-			OrgID:  orgID,
-			Role:   OrgRoleOwner,
+			UserID:   user.ID,
+			OrgID:    orgID,
+			OidcRole: repository.NullOrgRole{OrgRole: OrgRoleOwner, Valid: true},
 		}); err != nil {
 			return fmt.Errorf("upsert dev org membership: %w", err)
 		}

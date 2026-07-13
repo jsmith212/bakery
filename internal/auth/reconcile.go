@@ -82,10 +82,14 @@ func (s *Service) Reconcile(ctx context.Context, id Identity) (pgtype.UUID, erro
 				continue
 			}
 
+			// The OIDC half, and only the OIDC half. `role` is generated from
+			// greatest(oidc_role, local_role), so a local grant this reconciler
+			// knows nothing about survives -- structurally, because the column that
+			// holds it is never named here.
 			err := q.ReconcileOrgMembershipUpsert(ctx, repository.ReconcileOrgMembershipUpsertParams{
-				UserID: user.ID,
-				OrgID:  orgID,
-				Role:   orgRole(role),
+				UserID:   user.ID,
+				OrgID:    orgID,
+				OidcRole: repository.NullOrgRole{OrgRole: orgRole(role), Valid: true},
 			})
 			if err != nil {
 				return fmt.Errorf("upsert org membership: %w", err)
