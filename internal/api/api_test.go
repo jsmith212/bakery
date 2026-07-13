@@ -57,7 +57,7 @@ func TestRouteTable(t *testing.T) {
 		{AccessAuthenticated, "GET /api/v1/me"},
 
 		{AccessAuthenticated, "GET /api/v1/orgs"},
-		{AccessSiteAdmin, "POST /api/v1/orgs"},
+		{AccessUser, "POST /api/v1/orgs"},
 		{AccessOrgView, "GET /api/v1/orgs/{org}"},
 		{AccessOrgAdmin, "PATCH /api/v1/orgs/{org}"},
 		{AccessOrgOwner, "DELETE /api/v1/orgs/{org}"},
@@ -89,7 +89,7 @@ func TestRouteTable(t *testing.T) {
 
 	a := &API{
 		store: fixtureStore(t), auth: devLoginAuth{enabled: false}, keys: nil,
-		log: discardLogger(), metrics: nil, routes: nil,
+		log: discardLogger(), allowSelfServeOrgs: true, metrics: nil, routes: nil,
 	}
 	a.mount(http.NewServeMux())
 
@@ -133,7 +133,7 @@ func TestDevLoginRouteDoesNotExistWhenDisabled(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			a := &API{
 				store: fixtureStore(t), auth: devLoginAuth{enabled: tt.enabled}, keys: nil,
-				log: discardLogger(), metrics: nil, routes: nil,
+				log: discardLogger(), allowSelfServeOrgs: true, metrics: nil, routes: nil,
 			}
 
 			mux := http.NewServeMux()

@@ -36,9 +36,19 @@ const (
 	// AccessPublic is a route with no principal at all: /auth/config, the OIDC
 	// redirect and callback, dev-login. Anything else being Public is a bug.
 	AccessPublic Access = iota
-	// AccessAuthenticated needs a verified principal and nothing more (/me).
+	// AccessAuthenticated needs a verified principal and nothing more (/me). It is
+	// the ONLY level an API key may reach -- see guard.
 	AccessAuthenticated
-	// AccessSiteAdmin is site-admin only: creating an organization.
+	// AccessUser needs a verified HUMAN principal: a session or a CLI login, never
+	// an API key. Creating an organization is the one route at this level.
+	//
+	// It exists precisely so that route does not have to be AccessAuthenticated,
+	// which is the level the guard lets an API key through. A key that could create
+	// an org would receive a local OWNER grant on it (see handleCreateOrg), and a
+	// delegation would have quietly become a master key -- with a fresh tenant to be
+	// master of.
+	AccessUser
+	// AccessSiteAdmin is site-admin only.
 	AccessSiteAdmin
 	// AccessOrgView needs {org} and CanViewOrg.
 	AccessOrgView
@@ -69,6 +79,8 @@ func (a Access) String() string {
 		return "public"
 	case AccessAuthenticated:
 		return "authenticated"
+	case AccessUser:
+		return "user"
 	case AccessSiteAdmin:
 		return "site_admin"
 	case AccessOrgView:
@@ -348,7 +360,7 @@ func (a *API) resolve(ctx context.Context, r *http.Request, access Access, p Pri
 		if !p.CanOwnOrg(org.ID) {
 			return scope{}, errForbidden("this action requires the organization owner")
 		}
-	case AccessPublic, AccessAuthenticated, AccessSiteAdmin, AccessOrgView,
+	case AccessPublic, AccessAuthenticated, AccessUser, AccessSiteAdmin, AccessOrgView,
 		AccessProjectRead, AccessProjectAdmin:
 		// AccessOrgView: satisfied by CanViewOrg above. AccessProjectRead and
 		// AccessProjectAdmin are checked after project resolution. The rest cannot

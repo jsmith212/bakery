@@ -64,7 +64,10 @@ func newHarness(t *testing.T) *harness {
 		t.Fatalf("seed dev login: %v", err)
 	}
 
-	a, err := New(Config{Store: store, Auth: svc, Metrics: metrics.New(), Log: log})
+	a, err := New(Config{
+		Store: store, Auth: svc, Metrics: metrics.New(), Log: log,
+		AllowSelfServeOrgs: true,
+	})
 	if err != nil {
 		t.Fatalf("api.New: %v", err)
 	}

@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/jsmith212/bakery/internal/auth"
 	"github.com/jsmith212/bakery/internal/db/repository"
 	"github.com/jsmith212/bakery/internal/slug"
 )
@@ -119,14 +120,58 @@ func (a *API) handleCreateProject(w http.ResponseWriter, r *http.Request) error 
 		req.Name = req.Slug
 	}
 
-	project, err := a.store.CreateProject(ctx, repository.CreateProjectParams{
-		OrgID: s.OrgID, Slug: req.Slug, Name: req.Name,
+	// The project and the creator's ADMIN role on it are ONE transaction, for the
+	// same reason org creation and its owner grant are.
+	//
+	// The creator can already administer the project by virtue of their org role --
+	// but they cannot mint a KEY for it, because api_keys carries
+	// `FOREIGN KEY (user_id, project_id) REFERENCES project_memberships`: a key for a
+	// non-member cannot exist, and CreateAPIKey refuses with `scope_exceeds_role`
+	// before the database gets the chance to. So "create org -> create project ->
+	// mint a key" dead-ended one step further along than the org grant alone fixes,
+	// and this is the other half of it.
+	//
+	// The grant is guarded in SQL on the creator actually being an org member, so a
+	// SITE ADMIN creating a project in an org they do not belong to gets a no-op
+	// rather than a foreign-key 500. Nobody else can hit that path: creating an org
+	// now makes you a member of it.
+	var project repository.Project
+
+	err := a.store.Tx(ctx, func(q *repository.Queries) error {
+		created, err := q.CreateProject(ctx, repository.CreateProjectParams{
+			OrgID: s.OrgID, Slug: req.Slug, Name: req.Name,
+		})
+		if err != nil {
+			return fmt.Errorf("create project %q: %w", req.Slug, err)
+		}
+
+		if _, err := q.GrantProjectMembershipToCreator(ctx,
+			repository.GrantProjectMembershipToCreatorParams{
+				UserID: p.UserID(), ProjectID: created.ID,
+			}); err != nil {
+			return fmt.Errorf("grant the creator the project admin role: %w", err)
+		}
+
+		project = created
+
+		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("create project %q: %w", req.Slug, err)
+		return err
 	}
 
-	writeJSON(w, http.StatusCreated, newProject(project, s.OrgSlug, nil, p))
+	out := newProject(project, s.OrgSlug, nil, p)
+
+	// As with org creation: the principal was built before this project existed, so
+	// it cannot know the caller's role in it. The grant above is what makes `admin`
+	// true -- unless the caller is a site admin who is not an org member, in which
+	// case the grant was a no-op and reporting a role they do not hold would be a lie
+	// the very next request contradicts.
+	if _, isMember := p.OrgRole(s.OrgID); isMember {
+		out.Role = string(auth.ProjectRoleAdmin)
+	}
+
+	writeJSON(w, http.StatusCreated, out)
 
 	return nil
 }

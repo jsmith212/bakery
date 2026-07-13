@@ -258,6 +258,33 @@ SELECT $1, p.id, p.org_id, $3
 ON CONFLICT (user_id, project_id) DO UPDATE SET role = EXCLUDED.role
 RETURNING *;
 
+-- Gives a project's CREATOR the admin role on it, in the same transaction that
+-- creates the project. Without this the creator can administer the project (an org
+-- admin CanAdminProject) but cannot mint a key for it: api_keys carries
+-- `FOREIGN KEY (user_id, project_id) REFERENCES project_memberships`, so a key for
+-- a non-member CANNOT EXIST, and the scope cap refuses them with
+-- `scope_exceeds_role`. That is the second half of the dead-end M1.5 abolishes.
+--
+-- The EXISTS guard is load-bearing. project_memberships carries
+-- `FOREIGN KEY (user_id, org_id) REFERENCES org_memberships`, so this INSERT would
+-- be a 23503 -- a 500 on an otherwise valid request -- for a creator who is not an
+-- org member. A SITE ADMIN is exactly that: they may create a project in any org
+-- without belonging to it. So the guard makes the grant a no-op for them rather
+-- than an error, and they take the ordinary route (grant yourself a role) if they
+-- want a key. It cannot silently skip anyone else: creating an org now MAKES you a
+-- member of it.
+--
+-- name: GrantProjectMembershipToCreator :execrows
+INSERT INTO project_memberships (user_id, project_id, org_id, role)
+SELECT sqlc.arg(user_id), p.id, p.org_id, 'admin'
+  FROM projects p
+ WHERE p.id = sqlc.arg(project_id)
+   AND EXISTS (
+       SELECT 1 FROM org_memberships om
+        WHERE om.user_id = sqlc.arg(user_id) AND om.org_id = p.org_id
+   )
+ON CONFLICT (user_id, project_id) DO NOTHING;
+
 -- name: GetProjectMembership :one
 SELECT * FROM project_memberships WHERE user_id = $1 AND project_id = $2;
 

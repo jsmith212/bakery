@@ -79,7 +79,7 @@ func testAPI(t *testing.T, store Store, minter keyMinter) *API {
 
 	return &API{
 		store: store, auth: devLoginAuth{enabled: false}, keys: minter,
-		log: discardLogger(), metrics: nil, routes: nil,
+		log: discardLogger(), allowSelfServeOrgs: true, metrics: nil, routes: nil,
 	}
 }
 
@@ -186,6 +186,7 @@ func TestGuardAuthorizationMatrix(t *testing.T) {
 	patterns := map[Access]struct{ method, pattern, target string }{
 		AccessPublic:        {http.MethodGet, "GET /x", "/x"},
 		AccessAuthenticated: {http.MethodGet, "GET /x", "/x"},
+		AccessUser:          {http.MethodPost, "POST /x", "/x"},
 		AccessSiteAdmin:     {http.MethodPost, "POST /x", "/x"},
 		AccessOrgView:       {http.MethodGet, "GET /orgs/{org}", "/orgs/acme"},
 		AccessOrgAdmin:      {http.MethodPost, "POST /orgs/{org}", "/orgs/acme"},
@@ -208,6 +209,14 @@ func TestGuardAuthorizationMatrix(t *testing.T) {
 			"anonymous": anon, "site_admin": allow, "org_owner": allow, "org_admin": allow,
 			"org_member": allow, "proj_admin": allow, "proj_write": allow, "proj_read": allow,
 			"outsider": allow, "api_key": allow,
+		},
+		// A verified HUMAN. Every role passes; an API KEY does not, and that is the
+		// whole reason the level exists: the one route on it (creating an org) hands
+		// the caller a local owner grant, and a delegation must not become a master key.
+		AccessUser: {
+			"anonymous": anon, "site_admin": allow, "org_owner": allow, "org_admin": allow,
+			"org_member": allow, "proj_admin": allow, "proj_write": allow, "proj_read": allow,
+			"outsider": allow, "api_key": denied,
 		},
 		AccessSiteAdmin: {
 			"anonymous": anon, "site_admin": allow, "org_owner": denied, "org_admin": denied,
@@ -298,7 +307,7 @@ func TestEveryAccessIsInTheMatrix(t *testing.T) {
 	}
 
 	// If someone appends a constant after AccessProjectAdmin, this catches it.
-	if AccessProjectAdmin+1 != 8 {
+	if AccessProjectAdmin+1 != 9 {
 		t.Errorf("a new Access constant was added: extend patterns{} and matrix{} in "+
 			"TestGuardAuthorizationMatrix, then update this bound. Highest is now %d",
 			int(AccessProjectAdmin)+1)

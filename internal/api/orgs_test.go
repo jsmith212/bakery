@@ -105,15 +105,21 @@ func TestCreateOrgRejectsReservedSlugs(t *testing.T) {
 		})
 	}
 
-	// The control: a perfectly ordinary slug is accepted, so the test above is not
-	// passing merely because creation is broken.
-	t.Run("a normal slug is accepted", func(t *testing.T) {
+	// The control: a perfectly ordinary slug is NOT rejected, so the test above is
+	// not passing merely because creation is broken.
+	//
+	// It cannot assert a 201 any more. Creating an org and granting its creator a
+	// local owner role are one transaction, and fakeStore.Tx refuses -- deliberately,
+	// because a fake cannot demonstrate atomicity. So the assertion is that the slug
+	// got PAST validation and reached the transaction; the 201 is asserted DB-backed,
+	// in TestEndToEndCreateOrgThenProjectThenKey.
+	t.Run("a normal slug is not rejected", func(t *testing.T) {
 		store := fixtureStore(t)
 		a := testAPI(t, store, nil)
 
 		w := do(t, a, admin, http.MethodPost, Prefix+"/orgs", `{"slug":"widgets","name":"Widgets"}`)
-		if w.Code != http.StatusCreated {
-			t.Fatalf("status = %d, want %d (body %s)", w.Code, http.StatusCreated, w.Body.String())
+		if w.Code == http.StatusUnprocessableEntity {
+			t.Fatalf("an ordinary slug was rejected: status = %d (body %s)", w.Code, w.Body.String())
 		}
 	})
 

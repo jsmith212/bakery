@@ -159,7 +159,10 @@ func Boot(ctx context.Context, p BootParams) error {
 			"with no credential. This is a total authentication bypass. Never run this in production.")
 	}
 
-	apiSrv, err := api.New(api.Config{Store: store, Auth: authSvc, Metrics: m, Log: log})
+	apiSrv, err := api.New(api.Config{
+		Store: store, Auth: authSvc, Metrics: m, Log: log,
+		AllowSelfServeOrgs: cmd.AllowSelfServeOrgs,
+	})
 	if err != nil {
 		return fmt.Errorf("build api: %w", err)
 	}

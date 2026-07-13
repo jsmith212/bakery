@@ -49,6 +49,15 @@ type Config struct {
 	// r.URL.Path, which would mint a time series per org/project/key id.
 	Metrics *metrics.Metrics
 	Log     *slog.Logger
+
+	// AllowSelfServeOrgs lets ANY signed-in human create an organization (and become
+	// its local owner). Off restricts creation to site admins.
+	//
+	// The zero value is OFF, which is the restrictive one: a caller who forgets this
+	// field gets the M1 behaviour, not an open door. The PRODUCT default is on, and
+	// it lives where a deployment decision belongs -- the Kong flag
+	// (--allow-self-serve-orgs / ALLOW_SELF_SERVE_ORGS), which defaults to true.
+	AllowSelfServeOrgs bool
 }
 
 // API is the control-plane API.
@@ -57,6 +66,10 @@ type API struct {
 	auth  authService
 	keys  keyMinter
 	log   *slog.Logger
+
+	// allowSelfServeOrgs: see Config.AllowSelfServeOrgs. Read only by
+	// handleCreateOrg, and never written after New.
+	allowSelfServeOrgs bool
 
 	metrics *metrics.Metrics
 
@@ -99,12 +112,13 @@ func New(cfg Config) (*API, error) {
 	}
 
 	return &API{
-		store:   cfg.Store,
-		auth:    cfg.Auth,
-		keys:    serviceKeyMinter{svc: cfg.Auth},
-		log:     log,
-		metrics: cfg.Metrics,
-		routes:  nil,
+		store:              cfg.Store,
+		auth:               cfg.Auth,
+		keys:               serviceKeyMinter{svc: cfg.Auth},
+		log:                log,
+		allowSelfServeOrgs: cfg.AllowSelfServeOrgs,
+		metrics:            cfg.Metrics,
+		routes:             nil,
 	}, nil
 }
 
@@ -211,7 +225,11 @@ func (a *API) mount(mux *http.ServeMux) {
 
 	// ---- organizations
 	a.route(mux, AccessAuthenticated, "GET "+p+"/orgs", a.handleListOrgs)
-	a.route(mux, AccessSiteAdmin, "POST "+p+"/orgs", a.handleCreateOrg)
+	// AccessUser, not AccessAuthenticated: creating an org grants the creator a local
+	// OWNER role on it, so an API key that could reach this route would become the
+	// owner of a brand-new tenant. AccessAuthenticated is the one level the guard
+	// admits a key to, and this route must not sit on it.
+	a.route(mux, AccessUser, "POST "+p+"/orgs", a.handleCreateOrg)
 	a.route(mux, AccessOrgView, "GET "+p+"/orgs/{org}", a.handleGetOrg)
 	a.route(mux, AccessOrgAdmin, "PATCH "+p+"/orgs/{org}", a.handleUpdateOrg)
 	a.route(mux, AccessOrgOwner, "DELETE "+p+"/orgs/{org}", a.handleDeleteOrg)

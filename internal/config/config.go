@@ -274,6 +274,18 @@ type ServeCmd struct {
 	// the schema and no S3 driver in the binary.
 	StorageDir string `default:"./data" env:"STORAGE_DIR" help:"Directory the local storage driver writes blobs to." type:"path"`
 
+	// Self-serve orgs: ANY signed-in human may create an organization, and becomes
+	// its LOCAL OWNER (see internal/api's handleCreateOrg). Default ON.
+	//
+	// Off restricts creation to site admins. It does NOT restore the M1 dead-end:
+	// the creator still gets the owner grant, because an org whose creator holds no
+	// membership in it is an org nobody can ever join.
+	//
+	// An API key can never reach the endpoint whatever this says -- the route is
+	// AccessUser, which the guard admits no key to. A delegation must not become a
+	// master key, least of all the master of a brand-new tenant.
+	AllowSelfServeOrgs bool `default:"true" env:"ALLOW_SELF_SERVE_ORGS" help:"Let any signed-in user create an organization. They become its owner. Off restricts creation to site admins." negatable:""`
+
 	// DEV_LOGIN_ENABLED is reachable ONLY from here -- this flag or its env var.
 	//
 	// There is deliberately no UI control, no API endpoint and no database column

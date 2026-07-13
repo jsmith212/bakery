@@ -2,9 +2,11 @@ package api
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
+	"github.com/jsmith212/bakery/internal/auth"
 	"github.com/jsmith212/bakery/internal/db/repository"
 	"github.com/jsmith212/bakery/internal/slug"
 )
@@ -56,13 +58,48 @@ func (a *API) handleListOrgs(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// handleCreateOrg creates an organization. Site admin only (AccessSiteAdmin).
+// handleCreateOrg creates an organization AND MAKES THE CREATOR ITS LOCAL OWNER,
+// in one transaction. AccessUser -- any signed-in human, unless self-serve is off.
+//
+// # The dead-end this exists to abolish
+//
+// Creating an org used to grant no membership in it. There is no group mapping for
+// an org that did not exist a second ago, and there could not be -- so the creator,
+// site admin or not, was not a member of their own org, was therefore not a project
+// member of anything in it, and the API-key scope cap (which is capped at the
+// caller's PROJECT role at grant time, deliberately without a join, so the sstate
+// HEAD storm stays a single index probe) refused them with `scope_exceeds_role`.
+// They had created an org they could not use, and the only ways out were an LDAP
+// round trip or a psql session.
+//
+// The grant is LOCAL -- local_role = owner, with granted_by and granted_at -- and
+// never oidc_role: no group claim says this, and forging one would be a lie the
+// next login would rightly reconcile away. The local half is exactly the half the
+// reconciler cannot touch, so the grant survives every login the creator ever makes.
+//
+// # Why it is one transaction
+//
+// A crash between the INSERT and the grant leaves an org with no members. Nobody
+// can ever join it: adding a member requires being an admin of the org, and there
+// is no admin. It cannot be deleted either -- that requires being its owner. It is
+// precisely the orphaned, unusable org this milestone exists to abolish, and it
+// would be created by the very code meant to abolish it. So both statements go
+// through store.Tx and the org is not created at all unless its owner is.
 func (a *API) handleCreateOrg(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 
 	p, ok := principalFrom(ctx)
 	if !ok {
 		return errUnauthorized("authentication required")
+	}
+
+	// The guard has already refused an API-key principal (AccessUser is not
+	// AccessAuthenticated), which matters here more than anywhere: this endpoint
+	// hands its caller ownership of a fresh tenant, and a key that could reach it
+	// would be a delegation that had become a master key.
+	if !a.allowSelfServeOrgs && !p.IsSiteAdmin() {
+		return errForbidden("creating an organization is restricted to site administrators " +
+			"on this installation")
 	}
 
 	var req CreateOrgRequest
@@ -88,14 +125,47 @@ func (a *API) handleCreateOrg(w http.ResponseWriter, r *http.Request) error {
 		req.Name = req.Slug
 	}
 
-	org, err := a.store.CreateOrganization(ctx, repository.CreateOrganizationParams{
-		Slug: req.Slug, Name: req.Name,
+	var org repository.Organization
+
+	err := a.store.Tx(ctx, func(q *repository.Queries) error {
+		created, err := q.CreateOrganization(ctx, repository.CreateOrganizationParams{
+			Slug: req.Slug, Name: req.Name,
+		})
+		if err != nil {
+			return fmt.Errorf("create organization %q: %w", req.Slug, err)
+		}
+
+		if _, err := q.GrantOrgMembershipLocal(ctx, repository.GrantOrgMembershipLocalParams{
+			UserID:    p.UserID(),
+			OrgID:     created.ID,
+			LocalRole: repository.NullOrgRole{OrgRole: auth.OrgRoleOwner, Valid: true},
+			GrantedBy: p.UserID(),
+		}); err != nil {
+			return fmt.Errorf("grant the creator a local owner role: %w", err)
+		}
+
+		org = created
+
+		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("create organization %q: %w", req.Slug, err)
+		return err
 	}
 
-	writeJSON(w, http.StatusCreated, newOrg(org, p))
+	a.log.InfoContext(ctx, "created an organization; the creator is its local owner",
+		slog.String("org", org.Slug),
+		slog.String("owner", p.Email()),
+	)
+
+	// newOrg reports the CALLER's role in the org, and it reads it from the
+	// principal -- which was built at authentication time, before this org existed.
+	// So it would say "" here, and the console would render a brand-new org the
+	// creator apparently cannot administer. The grant above is what makes owner the
+	// true answer; say so.
+	created := newOrg(org, p)
+	created.Role = string(auth.OrgRoleOwner)
+
+	writeJSON(w, http.StatusCreated, created)
 
 	return nil
 }
