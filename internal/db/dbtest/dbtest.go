@@ -113,7 +113,21 @@ func NewWithDSN(t *testing.T) (*pgxpool.Pool, string) {
 
 	dsn := replaceDBName(srv.adminDSN, name)
 
-	pool, err := pgxpool.New(ctx, dsn)
+	// db.NewPool, not pgxpool.New: tests must run against the pool the server
+	// actually serves from, and the difference is not cosmetic -- NewPool's
+	// AfterConnect is what registers the enum types, without which any query
+	// binding an enum ARRAY (`scope = ANY($1::api_key_scope[])`) dies with
+	// "cannot find encode plan". A raw pool here would let that bug pass the
+	// whole DB suite, which is exactly how it survived M1.
+	//
+	// The clone is made from an already-migrated template, so the types exist.
+	//
+	// RETRIED, because NewPool pings on a 5s deadline and that deadline is a
+	// PRODUCTION guarantee we will not relax to suit a test harness: `go test
+	// ./...` starts a Postgres container per package, and half a dozen of them
+	// coming up at once can push a first connection past 5s on a loaded machine.
+	// A cold start is not a dead database, so retry it rather than fail the test.
+	pool, err := openPool(ctx, dsn)
 	if err != nil {
 		dropDatabase(srv, name)
 		t.Fatalf("dbtest: open pool on %s: %v", name, err)
@@ -478,4 +492,41 @@ SKIPPING DATABASE TESTS -- no Postgres available.
   These tests did not run. They did not pass.
 ================================================================================`,
 		err, image, DSNEnv, DSNEnv)
+}
+
+// poolOpenTimeout bounds the retry in openPool. Generous: it only ever elapses
+// if the database really is unreachable, in which case the test fails anyway.
+const poolOpenTimeout = 90 * time.Second
+
+// openPool is db.NewPool with a bounded retry, and it exists only because the
+// test harness runs many Postgres containers at once. See the call site.
+//
+// It keeps the pool small: a test database serves a handful of queries, and the
+// production default (MaxConns 16, MinConns 2 eagerly opened) multiplied by every
+// parallel test database is a lot of idle backends for no benefit.
+func openPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+	deadline := time.Now().Add(poolOpenTimeout)
+
+	for attempt := 1; ; attempt++ {
+		pool, err := db.NewPool(ctx, db.Config{URL: dsn, MaxConns: 4})
+		if err == nil {
+			return pool, nil
+		}
+
+		// A database missing an enum type is a REAL failure -- it is the bug the
+		// registration exists to catch -- and no amount of retrying fixes it.
+		if errors.Is(err, db.ErrEnumTypeMissing) {
+			return nil, err
+		}
+
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return nil, fmt.Errorf("open pool after %d attempts: %w", attempt, err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }

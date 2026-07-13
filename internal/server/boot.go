@@ -45,6 +45,10 @@ type BootParams struct {
 	Ready func(public, metricsAddr net.Addr)
 }
 
+// bootstrapMaxConns sizes the bootstrap pool: one connection pinned by BootLock
+// for the process lifetime, one for the migrations, one spare.
+const bootstrapMaxConns = 3
+
 // Boot brings up a full server: pool, boot lock, migrations, metrics, auth, the
 // control-plane API, and both listeners. It returns when the server has drained.
 //
@@ -55,23 +59,32 @@ type BootParams struct {
 //  2. Take the boot lock. BEFORE migrations, so two instances starting together
 //     cannot race each other through the same migration.
 //  3. Migrate.
-//  4. Everything else.
+//  4. Open the SERVING pool -- it registers the enum types, which only exist
+//     once (3) has run.
+//  5. Everything else.
 func Boot(ctx context.Context, p BootParams) error {
 	cmd := p.Cmd
 	log := slog.Default()
 
-	pool, err := db.NewPool(ctx, db.Config{URL: cmd.DBURL, MaxConns: 0})
+	// The BOOTSTRAP pool: no enum type registration, because on a fresh database
+	// the enum types do not exist yet. A pool that registered them would fail its
+	// own Ping here and the migrations that create them could never run.
+	//
+	// It outlives this function: BootLock pins one of its connections for the
+	// process lifetime, so closing it would drop the advisory lock. It serves no
+	// queries -- the serving pool below does.
+	bootPool, err := db.NewBootstrapPool(ctx, db.Config{URL: cmd.DBURL, MaxConns: bootstrapMaxConns})
 	if err != nil {
 		return fmt.Errorf("connect to database: %w", err)
 	}
 
-	defer pool.Close()
+	defer bootPool.Close()
 
 	// The advisory lock is what makes the in-process route cache and the LRU sound:
 	// they are only coherent if exactly one process writes this database. A second
 	// instance is refused, loudly, unless the operator has explicitly asserted that
 	// they know what they are doing.
-	lock, err := db.AcquireBootLock(ctx, pool)
+	lock, err := db.AcquireBootLock(ctx, bootPool)
 
 	switch {
 	case errors.Is(err, db.ErrLocked) && cmd.AllowMultiInstance:
@@ -82,9 +95,19 @@ func Boot(ctx context.Context, p BootParams) error {
 		defer lock.Release()
 	}
 
-	if err := db.Migrate(pool); err != nil {
+	if err := db.Migrate(bootPool); err != nil {
 		return fmt.Errorf("apply migrations: %w", err)
 	}
+
+	// Only NOW can the serving pool exist: its AfterConnect loads and registers
+	// every enum type, and it refuses a connection where one is missing. Before
+	// the migrations above, all seven were missing.
+	pool, err := db.NewPool(ctx, db.Config{URL: cmd.DBURL, MaxConns: 0})
+	if err != nil {
+		return fmt.Errorf("open serving pool: %w", err)
+	}
+
+	defer pool.Close()
 
 	version, dirty, applied, err := db.MigrationVersion(pool)
 	if err != nil {

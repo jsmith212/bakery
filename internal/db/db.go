@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -39,7 +40,8 @@ type Config struct {
 	MaxConns int32
 }
 
-// NewPool builds the pool and PROVES it can reach Postgres before returning.
+// NewPool builds the SERVING pool and PROVES it can reach Postgres before
+// returning.
 //
 // pgxpool.New deliberately does not connect -- its own doc says "A pool returns
 // without waiting for any connections to be established". Returning an unpinged
@@ -47,7 +49,35 @@ type Config struct {
 // request is what discovers it, which is exactly the bug kbi ships. So: Ping,
 // with a timeout, and close the pool on failure so a caller that ignores the
 // error cannot leak it.
+//
+// Its connections carry the enum type registrations (see enums.go), so it MUST
+// be built AFTER Migrate has run -- the types have to exist for a connection to
+// register them, and a connection that cannot is refused. Boot therefore does
+// ping/lock/migrate on a NewBootstrapPool and only then opens this one.
 func NewPool(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
+	return newPool(ctx, cfg, registerEnumTypes)
+}
+
+// NewBootstrapPool is NewPool without the enum registration, for the one caller
+// that cannot have it: boot, which must ping, take the advisory lock and run the
+// migrations against a database where the enum types DO NOT EXIST YET.
+//
+// Registering types on this pool would deadlock a fresh install -- AfterConnect
+// would fail on the missing types, so Ping would fail, so the migrations that
+// create the types could never run. It stays alive for the process lifetime
+// because BootLock pins one of its connections for exactly that long.
+//
+// Nothing may serve queries from it. It has no enum codecs, and a query passing
+// an enum slice through it fails with "cannot find encode plan".
+func NewBootstrapPool(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
+	return newPool(ctx, cfg, nil)
+}
+
+func newPool(
+	ctx context.Context,
+	cfg Config,
+	afterConnect func(context.Context, *pgx.Conn) error,
+) (*pgxpool.Pool, error) {
 	poolCfg, err := pgxpool.ParseConfig(cfg.URL)
 	if err != nil {
 		return nil, fmt.Errorf("parse DB_URL: %w", err)
@@ -62,6 +92,7 @@ func NewPool(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
 	poolCfg.MaxConnLifetime = defaultMaxConnLifetime
 	poolCfg.MaxConnIdleTime = defaultMaxConnIdleTime
 	poolCfg.HealthCheckPeriod = defaultHealthCheckPeriod
+	poolCfg.AfterConnect = afterConnect
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {

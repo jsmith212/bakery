@@ -160,9 +160,6 @@ func (a *API) handleListProjectMembers(w http.ResponseWriter, r *http.Request) e
 // as a separate statement afterwards would leave a window -- short, but a window in
 // which a demoted user still has write access to the cache, and one that a crash
 // between the two statements widens to forever.
-//
-// (internal/db ships RevokeAPIKeysForMembership for precisely this, and it does not
-// currently work -- see the comment at the revocation loop below.)
 func (a *API) handlePutProjectMember(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	s := scopeFrom(ctx)
@@ -196,57 +193,29 @@ func (a *API) handlePutProjectMember(w http.ResponseWriter, r *http.Request) err
 
 		// Revoke every key whose scope now exceeds the new role, IN THIS TRANSACTION.
 		//
-		// # Why this is not RevokeAPIKeysForMembership
-		//
-		// internal/db ships exactly that query for exactly this job, and it does not
-		// work. Its parameter is `[]repository.ApiKeyScope` bound to
-		// `sqlc.arg(scopes)::api_key_scope[]`, and pgx cannot build an encode plan for
-		// a slice of a custom enum type unless that type has been registered on the
-		// connection (conn.LoadType + TypeMap().RegisterType, in a pgxpool
-		// AfterConnect). internal/db does not register it, so the call fails at
-		// encode time:
-		//
-		//	unable to encode []repository.ApiKeyScope{"write"} into text format
-		//	for unknown type (OID 16427): cannot find encode plan
-		//
-		// It had never had a caller, so nothing had ever proven it. Registering the
-		// enum on the pool is the real fix and it belongs in internal/db; until then,
-		// this does the same work with parameters that DO encode (uuids), inside the
-		// same transaction, so the atomicity the invariant actually depends on is
-		// preserved. Do not "simplify" this back to the one-liner without first
-		// registering the type -- there is a test that will catch you, and it is the
-		// one that proves a demoted writer loses their write key.
-		keys, err := q.ListAPIKeysForProject(ctx, s.ProjectID)
-		if err != nil {
-			return fmt.Errorf("list keys for role downgrade: %w", err)
+		// A promotion revokes nothing: for a writer or an admin MaxScopeForRole is
+		// write, so no scope exceeds the role and there is no work to do. Skipping
+		// the statement then is not an optimisation, it is what keeps the log line
+		// below honest.
+		exceeding := scopesExceedingRole(role)
+		if len(exceeding) == 0 {
+			return nil
 		}
 
-		var revoked int
-
-		for _, key := range keys {
-			if key.UserID != userID || key.RevokedAt.Valid {
-				continue
-			}
-
-			// Within the new role's authority => keep. For a writer or an admin,
-			// MaxScopeForRole is write, so nothing is revoked and a promotion is
-			// correctly a no-op.
-			if auth.ScopeWithinRole(key.Scope, role) {
-				continue
-			}
-
-			if _, err := q.RevokeAPIKey(ctx, key.ID); err != nil {
-				return fmt.Errorf("revoke key exceeding role: %w", err)
-			}
-
-			revoked++
+		revoked, err := q.RevokeAPIKeysForMembership(ctx, repository.RevokeAPIKeysForMembershipParams{
+			UserID:    userID,
+			ProjectID: s.ProjectID,
+			Scopes:    exceeding,
+		})
+		if err != nil {
+			return fmt.Errorf("revoke keys exceeding the new role: %w", err)
 		}
 
 		if revoked > 0 {
 			a.log.InfoContext(ctx, "revoked API keys exceeding the new project role",
 				slog.String("project", s.ProjectSlug),
 				slog.String("role", string(role)),
-				slog.Int("keys_revoked", revoked),
+				slog.Int64("keys_revoked", revoked),
 			)
 		}
 
@@ -262,6 +231,25 @@ func (a *API) handlePutProjectMember(w http.ResponseWriter, r *http.Request) err
 	})
 
 	return nil
+}
+
+// scopesExceedingRole lists the key scopes that a member holding `role` may NOT
+// hold -- the argument to RevokeAPIKeysForMembership on a downgrade.
+//
+// It is DERIVED from auth.ScopeWithinRole rather than restating the rule, so a
+// future scope (or a change to what a reader may do) cannot leave this list
+// quietly stale while every caller still believes it is exhaustive. The cost is
+// a loop over two constants, once per role change.
+func scopesExceedingRole(role auth.ProjectRole) []auth.Scope {
+	var out []auth.Scope
+
+	for _, scope := range []auth.Scope{auth.ScopeRead, auth.ScopeWrite} {
+		if !auth.ScopeWithinRole(scope, role) {
+			out = append(out, scope)
+		}
+	}
+
+	return out
 }
 
 // handleDeleteProjectMember removes someone's project role. Project admin.
