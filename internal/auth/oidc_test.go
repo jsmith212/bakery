@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/url"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -337,6 +338,198 @@ func TestGroupsClaimIsConfigurable(t *testing.T) {
 
 	if len(id.Groups) != 0 {
 		t.Errorf("Groups = %v, want none: the configured claim name is absent from the token", id.Groups)
+	}
+
+	// And crucially, that is UNREADABLE, not "no groups". A misconfigured claim
+	// name must not look like a user who happens to be in nothing -- it must reach
+	// the reconciler as a refusal.
+	if id.GroupsPresent {
+		t.Error("GroupsPresent = true, but the configured claim is absent from the token: that is unreadable, not empty")
+	}
+}
+
+// TestUnreadableGroupsClaimIsNotAnEmptyOne is the load-bearing test of the whole
+// hybrid-role milestone.
+//
+// Azure AD, for a user in more than ~200 groups, REPLACES the `groups` claim with
+// a `_claim_names` / `_claim_sources` overage pointing at Microsoft Graph. The ID
+// token then carries no `groups` claim at all. Read naively, that token is
+// byte-for-byte the same answer as a user the IdP says is in zero groups -- and
+// the two demand OPPOSITE actions:
+//
+//   - zero groups  -> admissible. Reconcile the OIDC half away; the user keeps
+//     whatever local grants they hold.
+//   - unreadable   -> refuse the login and write NOTHING. Acting on it NULLs every
+//     oidc_role, deletes every membership with no local grant, and cascades away
+//     the user's project roles and API keys.
+//
+// So the assertion is not merely that each case produces the right field values.
+// It is that the two are DISTINGUISHABLE AT ALL, on real signed tokens, through
+// the real verifier. A []string cannot distinguish them; GroupsPresent is what
+// does.
+func TestUnreadableGroupsClaimIsNotAnEmptyOne(t *testing.T) {
+	idp := newFakeIDP(t)
+	provider := idp.provider(t)
+
+	tests := []struct {
+		name string
+		// claims is the payload the fake IdP signs.
+		claims func(f *fakeIDP) claims
+		// wantPresent is the answer to "did we read the groups claim?", NOT to
+		// "how many groups does this user have?".
+		wantPresent bool
+		wantGroups  []string
+	}{
+		{
+			name:        "the Azure AD groups overage: _claim_names, and no groups claim",
+			claims:      azureOverageClaims,
+			wantPresent: false,
+			wantGroups:  nil,
+		},
+		{
+			name: "an EMPTY groups claim is the IdP's answer, and it is readable",
+			claims: func(f *fakeIDP) claims {
+				c := defaultClaims(f)
+				c.groups = []string{} // present in the token, and empty
+
+				return c
+			},
+			wantPresent: true,
+			wantGroups:  []string{},
+		},
+		{
+			name: "a wholly absent groups claim is unreadable",
+			claims: func(f *fakeIDP) claims {
+				c := defaultClaims(f)
+				c.groups = nil // omitted from the payload entirely
+
+				return c
+			},
+			wantPresent: false,
+			wantGroups:  nil,
+		},
+		{
+			name:        "a populated groups claim is readable",
+			claims:      defaultClaims,
+			wantPresent: true,
+			wantGroups:  []string{"platform", "yocto-admins"},
+		},
+		{
+			name: "_claim_names naming groups wins even if a groups claim is also present",
+			claims: func(f *fakeIDP) claims {
+				// The IdP has told us the authoritative list lives on Graph. Whatever
+				// else the token says about groups is not the answer, and we fail
+				// closed rather than act on a partial one.
+				c := defaultClaims(f)
+				c.groups = []string{"platform"}
+				c.extra = map[string]any{
+					claimNamesClaim:   map[string]any{"groups": "src1"},
+					claimSourcesClaim: map[string]any{"src1": map[string]any{"endpoint": "https://graph.microsoft.com/"}},
+				}
+
+				return c
+			},
+			wantPresent: false,
+			wantGroups:  nil,
+		},
+		{
+			name: "_claim_names that does NOT name groups is not an overage",
+			claims: func(f *fakeIDP) claims {
+				c := defaultClaims(f)
+				c.extra = map[string]any{
+					claimNamesClaim:   map[string]any{"address": "src1"},
+					claimSourcesClaim: map[string]any{"src1": map[string]any{"endpoint": "https://idp.example.com/address"}},
+				}
+
+				return c
+			},
+			wantPresent: true,
+			wantGroups:  []string{"platform", "yocto-admins"},
+		},
+		{
+			name: "a groups claim of the wrong JSON type is unreadable, not empty",
+			claims: func(f *fakeIDP) claims {
+				c := defaultClaims(f)
+				c.groups = nil
+				c.extra = map[string]any{"groups": "platform yocto-admins"} // a string, not a list
+
+				return c
+			},
+			wantPresent: false,
+			wantGroups:  nil,
+		},
+		{
+			name: "a null groups claim is unreadable, not empty",
+			claims: func(f *fakeIDP) claims {
+				c := defaultClaims(f)
+				c.groups = nil
+				c.extra = map[string]any{"groups": nil}
+
+				return c
+			},
+			wantPresent: false,
+			wantGroups:  nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// A REAL token: RS256, signed by the fake IdP's published key, verified
+			// through the real JWKS fetch. Nothing about the claim path is stubbed.
+			id, err := provider.VerifyIDToken(t.Context(), idp.signIDToken(t, tt.claims(idp)))
+			if err != nil {
+				t.Fatalf("VerifyIDToken() error = %v, want success: an unreadable claim is not a token failure, it is a reconciler refusal", err)
+			}
+
+			if id.GroupsPresent != tt.wantPresent {
+				t.Errorf("GroupsPresent = %v, want %v", id.GroupsPresent, tt.wantPresent)
+			}
+
+			if !slices.Equal(id.Groups, tt.wantGroups) {
+				t.Errorf("Groups = %#v, want %#v", id.Groups, tt.wantGroups)
+			}
+		})
+	}
+}
+
+// TestOverageAndEmptyGroupsAreNotConfusable states the requirement directly,
+// rather than leaving it implied by two rows of a table: the two tokens differ,
+// and the ONLY field that tells them apart is GroupsPresent. If someone deletes
+// that field and "simplifies" Identity back to a []string, this is the test that
+// stops them -- len(Groups) == 0 holds for both.
+func TestOverageAndEmptyGroupsAreNotConfusable(t *testing.T) {
+	idp := newFakeIDP(t)
+	provider := idp.provider(t)
+
+	empty := defaultClaims(idp)
+	empty.groups = []string{}
+
+	readable, err := provider.VerifyIDToken(t.Context(), idp.signIDToken(t, empty))
+	if err != nil {
+		t.Fatalf("VerifyIDToken() on a `groups: []` token = %v, want success", err)
+	}
+
+	unreadable, err := provider.VerifyIDToken(t.Context(), idp.signIDToken(t, azureOverageClaims(idp)))
+	if err != nil {
+		t.Fatalf("VerifyIDToken() on an overage token = %v, want success", err)
+	}
+
+	// The trap: on the group LIST alone, these two identities are identical.
+	if len(readable.Groups) != 0 || len(unreadable.Groups) != 0 {
+		t.Fatalf("both tokens should yield zero groups; got %v and %v", readable.Groups, unreadable.Groups)
+	}
+
+	// And yet they mean opposite things, and the struct says so.
+	if !readable.GroupsPresent {
+		t.Error("`groups: []` -> GroupsPresent = false; the IdP gave us an answer and we discarded it")
+	}
+
+	if unreadable.GroupsPresent {
+		t.Error("the Azure overage -> GroupsPresent = true; we would reconcile away every membership this user has")
+	}
+
+	if readable.GroupsPresent == unreadable.GroupsPresent {
+		t.Fatal("an empty groups claim and an unreadable one are indistinguishable; this is the bug the milestone exists to fix")
 	}
 }
 

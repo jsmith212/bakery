@@ -40,9 +40,17 @@ func (s *Service) Reconcile(ctx context.Context, id Identity) (pgtype.UUID, erro
 		return pgtype.UUID{}, fmt.Errorf("%w: no group mapping is configured", ErrLoginNotAllowed)
 	}
 
-	// The gate. Resolve fails closed on an absent group claim and on a claim that
-	// maps to zero orgs; both mean refuse.
-	res, err := s.groups.Resolve(id.Groups)
+	// The gate. Resolve fails closed on an UNREADABLE groups claim (absent, or an
+	// Azure AD `_claim_names` overage) and on a user outside every login group.
+	//
+	// GroupsPresent is what carries the distinction across this call, and it is the
+	// only thing that does: `id.Groups` is empty in both the admissible case (the
+	// IdP asserts zero groups) and the catastrophic one (we never read the claim),
+	// so passing the slice alone would hand Resolve a lie it cannot detect.
+	//
+	// This runs BEFORE ensureOrgs and before the transaction, so a refusal here
+	// writes nothing -- which is the requirement, not a convenience.
+	res, err := s.groups.Resolve(config.GroupsClaim{Groups: id.Groups, Present: id.GroupsPresent})
 	if err != nil {
 		return pgtype.UUID{}, fmt.Errorf("%w: %w", ErrLoginNotAllowed, err)
 	}
@@ -98,10 +106,18 @@ func (s *Service) Reconcile(ctx context.Context, id Identity) (pgtype.UUID, erro
 			keep = append(keep, orgID)
 		}
 
-		// The second, redundant fail-closed guard. Resolve already refuses an empty
-		// result, so reaching here with an empty keep-set would mean a bug -- and
-		// the consequence of that bug is an irreversible cascade delete of the
-		// user's project roles and API keys. It is worth one `if`.
+		// Resolve NO LONGER refuses a zero-org resolution -- under the hybrid role
+		// model a user whose orgs are all granted in-app legitimately resolves to zero
+		// CLAIM-derived orgs, and refusing them is the bug. This reconciler still
+		// cannot admit them, and the reason is one query below, not one policy above:
+		// ReconcileOrgMembershipsRemove with an empty keep-set is an UNCONDITIONAL
+		// cascade delete of every org membership the user holds, and with it every
+		// project role and every API key. It has no notion of a local grant to spare.
+		//
+		// So the refusal stays until the local-grant-aware remove lands and this
+		// reconciler learns to write the oidc_role column and keep rows a local grant
+		// justifies. Refusing a legitimate login is a denial; admitting it against
+		// this query is an irreversible deletion. We take the denial.
 		if len(keep) == 0 {
 			return fmt.Errorf("%w: refusing to reconcile %s to zero organizations", ErrLoginNotAllowed, id.Subject)
 		}

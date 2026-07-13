@@ -51,6 +51,17 @@ var (
 // a namespaced claim), so it is configurable.
 const DefaultGroupsClaim = "groups"
 
+// The OIDC Core "aggregated and distributed claims" members (§5.6.2). Azure AD
+// uses them for the GROUPS OVERAGE: when a user is in more than ~200 groups, the
+// `groups` claim is REPLACED by a `_claim_names` entry naming a `_claim_sources`
+// endpoint on Microsoft Graph. The ID token then carries NO `groups` claim at
+// all -- byte-for-byte identical, to a naive reader, to a user who is in no
+// groups. That collision is the bug this package exists to refuse.
+const (
+	claimNamesClaim   = "_claim_names"
+	claimSourcesClaim = "_claim_sources"
+)
+
 // OIDCConfig is what internal/config resolved for the identity provider.
 type OIDCConfig struct {
 	Issuer       string
@@ -208,6 +219,23 @@ type Identity struct {
 	DisplayName string
 	Groups      []string
 
+	// GroupsPresent says whether Groups is the IdP's ANSWER or merely our
+	// FAILURE TO READ ONE. It is the whole point of this struct.
+	//
+	//   true,  len(Groups) == 0 -> the IdP asserts this user is in no groups.
+	//                              Admissible: they hold local memberships only.
+	//   false                   -> we could not read the claim. NOT "no groups".
+	//                              The reconciler must refuse the login and write
+	//                              nothing.
+	//
+	// A plain []string cannot hold that distinction -- nil and empty are the same
+	// answer to "how many groups" and opposite answers to "did you read it" -- and
+	// that inability IS the bug. Treating an unreadable claim as zero groups NULLs
+	// every oidc_role, deletes every membership with no local grant, and cascades
+	// the user's project roles and API keys away. Irreversibly, on a login that
+	// looked entirely successful.
+	GroupsPresent bool
+
 	// IssuedAt drives re-reconciliation on the Bearer path: the CLI has no
 	// server-side login callback, so a token issued AFTER the user's recorded
 	// last_login_at is our signal that the IdP re-asserted their groups and we
@@ -321,19 +349,20 @@ func (p *Provider) verify(ctx context.Context, raw, wantNonce string) (Identity,
 		return Identity{}, fmt.Errorf("%w: decode id_token claims: %w", ErrTokenInvalid, err)
 	}
 
-	groups, err := p.groups(tok)
+	groups, present, err := p.groups(tok)
 	if err != nil {
 		return Identity{}, err
 	}
 
 	return Identity{
-		Issuer:       tok.Issuer,
-		Subject:      tok.Subject,
-		Email:        strings.TrimSpace(claims.Email),
-		DisplayName:  displayName(claims),
-		Groups:       groups,
-		IssuedAt:     tok.IssuedAt,
-		RefreshToken: "",
+		Issuer:        tok.Issuer,
+		Subject:       tok.Subject,
+		Email:         strings.TrimSpace(claims.Email),
+		DisplayName:   displayName(claims),
+		Groups:        groups,
+		GroupsPresent: present,
+		IssuedAt:      tok.IssuedAt,
+		RefreshToken:  "",
 	}, nil
 }
 
@@ -362,28 +391,50 @@ func verifyNonce(got, want string) error {
 	return nil
 }
 
-// groups pulls the group claim out by its configured name.
+// groups pulls the group claim out by its configured name, and reports whether
+// it could be READ at all.
 //
-// A user with NO groups is not an error here -- it is an error in the reconciler,
-// which fails the login closed. Keeping that decision in one place matters: an
-// absent group claim is a thing that happens to real, correctly-configured users
-// (Azure AD replaces a >200-group claim with a `_claim_names` overage), and the
-// consequence of treating it as "zero groups, proceed" is that reconciliation
-// deletes every org membership, project role and API key the user holds.
-func (p *Provider) groups(tok *oidc.IDToken) ([]string, error) {
+// This is the boundary where "the IdP says zero groups" and "we could not read
+// the groups" are separated, and they must never be conflated again downstream.
+// It does NOT decide what to do about an unreadable claim -- that is the
+// reconciler's, which fails the login closed. What it decides is that the caller
+// is TOLD, rather than handed an empty slice that lies by omission.
+//
+// Unreadable (present == false), fail-closed, in every one of these cases:
+//
+//   - the claim is ABSENT. Azure AD's groups overage does exactly this to real,
+//     correctly-configured users, and so does a provider whose group mapper was
+//     never configured.
+//   - `_claim_names` names the groups claim (OIDC Core §5.6.2 distributed
+//     claims). The authoritative set lives on a `_claim_sources` endpoint we do
+//     not fetch, so whatever else the token says about groups is not the answer.
+//     Checked FIRST and independently of the claim's presence: if the IdP told us
+//     the real list is elsewhere, we do not get to pretend the token holds it.
+//   - the claim is present but is not a JSON array (null, a string, an object).
+//     We cannot read a list out of it, so we have not read the list.
+//
+// Readable (present == true) is only the one case: the claim is there and it is
+// an array. An EMPTY array is a genuine, admissible answer -- it means the user
+// has no claim-derived memberships, and under the hybrid role model that is an
+// ordinary user with local grants only.
+func (p *Provider) groups(tok *oidc.IDToken) ([]string, bool, error) {
 	raw := map[string]any{}
 	if err := tok.Claims(&raw); err != nil {
-		return nil, fmt.Errorf("%w: decode id_token claims: %w", ErrTokenInvalid, err)
+		return nil, false, fmt.Errorf("%w: decode id_token claims: %w", ErrTokenInvalid, err)
+	}
+
+	if isDistributedClaim(raw, p.groupsClaim) {
+		return nil, false, nil
 	}
 
 	value, ok := raw[p.groupsClaim]
 	if !ok {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	list, ok := value.([]any)
 	if !ok {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	groups := make([]string, 0, len(list))
@@ -394,7 +445,39 @@ func (p *Provider) groups(tok *oidc.IDToken) ([]string, error) {
 		}
 	}
 
-	return groups, nil
+	return groups, true, nil
+}
+
+// isDistributedClaim reports whether the token says the named claim's real value
+// lives somewhere else: `_claim_names` maps a claim name to a key in
+// `_claim_sources`, which carries the endpoint (and possibly an access token)
+// to fetch it from.
+//
+// We do not follow the source -- that is a Graph round trip with its own
+// credential, and it is not what this milestone buys. We only need to know that
+// the token is NOT the authority on this claim, which is precisely the fact a
+// naive `raw["groups"]` lookup throws away.
+//
+// `_claim_sources` is not required to reach this verdict: a `_claim_names` entry
+// alone already says the token is not carrying the value. A malformed overage
+// (names without sources) is, if anything, more reason to refuse.
+func isDistributedClaim(raw map[string]any, claim string) bool {
+	names, ok := raw[claimNamesClaim].(map[string]any)
+	if !ok {
+		return false
+	}
+
+	source, ok := names[claim]
+	if !ok {
+		return false
+	}
+
+	// The value is the key into _claim_sources. Anything non-empty there means the
+	// IdP has redirected us; an empty string is not a usable redirect, and we do
+	// not want a stray `"_claim_names": {"groups": ""}` to lock every login out.
+	ref, ok := source.(string)
+
+	return ok && ref != ""
 }
 
 func displayName(c idTokenClaims) string {

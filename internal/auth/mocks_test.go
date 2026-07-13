@@ -164,6 +164,12 @@ func (f *fakeIDP) token(w http.ResponseWriter, r *http.Request) {
 }
 
 // claims is the ID token payload the fake IdP will sign.
+//
+// `groups` is a []string on purpose and NOT a bool+slice: nil means the claim is
+// OMITTED from the token entirely (what Azure AD's overage produces), and an
+// empty non-nil slice means the token carries `"groups": []`. Those are the two
+// tokens the whole milestone turns on, and the harness has to be able to mint
+// both.
 type claims struct {
 	sub      string
 	email    string
@@ -173,6 +179,11 @@ type claims struct {
 	nonce    string
 	issuedAt time.Time
 	expires  time.Time
+
+	// extra is spliced into the payload verbatim, so a test can mint the
+	// `_claim_names` / `_claim_sources` overage, or a groups claim of the wrong
+	// JSON type, without teaching the harness about either.
+	extra map[string]any
 }
 
 func defaultClaims(f *fakeIDP) claims {
@@ -185,7 +196,29 @@ func defaultClaims(f *fakeIDP) claims {
 		nonce:    "",
 		issuedAt: time.Now(),
 		expires:  time.Now().Add(time.Hour),
+		extra:    nil,
 	}
+}
+
+// azureOverageClaims is the token a real, correctly-configured Azure AD user in
+// more than ~200 groups actually receives: NO `groups` claim, and a
+// `_claim_names` / `_claim_sources` pair pointing at Microsoft Graph instead.
+//
+// Read naively, this token is indistinguishable from "this user is in no
+// groups". It is not that. It is "the answer is somewhere else".
+func azureOverageClaims(f *fakeIDP) claims {
+	c := defaultClaims(f)
+	c.groups = nil // the overage REPLACES the claim; it does not shrink it
+	c.extra = map[string]any{
+		claimNamesClaim: map[string]any{"groups": "src1"},
+		claimSourcesClaim: map[string]any{
+			"src1": map[string]any{
+				"endpoint": "https://graph.microsoft.com/v1.0/users/subject-1/getMemberObjects",
+			},
+		},
+	}
+
+	return c
 }
 
 // signIDToken mints a real RS256 JWT with the PUBLISHED key.
@@ -232,6 +265,10 @@ func (f *fakeIDP) sign(t *testing.T, c claims, key *rsa.PrivateKey, kid string) 
 
 	if c.nonce != "" {
 		payload["nonce"] = c.nonce
+	}
+
+	for k, v := range c.extra {
+		payload[k] = v
 	}
 
 	signingInput := encodeSegment(t, header) + "." + encodeSegment(t, payload)
@@ -501,11 +538,17 @@ func newTestService(t *testing.T, groupMapJSON string, devLogin bool) *testServi
 	return &testService{Service: svc, pool: pool, store: store}
 }
 
-// identity builds an Identity as though an ID token had just been verified.
+// identity builds an Identity as though an ID token had just been verified and
+// its groups claim READ. GroupsPresent is true: these are the IdP's answer.
+//
+// An identity whose groups could NOT be read is a different thing: it must be
+// built deliberately (GroupsPresent: false), because the reconciler is required
+// to treat it as a refusal, not as zero groups.
 func identity(subject, email string, groups ...string) Identity {
 	return Identity{
 		Issuer: "https://idp.example.com", Subject: subject, Email: email,
-		DisplayName: email, Groups: groups, IssuedAt: time.Now(), RefreshToken: "",
+		DisplayName: email, Groups: groups, GroupsPresent: true,
+		IssuedAt: time.Now(), RefreshToken: "",
 	}
 }
 
