@@ -1,5 +1,8 @@
 default: help
 
+# The bitbake tag the conformance suite pins. Keep in step with the CI cache key.
+bb_tag := "2.8.0"
+
 # Install the pre-commit hooks
 bootstrap:
   pre-commit install --hook-type commit-msg --hook-type pre-push
@@ -73,6 +76,34 @@ test-db: generate
   bash -euo pipefail -c 'go test -v -count=1 ./internal/... 2>&1 | tee build/test-db.log'
   ! grep -q -- '--- SKIP' build/test-db.log || { grep -- '--- SKIP' build/test-db.log; echo 'FAIL: tests were SKIPPED. They did not run, so they did not pass. Start docker, or export TEST_DB_URL.'; exit 1; }
   @echo "no skipped tests"
+
+# Drive the REAL bitbake fetcher + real wget against the real sstate backend (a skip FAILS)
+conformance: generate
+  # Not in `just test-db` (which globs ./internal/...): this suite legitimately skips
+  # on a laptop with no bitbake checkout. This recipe is its home, and it provides the
+  # checkout so a skip here means the real client did not run -- which is a failure.
+  # bash + pipefail (not a shebang recipe, and not `sh`): with `sh` the exit status
+  # of `go test | tee` is tee's, so a failing suite would report as a pass -- exactly
+  # the trap `test-db` documents. Use an existing BB_LIB if the caller set one (CI
+  # restores a cached clone into it); otherwise clone the pinned tag, shallow.
+  mkdir -p build
+  bash -euo pipefail -c ' \
+    if [ -z "${BB_LIB:-}" ]; then \
+      if [ ! -d build/bitbake/lib ]; then \
+        echo "cloning bitbake {{bb_tag}} (shallow) into build/bitbake ..."; \
+        git clone --depth 1 --branch {{bb_tag}} https://git.openembedded.org/bitbake build/bitbake; \
+      fi; \
+      BB_LIB="$(pwd)/build/bitbake/lib"; \
+    fi; \
+    export BB_LIB; \
+    test -d "${BB_LIB}/bb/fetch2" || { echo "FAIL: no bb/fetch2 under BB_LIB=${BB_LIB}"; exit 1; }; \
+    go test -v -count=1 ./test/conformance/... 2>&1 | tee build/conformance.log; \
+    if grep -q -- "--- SKIP" build/conformance.log; then \
+      grep -- "--- SKIP" build/conformance.log; \
+      echo "FAIL: the conformance suite SKIPPED -- the real client did not run. Ensure docker or TEST_DB_URL, python3, wget, and a bitbake checkout (BB_LIB)."; \
+      exit 1; \
+    fi; \
+    echo "conformance: the real bitbake fetcher ran green" '
 
 # Run the race detector
 race: web generate

@@ -124,6 +124,67 @@ jobs:
           name: bakery
           path: build/bakery
 
+  # The conformance proof: drive the REAL bitbake fetcher and the real wget binary
+  # against the real sstate backend. It is a SEPARATE job from `build` because it has
+  # a dependency `build` does not -- a bitbake checkout -- and because a conformance
+  # test that silently skips is the exact failure this milestone must not have, so it
+  # runs through `just conformance`, where a skip fails the job.
+  conformance:
+    runs-on: ubuntu-latest
+
+    # Same postgres service as `build`: dbtest uses TEST_DB_URL and never touches
+    # Docker, so the ephemeral database the backend boots against is this service.
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --health-start-period 10s
+
+    env:
+      TEST_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - uses: extractions/setup-just@v3
+
+      # Cache the 13 MB shallow bitbake clone. `just conformance` clones into
+      # build/bitbake only on a cache miss; a hit restores it and the recipe reuses
+      # it, so the conformance run needs zero network. Key on the pinned tag, which
+      # the recipe's bb_tag must match -- bump both together.
+      - name: Cache the bitbake checkout
+        uses: actions/cache@v4
+        with:
+          path: build/bitbake
+          key: bitbake-2.8.0
+
+      # ubuntu-latest ships python3 and wget; the backend boots in-process, so there
+      # is nothing else to install. A skip here fails the job -- that is the point.
+      - name: Conformance (drive the REAL bitbake fetcher; a skip fails the job)
+        run: just conformance
+
+      - name: Upload the conformance log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-log
+          path: build/conformance.log
+
   commit:
     runs-on: ubuntu-latest
     steps:
@@ -136,7 +197,7 @@ jobs:
   image:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
-    needs: [build, check, commit]
+    needs: [build, check, commit, conformance]
 
     permissions:
       contents: read
