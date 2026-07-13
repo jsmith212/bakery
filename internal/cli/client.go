@@ -57,6 +57,13 @@ func (e *APIError) Error() string {
 type Client struct {
 	server string
 	http   *http.Client
+
+	// cacheHTTP is the transport for the /cache object path. It has NO total Timeout:
+	// an sstate tarball is multi-GB and a 30-second cap would fail every large upload.
+	// A /cache request is bounded by its context instead -- a per-HEAD deadline on the
+	// probe storm, the caller's context on a streaming PUT.
+	cacheHTTP *http.Client
+
 	tokens *TokenStore
 
 	// now and sleep are injected so the device-grant poll can be tested without
@@ -92,6 +99,7 @@ func NewClient(server string, tokens *TokenStore) (*Client, error) {
 	return &Client{
 		server:     server,
 		http:       &http.Client{Timeout: defaultTimeout},
+		cacheHTTP:  &http.Client{},
 		tokens:     tokens,
 		now:        time.Now,
 		sleep:      sleepCtx,
