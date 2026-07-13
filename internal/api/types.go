@@ -100,7 +100,7 @@ func newProject(pr repository.Project, orgSlug string, backends []string, p Prin
 	}
 }
 
-// Member is a person's roles.
+// Member is a person's roles, WITH THE PROVENANCE OF THE ORG ROLE.
 //
 // One type serves both membership lists. On the org list ProjectRole is absent; on
 // a project's list it is present and EMPTY for an org member who holds no role in
@@ -108,27 +108,143 @@ func newProject(pr repository.Project, orgSlug string, backends []string, p Prin
 // the members screen renders. Returning the org's full roster from the project
 // endpoint is deliberate: the screen needs to offer those people a project role,
 // and a list that omitted them could only offer a free-text box.
+//
+// # Why provenance is on the wire and not merely in the database
+//
+// Org membership has TWO sources: an OIDC half the reconciler owns and a local half
+// this API owns. OrgRole is the EFFECTIVE role, greatest(oidc, local), computed by
+// the database. Reporting only that would make a local grant that outlives an LDAP
+// revocation invisible -- which is a backdoor, not a UI simplification. So the
+// console can always answer "why is this person an admin?", and "if I remove the
+// local grant, are they still in?".
 type Member struct {
 	UserID      string `json:"user_id"`
 	Email       string `json:"email"`
 	DisplayName string `json:"display_name"`
 
-	// OrgRole is claim-derived and READ-ONLY over this API. See handleOrgMemberImmutable.
+	// OrgRole is the EFFECTIVE role: greatest(oidc_role, local_role). Never written
+	// directly -- the database generates it.
 	OrgRole string `json:"org_role"`
+
+	// OIDCRole and OIDCGroup are the claim half: the role the IdP's groups confer,
+	// and which group conferred it. Empty when no claim justifies this membership.
+	// Read-only over this API -- change the group in the IdP or the group map.
+	OIDCRole  string `json:"oidc_role,omitempty"`
+	OIDCGroup string `json:"oidc_group,omitempty"`
+
+	// LocalRole is the in-app half, granted by an org admin through PUT. Empty when
+	// there is no local grant. GrantedBy/GrantedByEmail/GrantedAt are its audit
+	// trail and are present exactly when LocalRole is.
+	LocalRole      string     `json:"local_role,omitempty"`
+	GrantedBy      string     `json:"granted_by,omitempty"`
+	GrantedByEmail string     `json:"granted_by_email,omitempty"`
+	GrantedAt      *time.Time `json:"granted_at"`
 
 	// ProjectRole is managed in-app: reader|writer|admin, or "" for "no role in
 	// this project". Only present on a project's member list.
 	ProjectRole string `json:"project_role,omitempty"`
 
-	// Source records where OrgRole came from, so the console can render it as
-	// read-only rather than offering an edit that the next login would revert.
-	Source string `json:"org_role_source"`
+	// Source summarises the two halves above for a console that only wants a badge:
+	// oidc_groups | local | oidc_groups+local. Absent on a response that carries no
+	// org role at all (the project-role PUT), rather than claiming a source for a
+	// role that is not there.
+	Source string `json:"org_role_source,omitempty"`
 }
 
-// OrgRoleSourceOIDC is the only value Member.Source takes today. It is a field and
-// not a constant in the client because the console must not hard-code "you cannot
-// edit this" -- if org roles ever become app-managed, the API says so.
-const OrgRoleSourceOIDC = "oidc_groups"
+// The values Member.Source takes. `oidc_groups+local` is not a curiosity: it is the
+// state in which a DELETE clears the local grant and the user REMAINS A MEMBER, and
+// an admin who cannot see that state coming is an admin who will be surprised by it.
+const (
+	OrgRoleSourceOIDC  = "oidc_groups"
+	OrgRoleSourceLocal = "local"
+	OrgRoleSourceBoth  = "oidc_groups+local"
+)
+
+// orgRoleSource summarises which halves justify a membership.
+func orgRoleSource(oidc, local bool) string {
+	switch {
+	case oidc && local:
+		return OrgRoleSourceBoth
+	case local:
+		return OrgRoleSourceLocal
+	default:
+		// Includes the impossible neither-half case: a row with no source cannot
+		// exist (the generated `role` would be NULL and the column is NOT NULL), so
+		// there is nothing honest to say but "the claims put them here".
+		return OrgRoleSourceOIDC
+	}
+}
+
+// newOrgMember renders one row of the org roster.
+func newOrgMember(m repository.ListOrgMembersRow) Member {
+	return Member{
+		UserID: uuidString(m.UserID), Email: m.Email, DisplayName: m.DisplayName,
+		OrgRole:   string(m.Role),
+		OIDCRole:  orgRoleString(m.OidcRole),
+		OIDCGroup: m.OidcGroup.String,
+		LocalRole: orgRoleString(m.LocalRole),
+		GrantedBy: uuidString(m.GrantedBy), GrantedByEmail: m.GrantedByEmail.String,
+		GrantedAt:   timePtr(m.GrantedAt),
+		ProjectRole: "",
+		Source:      orgRoleSource(m.OidcRole.Valid, m.LocalRole.Valid),
+	}
+}
+
+// newMembership renders an org_memberships row the API just wrote. The user's email
+// and display name are not on that row, so the caller supplies them -- it resolved
+// the user before writing, so it has them.
+func newMembership(m repository.OrgMembership, email, displayName, grantedByEmail string) Member {
+	return Member{
+		UserID: uuidString(m.UserID), Email: email, DisplayName: displayName,
+		OrgRole:   string(m.Role),
+		OIDCRole:  orgRoleString(m.OidcRole),
+		OIDCGroup: m.OidcGroup.String,
+		LocalRole: orgRoleString(m.LocalRole),
+		GrantedBy: uuidString(m.GrantedBy), GrantedByEmail: grantedByEmail,
+		GrantedAt:   timePtr(m.GrantedAt),
+		ProjectRole: "",
+		Source:      orgRoleSource(m.OidcRole.Valid, m.LocalRole.Valid),
+	}
+}
+
+// orgRoleString renders a nullable org role as a string, with NULL as "" -- never
+// as the zero OrgRole, which would be an empty string that LOOKS like a role.
+func orgRoleString(r repository.NullOrgRole) string {
+	if !r.Valid {
+		return ""
+	}
+
+	return string(r.OrgRole)
+}
+
+// OrgMemberRemoval is the response to DELETE /orgs/{org}/members/{user}, and it
+// exists because a bare 204 would be a LIE half the time.
+//
+// The API owns only the local half of a membership. Clearing it removes the user
+// from the org only if no OIDC claim also justifies them; if one does, the row
+// survives and they are still a member, still hold their project roles, and still
+// hold every API key they have minted. An admin who removes someone, sees a
+// success, and reasonably concludes they are gone -- when they are not -- is a
+// security incident waiting to happen. So the response says which of the two
+// happened, and when the membership survives it says what is holding it up.
+type OrgMemberRemoval struct {
+	UserID string `json:"user_id"`
+
+	// LocalRoleRevoked is true when a local grant was actually cleared.
+	LocalRoleRevoked bool `json:"local_role_revoked"`
+
+	// StillAMember is TRUE when the user REMAINS a member of the org because an
+	// OIDC claim justifies them independently of the grant just removed.
+	StillAMember bool `json:"still_a_member"`
+
+	// Membership is the surviving membership, present exactly when StillAMember.
+	// It carries the group that is holding it up.
+	Membership *Member `json:"membership,omitempty"`
+
+	// Message is prose for a human, and the console shows it verbatim. The codes
+	// above are what a client branches on.
+	Message string `json:"message"`
+}
 
 // APIKey is a key's METADATA. There is no Token field and no Hash field: this is
 // the type returned by every endpoint except create, and it is structurally
@@ -321,6 +437,20 @@ func scopeOf(s string) (auth.Scope, error) {
 		return auth.ScopeWrite, nil
 	default:
 		return "", errValidation("scope", `scope must be "read" or "write"`)
+	}
+}
+
+// orgRoleOf parses an org role from a request body.
+func orgRoleOf(s string) (auth.OrgRole, error) {
+	switch auth.OrgRole(s) {
+	case auth.OrgRoleMember:
+		return auth.OrgRoleMember, nil
+	case auth.OrgRoleAdmin:
+		return auth.OrgRoleAdmin, nil
+	case auth.OrgRoleOwner:
+		return auth.OrgRoleOwner, nil
+	default:
+		return "", errValidation("role", `role must be "member", "admin" or "owner"`)
 	}
 }
 

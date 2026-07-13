@@ -34,8 +34,28 @@ type Store interface {
 	DeleteProject(ctx context.Context, id pgtype.UUID) (int64, error)
 	ResolveRoute(ctx context.Context, arg repository.ResolveRouteParams) (repository.ResolveRouteRow, error)
 
-	// Memberships.
+	// Users. Resolving {user} for an ORG grant cannot go through the org roster --
+	// the whole point is to add someone who is not on it yet.
+	GetUser(ctx context.Context, id pgtype.UUID) (repository.User, error)
+	GetUserByEmail(ctx context.Context, email string) (repository.User, error)
+
+	// Memberships. The three local-grant queries name local_role, granted_by and
+	// granted_at and NOTHING else -- the OIDC half belongs to internal/auth's
+	// reconciler, and neither can clobber the other because neither names the
+	// other's columns.
 	ListOrgMembers(ctx context.Context, orgID pgtype.UUID) ([]repository.ListOrgMembersRow, error)
+	GetOrgMembership(
+		ctx context.Context, arg repository.GetOrgMembershipParams,
+	) (repository.OrgMembership, error)
+	GrantOrgMembershipLocal(
+		ctx context.Context, arg repository.GrantOrgMembershipLocalParams,
+	) (repository.OrgMembership, error)
+	RevokeOrgMembershipLocal(
+		ctx context.Context, arg repository.RevokeOrgMembershipLocalParams,
+	) (repository.OrgMembership, error)
+	DeleteLocalOrgMembership(
+		ctx context.Context, arg repository.DeleteLocalOrgMembershipParams,
+	) (int64, error)
 	ListOrgMembershipsForUser(
 		ctx context.Context, userID pgtype.UUID,
 	) ([]repository.ListOrgMembershipsForUserRow, error)

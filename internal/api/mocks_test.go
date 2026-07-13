@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -384,6 +385,77 @@ func (s *fakeStore) ResolveRoute(
 
 	return repository.ResolveRouteRow{}, pgx.ErrNoRows
 }
+
+func (s *fakeStore) GetUser(_ context.Context, id pgtype.UUID) (repository.User, error) {
+	for _, u := range s.users {
+		if u.ID == id {
+			return u, nil
+		}
+	}
+
+	return repository.User{}, pgx.ErrNoRows
+}
+
+func (s *fakeStore) GetUserByEmail(_ context.Context, email string) (repository.User, error) {
+	for _, u := range s.users {
+		if strings.EqualFold(u.Email, email) {
+			return u, nil
+		}
+	}
+
+	return repository.User{}, pgx.ErrNoRows
+}
+
+// The org-membership writes are NOT faked into working state: the hybrid model is
+// the database's (two source columns, a generated effective role, and guards in the
+// WHERE clauses), and a fake that agreed with the handler would prove nothing about
+// any of it. So they record the call and refuse, and every behavioural test for them
+// is DB-backed. What the fake IS for is the authorization boundary: a test can still
+// assert that a denied caller never reached the write at all.
+func (s *fakeStore) GetOrgMembership(
+	_ context.Context, arg repository.GetOrgMembershipParams,
+) (repository.OrgMembership, error) {
+	s.note("GetOrgMembership")
+
+	for _, m := range s.orgMembers[arg.OrgID] {
+		if m.UserID == arg.UserID {
+			return repository.OrgMembership{
+				UserID: m.UserID, OrgID: arg.OrgID, Role: m.Role,
+				OidcRole: repository.NullOrgRole{OrgRole: m.Role, Valid: true},
+			}, nil
+		}
+	}
+
+	return repository.OrgMembership{}, pgx.ErrNoRows
+}
+
+func (s *fakeStore) GrantOrgMembershipLocal(
+	_ context.Context, _ repository.GrantOrgMembershipLocalParams,
+) (repository.OrgMembership, error) {
+	s.note("GrantOrgMembershipLocal")
+
+	return repository.OrgMembership{}, errFakeHybrid
+}
+
+func (s *fakeStore) RevokeOrgMembershipLocal(
+	_ context.Context, _ repository.RevokeOrgMembershipLocalParams,
+) (repository.OrgMembership, error) {
+	s.note("RevokeOrgMembershipLocal")
+
+	return repository.OrgMembership{}, errFakeHybrid
+}
+
+func (s *fakeStore) DeleteLocalOrgMembership(
+	_ context.Context, _ repository.DeleteLocalOrgMembershipParams,
+) (int64, error) {
+	s.note("DeleteLocalOrgMembership")
+
+	return 0, errFakeHybrid
+}
+
+// errFakeHybrid is what the local-grant writes return: the hybrid role model lives
+// in the schema, so it is asserted against a real Postgres or not at all.
+var errFakeHybrid = errors.New("fakeStore: the local-grant writes are DB-backed; use the harness")
 
 func (s *fakeStore) ListOrgMembers(
 	_ context.Context, orgID pgtype.UUID,

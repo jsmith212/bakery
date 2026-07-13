@@ -113,15 +113,81 @@ SELECT om.org_id, om.role, o.slug, o.name
  WHERE om.user_id = $1
  ORDER BY o.slug;
 
+-- Every membership carries its PROVENANCE, both halves of it. The console renders
+-- `ldap: acme-leads` beside `local: granted by jsmith`, and an admin looking at a
+-- membership that outlived an LDAP revocation has to be able to see which half is
+-- holding it up. A list that reported only the effective role would make a local
+-- grant invisible, which is the definition of a backdoor.
+--
+-- granted_by is LEFT JOINed, not inner: ON DELETE SET NULL means the granting user
+-- can be gone while the grant they made stands. An inner join would silently drop
+-- exactly those rows -- the ones an audit most wants to see.
+--
 -- name: ListOrgMembers :many
-SELECT om.user_id, om.role, u.email, u.display_name
+SELECT om.user_id, om.role, om.oidc_role, om.oidc_group, om.local_role,
+       om.granted_by, om.granted_at,
+       u.email, u.display_name,
+       g.email AS granted_by_email
   FROM org_memberships om
   JOIN users u ON u.id = om.user_id
+  LEFT JOIN users g ON g.id = om.granted_by
  WHERE om.org_id = $1
  ORDER BY u.email;
 
 -- name: GetOrgMembership :one
 SELECT * FROM org_memberships WHERE user_id = $1 AND org_id = $2;
+
+-- LOCAL ORG GRANTS -- the API's half, and ONLY its half.
+--
+-- Mirror image of the reconciler's queries above: these three name local_role,
+-- granted_by and granted_at, and NEVER oidc_role or oidc_group. Between the two
+-- sets, neither source can clobber the other -- not by convention, but because
+-- neither statement names the other's columns. The effective `role` is GENERATED
+-- from both and is not writable by anyone.
+
+-- name: GrantOrgMembershipLocal :one
+INSERT INTO org_memberships (user_id, org_id, local_role, granted_by, granted_at)
+VALUES ($1, $2, $3, $4, now())
+ON CONFLICT (user_id, org_id) DO UPDATE
+   SET local_role = EXCLUDED.local_role,
+       granted_by = EXCLUDED.granted_by,
+       granted_at = now()
+RETURNING *;
+
+-- Clears the LOCAL half of a membership an OIDC claim ALSO justifies. The row
+-- survives, the effective role falls back to the claim, and the user keeps their
+-- project roles and API keys -- because they are, still, a member of the org.
+--
+-- The `oidc_role IS NOT NULL` guard is not belt-and-braces: `role` is GENERATED
+-- NOT NULL AS greatest(oidc_role, local_role), so NULLing local_role on a row with
+-- no claim would make the generated column NULL and Postgres would reject the
+-- UPDATE with 23502. The guard turns that would-be 500 into "no rows", which is
+-- how the caller knows the row must be DELETED instead.
+--
+-- name: RevokeOrgMembershipLocal :one
+UPDATE org_memberships
+   SET local_role = NULL, granted_by = NULL, granted_at = NULL
+ WHERE user_id = $1 AND org_id = $2 AND oidc_role IS NOT NULL
+RETURNING *;
+
+-- Removes a membership NOTHING justifies once the local grant is gone. Guarded, so
+-- it can never take a claim-derived membership with it: LDAP owns those and the API
+-- must not be able to remove one, not even by accident.
+--
+-- This DELETE is the one that cascades org_memberships -> project_memberships ->
+-- api_keys. That is correct and intended here: the user is leaving the org.
+--
+-- name: DeleteLocalOrgMembership :execrows
+DELETE FROM org_memberships
+ WHERE user_id = $1 AND org_id = $2 AND oidc_role IS NULL;
+
+-- Resolves the {user} path segment when the caller names an EMAIL. Case-insensitive
+-- to match users_email_lower_key, which is the uniqueness the identity model
+-- actually has -- a case-sensitive lookup would miss `Marko@acme.dev` and report
+-- "no such user" for a user who plainly exists.
+--
+-- name: GetUserByEmail :one
+SELECT * FROM users WHERE lower(email) = lower($1);
 
 -- The slug CHECK calls bakery_slug_ok, so a reserved or malformed slug is refused
 -- here no matter which writer proposes it. internal/slug mirrors the rule in Go

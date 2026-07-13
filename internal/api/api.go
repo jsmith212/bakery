@@ -216,15 +216,13 @@ func (a *API) mount(mux *http.ServeMux) {
 	a.route(mux, AccessOrgAdmin, "PATCH "+p+"/orgs/{org}", a.handleUpdateOrg)
 	a.route(mux, AccessOrgOwner, "DELETE "+p+"/orgs/{org}", a.handleDeleteOrg)
 
-	// ---- org memberships. READ-ONLY: org roles are reconciled from OIDC group
-	// claims on every login, so a hand-edit here is either reverted at the user's
-	// next login (a lie that looks like it worked) or, worse, grants authority the
-	// IdP never granted and that survives until then. The write routes exist and
-	// return 409 with the reason, rather than 404 -- a 404 would leave an operator
-	// hunting for the endpoint they are sure should be there.
+	// ---- org memberships. HYBRID: the reconciler owns the OIDC half, these routes
+	// own the local half, and the effective role is greatest(oidc, local), generated
+	// by the database. PUT grants a local role; DELETE clears one -- and says so when
+	// the membership survives it because a group claim still justifies the user.
 	a.route(mux, AccessOrgView, "GET "+p+"/orgs/{org}/members", a.handleListOrgMembers)
-	a.route(mux, AccessOrgAdmin, "PUT "+p+"/orgs/{org}/members/{user}", a.handleOrgMemberImmutable)
-	a.route(mux, AccessOrgAdmin, "DELETE "+p+"/orgs/{org}/members/{user}", a.handleOrgMemberImmutable)
+	a.route(mux, AccessOrgAdmin, "PUT "+p+"/orgs/{org}/members/{user}", a.handlePutOrgMember)
+	a.route(mux, AccessOrgAdmin, "DELETE "+p+"/orgs/{org}/members/{user}", a.handleDeleteOrgMember)
 
 	// ---- projects
 	a.route(mux, AccessOrgView, "GET "+p+"/orgs/{org}/projects", a.handleListProjects)

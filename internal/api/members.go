@@ -2,11 +2,13 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/jsmith212/bakery/internal/auth"
@@ -18,11 +20,28 @@ type PutProjectMemberRequest struct {
 	Role string `json:"role"` // reader|writer|admin
 }
 
+// PutOrgMemberRequest grants or changes an org role LOCALLY.
+type PutOrgMemberRequest struct {
+	Role string `json:"role"` // member|admin|owner
+}
+
 // ---------------------------------------------------------------------------
-// Org memberships: READ-ONLY over this API.
+// Org memberships: HYBRID. An OIDC half the reconciler owns, a local half this
+// API owns, and a database-generated effective role = greatest(oidc, local).
+//
+// The two halves never touch. internal/auth's reconciler names oidc_role and
+// oidc_group and nothing else; the handlers below name local_role, granted_by and
+// granted_at and nothing else. Neither can clobber the other, and that is
+// structural -- neither statement names the other's columns -- rather than a
+// convention someone has to remember.
+//
+// (In M1 this endpoint was a 409: org roles were 100% claim-derived, so a
+// hand-edit would have been silently reverted at the user's next login. The hybrid
+// columns are precisely what make a local grant survive that login, which is what
+// makes this endpoint honest to offer.)
 // ---------------------------------------------------------------------------
 
-// handleListOrgMembers lists an org's members and their claim-derived org roles.
+// handleListOrgMembers lists an org's members, WITH the provenance of each role.
 func (a *API) handleListOrgMembers(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	s := scopeFrom(ctx)
@@ -35,10 +54,7 @@ func (a *API) handleListOrgMembers(w http.ResponseWriter, r *http.Request) error
 	out := make([]Member, 0, len(rows))
 
 	for _, m := range rows {
-		out = append(out, Member{
-			UserID: uuidString(m.UserID), Email: m.Email, DisplayName: m.DisplayName,
-			OrgRole: string(m.Role), ProjectRole: "", Source: OrgRoleSourceOIDC,
-		})
+		out = append(out, newOrgMember(m))
 	}
 
 	writeJSON(w, http.StatusOK, list(out))
@@ -46,58 +62,189 @@ func (a *API) handleListOrgMembers(w http.ResponseWriter, r *http.Request) error
 	return nil
 }
 
-// handleOrgMemberImmutable refuses every write to an org membership.
+// handlePutOrgMember grants or changes someone's LOCAL org role. Org admin.
 //
-// # Why this endpoint exists only to say no
+// This is the primary way a person joins an org: no group to create in the IdP, no
+// group-map file to redeploy, no waiting for their next login. It writes local_role
+// with its provenance (who granted it, when) and touches neither oidc_role nor
+// oidc_group -- so the next login reconciles the claim half as usual and leaves
+// this grant standing.
 //
-// STALE, AND ONLY UNTIL THE NEXT COMMIT. Since the hybrid role model landed, org
-// membership has TWO sources -- an OIDC half and a local half -- and the reconciler
-// owns only the first: it writes oidc_role/oidc_group, deletes a membership solely
-// when NEITHER source justifies it, and cannot touch local_role at all. Granting a
-// role in-app is therefore no longer a change the next login reverts, which is the
-// whole premise of the refusal below. The endpoint that grants it is the next task
-// in docs/design/specs/2026-07-12-hybrid-role-model-plan.md; this handler and this
-// comment go with it.
+// # Granting OWNER requires being one
 //
-// What follows is the M1 reasoning, preserved because it explains what the local
-// half had to be built to be safe FROM. In M1, org roles were 100% claim-derived
-// and reconciled on every login, so:
-//
-// So an API that let an admin hand-edit an org role would produce one of exactly
-// two outcomes, and both are bad:
-//
-//   - The IdP does not agree. The edit survives until that user's next login and
-//     is then silently reverted. The admin saw a 200, the console showed the new
-//     role, and the change evaporated hours later with no event and no log line
-//     anyone will read. Worse in the granting direction than the revoking one: for
-//     a window measured in "however long until they log in again", the user holds
-//     authority their IdP groups never conferred, and the audit trail for it lives
-//     in Bakery rather than in the identity provider where the org's access review
-//     will look.
-//
-//   - The IdP does agree, in which case the edit was unnecessary -- fix the group
-//     in the IdP and the next login carries it.
-//
-// Nothing is gained and a whole class of "why did my permissions change back"
-// incidents is created. The right place to change an org role is the group map and
-// the IdP, and the right thing for the API to do is say so.
-//
-// It is a 409 rather than a 404 or a 405 on purpose. A 404 would send an operator
-// hunting for an endpoint they are certain must exist; a 405 would imply the
-// method is wrong rather than the whole idea. A 409 with a code the console can
-// branch on (`claim_derived_role`) says: the state you are trying to write is
-// owned by something else.
-//
-// Note the route is still AccessOrgAdmin. Refusing AFTER the authorization check
-// means an unauthorized caller learns nothing about the org from probing it -- they
-// get a 404/403 exactly as they would anywhere else, not a helpful 409.
-func (a *API) handleOrgMemberImmutable(_ http.ResponseWriter, r *http.Request) error {
-	_ = scopeFrom(r.Context()) // assert the guard resolved and authorized a scope
+// The route is AccessOrgAdmin, but an org ADMIN may not mint an org OWNER: an owner
+// can delete the org and everything cached in it, so admin -> owner would be a
+// self-service escalation to a strictly greater authority than the granter holds.
+// The check is on CanOwnOrg, so an owner and a site admin may do it and nobody else
+// can. This narrows the route; it does not widen any.
+func (a *API) handlePutOrgMember(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+	s := scopeFrom(ctx)
 
-	return errConflict(CodeClaimDerived,
-		"org roles are derived from OIDC group claims and are reconciled on every login; "+
-			"they cannot be edited here. Change the user's groups in the identity provider, "+
-			"or change the group-to-org mapping file, and the next login will carry it.")
+	p, ok := principalFrom(ctx)
+	if !ok {
+		return errUnauthorized("authentication required")
+	}
+
+	var req PutOrgMemberRequest
+	if err := decodeJSON(r, &req); err != nil {
+		return err
+	}
+
+	role, err := orgRoleOf(strings.TrimSpace(req.Role))
+	if err != nil {
+		return err
+	}
+
+	if role == auth.OrgRoleOwner && !p.CanOwnOrg(s.OrgID) {
+		return errForbidden("only an organization owner may grant the owner role")
+	}
+
+	user, err := a.resolveUser(ctx, r.PathValue("user"))
+	if err != nil {
+		return err
+	}
+
+	membership, err := a.store.GrantOrgMembershipLocal(ctx, repository.GrantOrgMembershipLocalParams{
+		UserID:    user.ID,
+		OrgID:     s.OrgID,
+		LocalRole: repository.NullOrgRole{OrgRole: role, Valid: true},
+		GrantedBy: p.UserID(),
+	})
+	if err != nil {
+		return fmt.Errorf("grant local org role: %w", err)
+	}
+
+	a.log.InfoContext(ctx, "granted a local org role",
+		slog.String("org", s.OrgSlug),
+		slog.String("user", user.Email),
+		slog.String("local_role", string(role)),
+		slog.String("granted_by", p.Email()),
+	)
+
+	writeJSON(w, http.StatusOK, newMembership(membership, user.Email, user.DisplayName, p.Email()))
+
+	return nil
+}
+
+// handleDeleteOrgMember clears someone's LOCAL org role. Org admin.
+//
+// # The response has to be honest, and this is why
+//
+// This endpoint owns exactly one of the two sources of a membership. There are
+// three outcomes and they are NOT interchangeable:
+//
+//  1. Local grant only. The row is deleted, the user leaves the org, and the
+//     cascade takes their project roles and every API key they hold in the org with
+//     it. 200, still_a_member = false.
+//
+//  2. Local grant AND an OIDC claim. The local half is cleared and THE ROW
+//     SURVIVES: the user is still a member, at whatever role their groups confer,
+//     with their project roles and their keys intact. 200, still_a_member = TRUE,
+//     and the body names the group that is holding the membership up. An admin who
+//     sees a bare 204 here and concludes the user is gone is wrong, and a bare 204
+//     is what would have told them so.
+//
+//  3. No local grant at all -- the membership is purely claim-derived. There is
+//     nothing here to remove. This is a 409, not a 200 and not a 204, because a
+//     success on a request that changed nothing is the same lie as (2): the user is
+//     still in the org, and the only way to remove them is in the IdP.
+func (a *API) handleDeleteOrgMember(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+	s := scopeFrom(ctx)
+
+	user, err := a.resolveUser(ctx, r.PathValue("user"))
+	if err != nil {
+		return err
+	}
+
+	current, err := a.store.GetOrgMembership(ctx, repository.GetOrgMembershipParams{
+		UserID: user.ID, OrgID: s.OrgID,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errNotFound("that user is not a member of this organization")
+		}
+
+		return fmt.Errorf("load org membership: %w", err)
+	}
+
+	if !current.LocalRole.Valid {
+		return errConflict(CodeClaimDerived, "this membership is derived from OIDC group claims"+
+			claimSource(current)+", not from a grant made here, so it cannot be removed here. "+
+			"Remove the user from the group in the identity provider, or change the group-to-org "+
+			"mapping, and the membership disappears at their next login.")
+	}
+
+	// The claim half decides whether clearing the local half removes the user or
+	// merely demotes them. Both statements are guarded on it in SQL, so this is a
+	// branch, not a race: whichever one matches, matches.
+	if current.OidcRole.Valid {
+		survived, err := a.store.RevokeOrgMembershipLocal(ctx, repository.RevokeOrgMembershipLocalParams{
+			UserID: user.ID, OrgID: s.OrgID,
+		})
+		if err != nil {
+			return fmt.Errorf("revoke local org role: %w", err)
+		}
+
+		member := newMembership(survived, user.Email, user.DisplayName, "")
+
+		a.log.InfoContext(ctx, "revoked a local org role; the membership survives by claim",
+			slog.String("org", s.OrgSlug),
+			slog.String("user", user.Email),
+			slog.String("oidc_group", member.OIDCGroup),
+		)
+
+		writeJSON(w, http.StatusOK, OrgMemberRemoval{
+			UserID: uuidString(user.ID), LocalRoleRevoked: true, StillAMember: true,
+			Membership: &member,
+			Message: "The local grant was removed, but this user IS STILL A MEMBER of the " +
+				"organization: their OIDC group claims" + claimSource(current) + " justify the " +
+				"membership on their own. Their project roles and API keys are unaffected. To " +
+				"remove them entirely, remove them from the group in the identity provider.",
+		})
+
+		return nil
+	}
+
+	n, err := a.store.DeleteLocalOrgMembership(ctx, repository.DeleteLocalOrgMembershipParams{
+		UserID: user.ID, OrgID: s.OrgID,
+	})
+	if err != nil {
+		return fmt.Errorf("delete org membership: %w", err)
+	}
+
+	if n == 0 {
+		// A concurrent login reconciled a claim onto the row between the read above
+		// and this delete. The guard in the SQL held, which is the point of it: we
+		// refuse rather than remove a membership the claims now justify.
+		return errConflict(CodeConflict,
+			"the membership changed while it was being removed; retry")
+	}
+
+	a.log.InfoContext(ctx, "removed an org membership",
+		slog.String("org", s.OrgSlug),
+		slog.String("user", user.Email),
+	)
+
+	writeJSON(w, http.StatusOK, OrgMemberRemoval{
+		UserID: uuidString(user.ID), LocalRoleRevoked: true, StillAMember: false,
+		Membership: nil,
+		Message: "The user was removed from the organization. Their project roles and every " +
+			"API key they held in it were revoked with the membership.",
+	})
+
+	return nil
+}
+
+// claimSource names the group behind a claim-derived membership, for the prose in
+// the two responses above. An admin's next question is always "held up by WHAT?".
+func claimSource(m repository.OrgMembership) string {
+	if !m.OidcGroup.Valid || m.OidcGroup.String == "" {
+		return ""
+	}
+
+	return " (" + m.OidcGroup.String + ")"
 }
 
 // ---------------------------------------------------------------------------
@@ -133,11 +280,10 @@ func (a *API) handleListProjectMembers(w http.ResponseWriter, r *http.Request) e
 	out := make([]Member, 0, len(orgMembers))
 
 	for _, m := range orgMembers {
-		out = append(out, Member{
-			UserID: uuidString(m.UserID), Email: m.Email, DisplayName: m.DisplayName,
-			OrgRole: string(m.Role), ProjectRole: string(roles[m.UserID]),
-			Source: OrgRoleSourceOIDC,
-		})
+		member := newOrgMember(m)
+		member.ProjectRole = string(roles[m.UserID])
+
+		out = append(out, member)
 	}
 
 	writeJSON(w, http.StatusOK, list(out))
@@ -235,7 +381,9 @@ func (a *API) handlePutProjectMember(w http.ResponseWriter, r *http.Request) err
 
 	writeJSON(w, http.StatusOK, Member{
 		UserID: uuidString(out.UserID), Email: "", DisplayName: "",
-		OrgRole: "", ProjectRole: string(out.Role), Source: OrgRoleSourceOIDC,
+		OrgRole: "", OIDCRole: "", OIDCGroup: "", LocalRole: "",
+		GrantedBy: "", GrantedByEmail: "", GrantedAt: nil,
+		ProjectRole: string(out.Role), Source: "",
 	})
 
 	return nil
@@ -289,6 +437,62 @@ func (a *API) handleDeleteProjectMember(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusNoContent, nil)
 
 	return nil
+}
+
+// resolveUser turns the {user} path segment -- a user id or an email -- into a
+// USER, without requiring them to be a member of anything.
+//
+// This is the resolver the ORG-membership endpoints need, and it is deliberately
+// weaker than resolveOrgMember below: granting someone their FIRST membership in an
+// org means naming a user who is, by definition, not on the org's roster yet.
+//
+// The IDOR guard therefore cannot come from the roster here. It comes from the
+// guard: the route is AccessOrgAdmin against the org in the path, and the only
+// thing this id is ever used for is a write to (this user, THAT org). A caller who
+// names a user id from another tenant can, at most, add that user to an org they
+// already administer -- they cannot read anything of that user's, and they cannot
+// reach any other org.
+//
+// It does tell an org admin whether an email address has a Bakery account, and that
+// is an unavoidable consequence of being able to add one: the user must exist (they
+// are provisioned at their first login) or there is nothing to grant. The message
+// says exactly that, so nobody has to guess.
+func (a *API) resolveUser(ctx context.Context, ref string) (repository.User, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return repository.User{}, errValidation("user", "a user id or email address is required")
+	}
+
+	notFound := errNotFound("no such user. Users are provisioned at their first login; " +
+		"ask them to sign in once, then grant the role")
+
+	var (
+		user repository.User
+		err  error
+	)
+
+	if strings.Contains(ref, "@") {
+		user, err = a.store.GetUserByEmail(ctx, ref)
+	} else {
+		var id pgtype.UUID
+
+		id, err = parseUUID(ref)
+		if err != nil {
+			return repository.User{}, err
+		}
+
+		user, err = a.store.GetUser(ctx, id)
+	}
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return repository.User{}, notFound
+		}
+
+		return repository.User{}, fmt.Errorf("resolve user: %w", err)
+	}
+
+	return user, nil
 }
 
 // resolveOrgMember turns the {user} path segment -- a user id or an email -- into

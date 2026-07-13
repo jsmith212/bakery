@@ -227,48 +227,71 @@ func TestListOrgsIsScopedToTheCaller(t *testing.T) {
 	}
 }
 
-// TestOrgRolesAreNotEditable: an org membership write is refused with 409, because
-// the OIDC reconciler owns that table and would revert the edit at the user's next
-// login -- silently, hours later.
-func TestOrgRolesAreNotEditable(t *testing.T) {
-	tests := []struct {
-		name   string
-		method string
-	}{
-		{"PUT is refused", http.MethodPut},
-		{"DELETE is refused", http.MethodDelete},
-	}
-
+// TestTheClaimHalfOfAnOrgRoleIsStillNotEditable.
+//
+// This test was TestOrgRolesAreNotEditable, and it asserted that BOTH writes to an
+// org membership were a 409: in M1 an org role was 100% claim-derived, so a
+// hand-edit would have been silently reverted at the user's next login. It is
+// INVERTED rather than deleted, so what changed in M1.5 -- and what did NOT -- is
+// recorded rather than erased.
+//
+// What changed: an org role now has a LOCAL half, which the reconciler cannot touch,
+// so PUT grants one and it survives the next login (asserted DB-backed in
+// orgmembers_test.go -- the hybrid model lives in the schema and only a real
+// Postgres can prove it).
+//
+// What did NOT change: the CLAIM half is still owned by the IdP, and a DELETE
+// against a purely claim-derived membership is still a 409 with the same code. The
+// API cannot remove a membership LDAP is holding up, and it must not pretend it can.
+func TestTheClaimHalfOfAnOrgRoleIsStillNotEditable(t *testing.T) {
 	cast := principals(t)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			store := fixtureStore(t)
-			a := testAPI(t, store, nil)
+	// marko's fixture membership is claim-derived (fakeStore's GetOrgMembership
+	// reports oidc_role set, local_role NULL), so there is no local grant to remove.
+	t.Run("DELETE against a claim-derived membership is still a 409", func(t *testing.T) {
+		store := fixtureStore(t)
+		a := testAPI(t, store, nil)
 
-			body := ""
-			if tt.method == http.MethodPut {
-				body = `{"role":"owner"}`
+		w := do(t, a, cast["org_admin"], http.MethodDelete,
+			Prefix+"/orgs/acme/members/marko@acme.dev", "")
+
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusConflict)
+		}
+
+		if got := decodeErr(t, w).Code; got != CodeClaimDerived {
+			t.Errorf("error code = %q, want %q", got, CodeClaimDerived)
+		}
+
+		// The read happened; no WRITE did. A 409 that had already deleted the row is
+		// exactly the failure a status-code-only assertion cannot see.
+		for _, call := range store.calls {
+			if call != "GetOrgMembership" {
+				t.Errorf("the refused DELETE wrote to the store: %v", store.calls)
 			}
+		}
+	})
 
-			w := do(t, a, cast["org_admin"], tt.method,
-				Prefix+"/orgs/acme/members/marko@acme.dev", body)
+	// An org ADMIN may grant, but may not mint an OWNER: an owner can delete the org
+	// and everything cached in it, so that would be a self-service escalation to an
+	// authority the granter does not hold.
+	t.Run("an org admin may not grant the owner role", func(t *testing.T) {
+		store := fixtureStore(t)
+		a := testAPI(t, store, nil)
 
-			if w.Code != http.StatusConflict {
-				t.Fatalf("status = %d, want %d", w.Code, http.StatusConflict)
-			}
+		w := do(t, a, cast["org_admin"], http.MethodPut,
+			Prefix+"/orgs/acme/members/marko@acme.dev", `{"role":"owner"}`)
 
-			if got := decodeErr(t, w).Code; got != CodeClaimDerived {
-				t.Errorf("error code = %q, want %q", got, CodeClaimDerived)
-			}
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want %d (body %s)", w.Code, http.StatusForbidden, w.Body.String())
+		}
 
-			if len(store.calls) != 0 {
-				t.Errorf("the store was written to: %v", store.calls)
-			}
-		})
-	}
+		if len(store.calls) != 0 {
+			t.Errorf("the refused grant wrote to the store: %v", store.calls)
+		}
+	})
 
-	// And an UNAUTHORIZED caller does not even learn that: they get the ordinary
+	// And an UNAUTHORIZED caller learns nothing from any of it: they get the ordinary
 	// authorization answer, not a helpful 409 that confirms the org exists.
 	t.Run("an unauthorized caller gets the authz answer, not the 409", func(t *testing.T) {
 		a := testAPI(t, fixtureStore(t), nil)
