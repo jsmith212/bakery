@@ -530,6 +530,7 @@ func (a *API) resolveOrgMember(ctx context.Context, orgID pgtype.UUID, ref strin
 	// not in this org: telling an org admin which email addresses have Bakery
 	// accounts elsewhere in the installation is a directory-enumeration oracle.
 	return pgtype.UUID{}, errNotFound(
-		"no such member of this organization. Users are provisioned at their first login, " +
-			"and org membership comes from OIDC group claims")
+		"no such member of this organization. Users are provisioned at their first login; " +
+			"add them to the organization with PUT /orgs/{org}/members/{user}, or map an OIDC " +
+			"group to it")
 }
