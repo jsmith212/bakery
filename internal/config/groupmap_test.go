@@ -35,8 +35,31 @@ func TestParseGroupMap(t *testing.T) {
 	}{
 		{name: "valid", doc: validGroupMap, wantErr: false},
 		{
-			name:    "no orgs means nobody can ever log in",
+			// INVERTED, DELIBERATELY. This case used to be "no orgs means nobody can
+			// ever log in" and asserted an error, because org membership WAS the login
+			// gate. It is not any more: the gate is login_groups, and a deployment can
+			// run entirely on local org grants. An org-free file is now exactly right,
+			// and refusing it would refuse the very deployment this milestone exists to
+			// enable.
+			name:    "no orgs is fine now: a deployment can run entirely on local grants",
 			doc:     `{"orgs": []}`,
+			wantErr: false,
+		},
+		{
+			name:    "orgs may be omitted entirely",
+			doc:     `{"login_groups": ["bakery-users"]}`,
+			wantErr: false,
+		},
+		{
+			name:    "a login gate with no orgs and no site admins is a valid policy",
+			doc:     `{}`,
+			wantErr: false,
+		},
+		{
+			// An empty LIST admits anyone; an empty STRING gates on a group nobody can
+			// be in, which locks everybody out. That is what a stray "" looks like.
+			name:    "empty login group name locks everyone out",
+			doc:     `{"login_groups": [""], "orgs": []}`,
 			wantErr: true,
 		},
 		{
@@ -89,6 +112,14 @@ func TestParseGroupMap(t *testing.T) {
 			doc:     `{"site_admin_group": ["x"], "orgs": [{"slug": "acme", "groups": {"g": "member"}}]}`,
 			wantErr: true,
 		},
+		{
+			// The login gate has the worst failure mode of the lot: a typo'd
+			// `login_group` parses to an EMPTY LoginGroups, which admits everyone who
+			// can authenticate. DisallowUnknownFields is what stops it.
+			name:    "a typo'd login_groups must not silently open the gate",
+			doc:     `{"login_group": ["bakery-users"], "orgs": []}`,
+			wantErr: true,
+		},
 		{name: "not json", doc: `orgs: [acme]`, wantErr: true},
 		{name: "empty document", doc: ``, wantErr: true},
 	}
@@ -123,7 +154,7 @@ func TestGroupNamesThatYAMLWouldEatParseFine(t *testing.T) {
 		t.Fatalf("ParseGroupMap: %v", err)
 	}
 
-	got, err := gm.Resolve([]string{"no", "1.10"})
+	got, err := gm.Resolve(GroupsClaim{Groups: []string{"no", "1.10"}, Present: true})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -141,14 +172,14 @@ func TestGroupMapResolve(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		groups   []string
+		claim    GroupsClaim
 		wantErr  error
 		wantSite SiteRole
 		wantOrgs map[string]OrgRole
 	}{
 		{
 			name:     "one group, one org",
-			groups:   []string{"acme-engineering"},
+			claim:    present("acme-engineering"),
 			wantSite: SiteRoleUser,
 			wantOrgs: map[string]OrgRole{"acme": OrgRoleMember},
 		},
@@ -156,25 +187,25 @@ func TestGroupMapResolve(t *testing.T) {
 			// The highest role wins, NOT whichever the map happened to iterate last.
 			// Getting this wrong makes an owner's role flap between runs.
 			name:     "highest role wins",
-			groups:   []string{"acme-engineering", "acme-directors", "acme-leads"},
+			claim:    present("acme-engineering", "acme-directors", "acme-leads"),
 			wantSite: SiteRoleUser,
 			wantOrgs: map[string]OrgRole{"acme": OrgRoleOwner},
 		},
 		{
 			name:     "order does not matter",
-			groups:   []string{"acme-directors", "acme-engineering"},
+			claim:    present("acme-directors", "acme-engineering"),
 			wantSite: SiteRoleUser,
 			wantOrgs: map[string]OrgRole{"acme": OrgRoleOwner},
 		},
 		{
 			name:     "several orgs",
-			groups:   []string{"acme-leads", "initech-all"},
+			claim:    present("acme-leads", "initech-all"),
 			wantSite: SiteRoleUser,
 			wantOrgs: map[string]OrgRole{"acme": OrgRoleAdmin, "initech": OrgRoleMember},
 		},
 		{
 			name:     "site admin",
-			groups:   []string{"bakery-admins", "acme-engineering"},
+			claim:    present("bakery-admins", "acme-engineering"),
 			wantSite: SiteRoleAdmin,
 			wantOrgs: map[string]OrgRole{"acme": OrgRoleMember},
 		},
@@ -182,59 +213,87 @@ func TestGroupMapResolve(t *testing.T) {
 			// Users are routinely in dozens of unrelated IdP groups. Those must be
 			// ignored, not rejected.
 			name:     "unmapped groups are ignored",
-			groups:   []string{"vpn-users", "printer-admins", "initech-all"},
+			claim:    present("vpn-users", "printer-admins", "initech-all"),
 			wantSite: SiteRoleUser,
 			wantOrgs: map[string]OrgRole{"initech": OrgRoleMember},
 		},
 		{
-			// FAIL CLOSED. Azure AD truncates a >200-group claim into a _claim_names
-			// overage, so "no groups" happens to real users. Proceeding with an empty
-			// keep-set would make ReconcileOrgMembershipsRemove delete every org
-			// membership the user has -- cascading to their project roles and every API
-			// key they hold in those orgs, irreversibly.
-			name:    "no groups at all is an error, never an empty result",
-			groups:  nil,
-			wantErr: ErrNoGroups,
+			// UNCHANGED, AND THE POINT OF THE WHOLE EXERCISE. An unreadable claim is
+			// still refused: Azure AD replaces a >200-group claim with a `_claim_names`
+			// overage, so the `groups` claim is simply ABSENT for real,
+			// correctly-configured users. Reconciling it as "zero groups" would NULL
+			// every oidc_role, delete every membership row with no local grant, and
+			// cascade away the user's project roles and every API key they hold in
+			// those orgs. Irreversible.
+			name:    "an unreadable claim is refused, never treated as an empty result",
+			claim:   GroupsClaim{Present: false},
+			wantErr: ErrGroupsUnreadable,
 		},
 		{
-			name:    "empty slice is an error",
-			groups:  []string{},
-			wantErr: ErrNoGroups,
+			// The zero value fails closed: a caller who forgets to set Present refuses
+			// the login instead of wiping the user's memberships.
+			name:    "the zero-value claim fails closed",
+			claim:   GroupsClaim{},
+			wantErr: ErrGroupsUnreadable,
 		},
 		{
-			name:    "groups that map to nothing is an error",
-			groups:  []string{"vpn-users"},
-			wantErr: ErrNoMappedOrgs,
+			// Belt and braces: even a non-empty group list is refused if we were told
+			// the claim was not readable. Present is the authority, not len(Groups).
+			name:    "groups alongside Present=false are not trusted",
+			claim:   GroupsClaim{Groups: []string{"acme-directors"}, Present: false},
+			wantErr: ErrGroupsUnreadable,
 		},
 		{
-			// A site admin with no org is still not entitled to anything, so the login
-			// is still rejected. The site-admin group is not a backdoor around the org
-			// mapping.
-			name:    "site admin with no org membership is still rejected",
-			groups:  []string{"bakery-admins"},
-			wantErr: ErrNoMappedOrgs,
+			// INVERTED, DELIBERATELY. This case used to be "empty slice is an error"
+			// (ErrNoGroups). A GENUINELY EMPTY claim is an ordinary state now: it means
+			// "this user has only local memberships". Admit them, and reconcile the OIDC
+			// half to nothing. Conflating this with the case above is the whole trap.
+			name:     "a genuinely empty claim is admitted with zero orgs",
+			claim:    GroupsClaim{Groups: []string{}, Present: true},
+			wantSite: SiteRoleUser,
+			wantOrgs: map[string]OrgRole{},
+		},
+		{
+			// INVERTED, DELIBERATELY. Was "groups that map to nothing is an error"
+			// (ErrNoMappedOrgs). Org membership is no longer the login gate, so
+			// resolving to zero orgs is not a refusal -- the user may hold local
+			// memberships this file cannot see.
+			name:     "groups that map to no org resolve to zero orgs, not an error",
+			claim:    present("vpn-users"),
+			wantSite: SiteRoleUser,
+			wantOrgs: map[string]OrgRole{},
+		},
+		{
+			// INVERTED, DELIBERATELY. Was "site admin with no org membership is still
+			// rejected". A site admin who is in no org group is exactly the operator who
+			// has to create the first org, and refusing them was the dead-end that
+			// started this milestone.
+			name:     "site admin with no org membership is admitted",
+			claim:    present("bakery-admins"),
+			wantSite: SiteRoleAdmin,
+			wantOrgs: map[string]OrgRole{},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := gm.Resolve(tt.groups)
+			got, err := gm.Resolve(tt.claim)
 
 			if tt.wantErr != nil {
 				if !errors.Is(err, tt.wantErr) {
-					t.Fatalf("Resolve(%v) error = %v, want %v", tt.groups, err, tt.wantErr)
+					t.Fatalf("Resolve(%v) error = %v, want %v", tt.claim, err, tt.wantErr)
 				}
 
-				if len(got.Orgs) != 0 {
-					t.Errorf("Resolve returned %d orgs alongside an error; a caller that "+
-						"ignored the error would reconcile against them", len(got.Orgs))
+				if len(got.Orgs) != 0 || got.SiteRole != "" {
+					t.Errorf("Resolve returned site %q and %d orgs alongside an error; a caller "+
+						"that ignored the error would reconcile against them", got.SiteRole, len(got.Orgs))
 				}
 
 				return
 			}
 
 			if err != nil {
-				t.Fatalf("Resolve(%v): %v", tt.groups, err)
+				t.Fatalf("Resolve(%v): %v", tt.claim, err)
 			}
 
 			if got.SiteRole != tt.wantSite {
@@ -245,6 +304,167 @@ func TestGroupMapResolve(t *testing.T) {
 				t.Errorf("Orgs = %v, want %v", got.Orgs, tt.wantOrgs)
 			}
 		})
+	}
+}
+
+// present is a readable groups claim. The bare-slice form is deliberately not
+// available: a test must say which of the two states it means.
+func present(groups ...string) GroupsClaim {
+	return GroupsClaim{Groups: groups, Present: true}
+}
+
+// TestLoginGate. The gate answers "may this human use Bakery at all?", which is a
+// DIFFERENT question from "which orgs are they in" -- answering the second to
+// answer the first is what forced a group per org into the directory forever.
+func TestLoginGate(t *testing.T) {
+	const gated = `{
+	  "login_groups": ["bakery-users", "bakery-contractors"],
+	  "site_admin_groups": ["bakery-admins"],
+	  "orgs": [{"slug": "acme", "groups": {"acme-engineering": "member"}}]
+	}`
+
+	tests := []struct {
+		name     string
+		doc      string
+		claim    GroupsClaim
+		wantErr  error
+		wantSite SiteRole
+		wantOrgs map[string]OrgRole
+	}{
+		{
+			name:     "in a login group, admitted",
+			doc:      gated,
+			claim:    present("bakery-users", "acme-engineering"),
+			wantSite: SiteRoleUser,
+			wantOrgs: map[string]OrgRole{"acme": OrgRoleMember},
+		},
+		{
+			name:     "any one login group is enough",
+			doc:      gated,
+			claim:    present("bakery-contractors"),
+			wantSite: SiteRoleUser,
+			wantOrgs: map[string]OrgRole{},
+		},
+		{
+			// The gate is the gate. An org group does not smuggle you past it.
+			name:    "in no login group, refused even with a mapped org group",
+			doc:     gated,
+			claim:   present("acme-engineering"),
+			wantErr: ErrNotInLoginGroup,
+		},
+		{
+			// Nor does the site-admin group. If the gate says no, it is no.
+			name:    "in no login group, refused even as a site admin",
+			doc:     gated,
+			claim:   present("bakery-admins"),
+			wantErr: ErrNotInLoginGroup,
+		},
+		{
+			name:    "an empty claim is refused when the gate is configured",
+			doc:     gated,
+			claim:   GroupsClaim{Groups: []string{}, Present: true},
+			wantErr: ErrNotInLoginGroup,
+		},
+		{
+			// EMPTY login_groups ADMITS ANY SUCCESSFUL OIDC AUTH. The IdP has already
+			// decided who may authenticate; a deployment whose tenant is its user base
+			// should not have to restate that as a group.
+			name:     "an unset gate admits anyone who authenticated",
+			doc:      `{"orgs": [{"slug": "acme", "groups": {"acme-engineering": "member"}}]}`,
+			claim:    present("some-unrelated-group"),
+			wantSite: SiteRoleUser,
+			wantOrgs: map[string]OrgRole{},
+		},
+		{
+			name:     "an explicitly empty gate admits anyone who authenticated",
+			doc:      `{"login_groups": [], "orgs": []}`,
+			claim:    GroupsClaim{Groups: []string{}, Present: true},
+			wantSite: SiteRoleUser,
+			wantOrgs: map[string]OrgRole{},
+		},
+		{
+			// THE TRAP DETECTION IS NOT PART OF THE GATE, AND MUST NOT DEPEND ON IT.
+			// The gate and the reconciler consume the same claim, so an unreadable claim
+			// must refuse with ErrGroupsUnreadable whether the gate is on...
+			name:    "an unreadable claim is refused as unreadable, gate on",
+			doc:     gated,
+			claim:   GroupsClaim{Present: false},
+			wantErr: ErrGroupsUnreadable,
+		},
+		{
+			// ...or off. If this ever returns nil, an absent claim reconciles as "zero
+			// groups" on every deployment that did not configure a gate.
+			name:    "an unreadable claim is refused as unreadable, gate off",
+			doc:     `{"orgs": []}`,
+			claim:   GroupsClaim{Present: false},
+			wantErr: ErrGroupsUnreadable,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gm, err := ParseGroupMap([]byte(tt.doc))
+			if err != nil {
+				t.Fatalf("ParseGroupMap: %v", err)
+			}
+
+			got, err := gm.Resolve(tt.claim)
+
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("Resolve(%v) error = %v, want %v", tt.claim, err, tt.wantErr)
+				}
+
+				if len(got.Orgs) != 0 || got.SiteRole != "" {
+					t.Errorf("Resolve returned site %q and %d orgs alongside an error; a caller "+
+						"that ignored the error would reconcile against them", got.SiteRole, len(got.Orgs))
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Resolve(%v): %v", tt.claim, err)
+			}
+
+			if got.SiteRole != tt.wantSite {
+				t.Errorf("SiteRole = %q, want %q", got.SiteRole, tt.wantSite)
+			}
+
+			if !maps.Equal(got.Orgs, tt.wantOrgs) {
+				t.Errorf("Orgs = %v, want %v", got.Orgs, tt.wantOrgs)
+			}
+		})
+	}
+}
+
+// TestOrgFreeGroupMapResolves: the file that exists ONLY to gate logins and name
+// site admins. Every org membership in such a deployment is granted in-app. This
+// whole document used to be a boot failure.
+func TestOrgFreeGroupMapResolves(t *testing.T) {
+	gm, err := ParseGroupMap([]byte(`{
+	  "login_groups": ["bakery-users"],
+	  "site_admin_groups": ["bakery-admins"]
+	}`))
+	if err != nil {
+		t.Fatalf("an org-free group map must parse: %v", err)
+	}
+
+	if got := gm.OrgSlugs(); len(got) != 0 {
+		t.Errorf("OrgSlugs() = %v, want none", got)
+	}
+
+	got, err := gm.Resolve(present("bakery-users", "bakery-admins"))
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	if got.SiteRole != SiteRoleAdmin {
+		t.Errorf("SiteRole = %q, want admin", got.SiteRole)
+	}
+
+	if len(got.Orgs) != 0 {
+		t.Errorf("Orgs = %v, want none -- this file maps no orgs", got.Orgs)
 	}
 }
 

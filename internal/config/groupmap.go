@@ -59,21 +59,37 @@ const (
 
 // Errors the caller must branch on.
 var (
-	// ErrNoGroups means the ID token carried no group claim at all.
+	// ErrGroupsUnreadable means we could not read the user's groups AT ALL: the
+	// claim was absent, or Azure AD replaced it with a `_claim_names` /
+	// `_claim_sources` overage pointing at Graph.
 	//
-	// FAIL CLOSED. Azure AD truncates a >200-group claim into a `_claim_names`
-	// overage rather than sending the groups, so "no groups" is a thing that
-	// happens to real, correctly-configured users. Reconciliation must REJECT the
-	// login, never proceed with an empty keep-set: an empty keep-set makes
-	// ReconcileOrgMembershipsRemove delete every org membership the user has, which
-	// cascades to their project memberships and every API key they hold in those
-	// orgs. That is irreversible -- re-adding the org membership does NOT bring the
-	// keys back.
-	ErrNoGroups = errors.New("the ID token carried no group claim")
+	// FAIL CLOSED, AND MIND THE DIFFERENCE. "The IdP says this user is in zero
+	// groups" and "we could not read this user's groups" are CATEGORICALLY
+	// DIFFERENT, and only the first is safe to act on:
+	//
+	//   - groups: []  -> an ordinary state. It means "this user has only local
+	//     memberships". ADMIT them, and reconcile the OIDC half away.
+	//   - unreadable  -> we do not know. REFUSE the login and reconcile NOTHING.
+	//
+	// Treating unreadable as empty NULLs every oidc_role, deletes every org
+	// membership row with no local grant, and cascades away the user's project
+	// roles and every API key they hold in those orgs. That is irreversible --
+	// re-adding the org membership does NOT bring the keys back. And it happens to
+	// real, correctly-configured users, not to hypothetical ones.
+	//
+	// This holds WHETHER OR NOT the login gate is configured: the gate and the
+	// reconciler consume the same claim, so disabling the gate must not disable the
+	// trap detection. Resolve therefore checks readability BEFORE the gate.
+	ErrGroupsUnreadable = errors.New("the user's groups claim is unreadable (absent, or an overage reference)")
 
-	// ErrNoMappedOrgs means the user's groups map to zero orgs: they are not
-	// entitled to anything here. Same fail-closed rule -- reject the login.
-	ErrNoMappedOrgs = errors.New("none of the user's groups map to an organization")
+	// ErrNotInLoginGroup means login_groups is configured and the user is in none
+	// of them: they may not use Bakery at all. Reject the login.
+	//
+	// This is the LOGIN GATE, and it is a separate question from "which orgs are
+	// they in". Answering the second to answer the first is what forced a group per
+	// org into the directory, forever. A user in a login group with zero mapped
+	// orgs is admitted, and holds only local memberships.
+	ErrNotInLoginGroup = errors.New("none of the user's groups is a login group")
 
 	// ErrInvalidGroupMap means the mapping file is malformed. Boot must refuse.
 	ErrInvalidGroupMap = errors.New("invalid group mapping file")
@@ -81,19 +97,41 @@ var (
 
 // GroupMap is the parsed, validated group -> org mapping.
 //
-// Org roles and the site role are 100% derived from OIDC group claims and
-// reconciled on EVERY login. PROJECT roles are managed in-app and this file must
-// never mention them: a manually granted org role would be silently deleted by the
-// user's next login, which is why the schema has no `source` column and makes that
-// state unrepresentable.
+// It answers three DIFFERENT questions from three different fields, and keeping
+// them apart is the whole point of the file:
+//
+//   - LoginGroups: may this human use Bakery at all?
+//   - SiteAdminGroups: may they run the platform? (the OIDC half of a hybrid role)
+//   - Orgs: which orgs are they in, and how? (the OIDC half of a hybrid membership)
+//
+// The claim-derived roles here are only ever ONE HALF of the effective role: an org
+// membership and a site role may ALSO be granted in-app, and the database computes
+// the effective role as greatest(oidc, local). The reconciler writes the oidc_*
+// columns and nothing else, so nothing in this file can clobber a local grant.
+//
+// PROJECT roles are in-app only and must never appear here. Group-mapping them is
+// the group explosion this design exists to escape.
 type GroupMap struct {
 	// Note is the comment field JSON does not have. Ignored.
 	Note string `json:"note,omitempty"`
+
+	// LoginGroups is the login gate: membership in any one of these admits the user.
+	//
+	// EMPTY OR UNSET ADMITS ANY SUCCESSFUL OIDC AUTH. That is deliberate, and it is
+	// not a fail-open: the IdP has already decided who may authenticate, and a
+	// deployment whose IdP tenant IS its user base should not have to restate that
+	// as a group. It is also what lets a deployment run with no `orgs` at all and
+	// hand out every membership locally.
+	LoginGroups []string `json:"login_groups"`
 
 	// SiteAdminGroups: membership in any of these makes the user a site admin.
 	SiteAdminGroups []string `json:"site_admin_groups"`
 
 	// Orgs maps each org slug to its group -> role table.
+	//
+	// MAY BE EMPTY. A deployment can run entirely on local grants, in which case
+	// this file exists only to answer the login-gate and site-admin questions -- or
+	// need not exist at all.
 	Orgs []GroupMapOrg `json:"orgs"`
 }
 
@@ -110,12 +148,40 @@ type GroupMapOrg struct {
 	Groups map[string]OrgRole `json:"groups"`
 }
 
-// Resolution is the authorization state a login reconciles to.
+// Resolution is the authorization state a login reconciles to. It is the OIDC HALF
+// of the user's authorization, never the whole of it: the local half lives in the
+// database and this type cannot see it.
 type Resolution struct {
 	SiteRole SiteRole
 
-	// Orgs maps org slug -> role. Never empty: Resolve returns an error instead.
+	// Orgs maps org slug -> role.
+	//
+	// LEGITIMATELY EMPTY. It used to be "never empty: Resolve returns an error
+	// instead", because org membership was the login gate. It is not any more: a
+	// user whose orgs are all granted in-app resolves to zero claim-derived orgs and
+	// must be ADMITTED. An empty map means "reconcile the OIDC half to nothing",
+	// which is a real instruction, not a missing answer -- Resolve returns
+	// ErrGroupsUnreadable when the answer is missing.
 	Orgs map[string]OrgRole
+}
+
+// GroupsClaim is the `groups` claim as read from the ID token, plus the one bit
+// that a plain []string cannot carry: whether we could read it at all.
+//
+// The two states a bare slice conflates are the trap this whole model fails closed
+// around (see ErrGroupsUnreadable), so the distinction is a field, not a nil check
+// that any append, copy or round-trip through a mock could quietly erase.
+//
+// The ZERO VALUE IS "UNREADABLE", so a caller that forgets to set Present refuses
+// the login rather than wiping the user's memberships.
+type GroupsClaim struct {
+	// Groups is the group names the claim carried. Meaningless unless Present.
+	Groups []string
+
+	// Present is true iff the ID token actually carried a readable groups claim --
+	// including a genuinely empty one. It is FALSE when the claim was absent or
+	// replaced by an Azure AD `_claim_names` overage.
+	Present bool
 }
 
 // LoadGroupMap reads and validates the mapping file at path.
@@ -152,9 +218,10 @@ func ParseGroupMap(raw []byte) (*GroupMap, error) {
 }
 
 func (g *GroupMap) validate() error {
-	if len(g.Orgs) == 0 {
-		return fmt.Errorf("%w: no orgs are mapped, so no user could ever log in", ErrInvalidGroupMap)
-	}
+	// There is deliberately NO `len(g.Orgs) == 0` rule here. It used to say "no orgs
+	// are mapped, so no user could ever log in", and that was true when org
+	// membership was the login gate. It is not any more: a deployment can run
+	// entirely on local grants, and an org-free file is then exactly right.
 
 	seen := make(map[string]struct{}, len(g.Orgs))
 
@@ -193,26 +260,55 @@ func (g *GroupMap) validate() error {
 		return fmt.Errorf("%w: site_admin_groups contains an empty group name", ErrInvalidGroupMap)
 	}
 
+	// An empty string in login_groups would gate on a group nobody can be in, which
+	// locks everybody out -- and it is what a trailing comma or a stray "" looks
+	// like. An empty LIST is fine and means something else entirely (admit anyone).
+	if slices.Contains(g.LoginGroups, "") {
+		return fmt.Errorf("%w: login_groups contains an empty group name", ErrInvalidGroupMap)
+	}
+
 	return nil
 }
 
-// Resolve turns a user's OIDC group claim into the authorization state to
-// reconcile.
+// Resolve turns a user's OIDC groups claim into the OIDC half of their
+// authorization state.
 //
 // It FAILS CLOSED, and the caller MUST honor that: an error here means REJECT THE
-// LOGIN, never "proceed with no orgs". See ErrNoGroups.
+// LOGIN AND RECONCILE NOTHING -- not one write. It does NOT mean "proceed with no
+// orgs", and on an error the returned Resolution is the zero value precisely so
+// that a caller which ignored the error reconciles against nothing rather than
+// against a plausible-looking empty answer.
+//
+// It refuses on exactly two things, in this order:
+//
+//  1. ErrGroupsUnreadable -- we could not read the claim, so we do not know this
+//     user's groups. Checked FIRST, and checked whether or not the login gate is
+//     configured: the gate and the reconciler consume the same claim, so an
+//     unconfigured gate must not disable the trap detection.
+//  2. ErrNotInLoginGroup -- login_groups is configured and the user is in none of
+//     them.
+//
+// Resolving to ZERO ORGS IS NOT AN ERROR. It used to be, when org membership was
+// the login gate; a locally-granted user legitimately resolves to zero claim-derived
+// orgs and refusing them is the bug. Zero orgs means "reconcile the OIDC half away",
+// and the row survives whenever a local grant justifies it.
 //
 // A user in several groups that map to the same org gets the HIGHEST role, not the
 // last one the map happened to iterate. A group the file does not mention is
 // ignored -- users are routinely in dozens of unrelated IdP groups.
-func (g *GroupMap) Resolve(groups []string) (Resolution, error) {
-	if len(groups) == 0 {
-		return Resolution{SiteRole: "", Orgs: nil}, ErrNoGroups
+func (g *GroupMap) Resolve(claim GroupsClaim) (Resolution, error) {
+	if !claim.Present {
+		return Resolution{}, ErrGroupsUnreadable
 	}
 
-	claimed := make(map[string]struct{}, len(groups))
-	for _, group := range groups {
+	claimed := make(map[string]struct{}, len(claim.Groups))
+	for _, group := range claim.Groups {
 		claimed[group] = struct{}{}
+	}
+
+	// The gate. An EMPTY login_groups admits anyone who authenticated.
+	if len(g.LoginGroups) > 0 && !anyClaimed(claimed, g.LoginGroups) {
+		return Resolution{}, ErrNotInLoginGroup
 	}
 
 	orgs := make(map[string]OrgRole)
@@ -229,21 +325,23 @@ func (g *GroupMap) Resolve(groups []string) (Resolution, error) {
 		}
 	}
 
-	if len(orgs) == 0 {
-		return Resolution{SiteRole: "", Orgs: nil}, ErrNoMappedOrgs
-	}
-
 	site := SiteRoleUser
-
-	for _, group := range g.SiteAdminGroups {
-		if _, ok := claimed[group]; ok {
-			site = SiteRoleAdmin
-
-			break
-		}
+	if anyClaimed(claimed, g.SiteAdminGroups) {
+		site = SiteRoleAdmin
 	}
 
 	return Resolution{SiteRole: site, Orgs: orgs}, nil
+}
+
+// anyClaimed reports whether the user holds any of want.
+func anyClaimed(claimed map[string]struct{}, want []string) bool {
+	for _, group := range want {
+		if _, ok := claimed[group]; ok {
+			return true
+		}
+	}
+
+	return false
 }
 
 // OrgSlugs returns every org slug the file mentions, sorted. Boot logs it, so an
