@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -141,6 +142,60 @@ func TestInvalidate(t *testing.T) {
 
 	if got := store.resolveCalls.Load(); got != 2 {
 		t.Errorf("ResolveRoute called %d times, want 2 (Invalidate must force a re-query)", got)
+	}
+}
+
+// TestResolveTTLExpiresStaleRoute: a control-plane change to a backend's ReadAuthRequired
+// must not be served out of cache forever. A public mirror flipped private (the
+// post-leak / offboarding case) is served stale only until the TTL, after which the next
+// Resolve re-reads the row and reflects the new, private policy. Without a TTL the stale
+// open route -- ReadAuthRequired=false -- would keep the "private" cache world-readable
+// until the process restarts.
+func TestResolveTTLExpiresStaleRoute(t *testing.T) {
+	store := newHitStore()
+	store.backend.ReadAuthRequired = false // a public mirror
+
+	r := NewCachedResolver(store, nil)
+
+	clock := time.Unix(1_700_000_000, 0)
+	r.now = func() time.Time { return clock }
+
+	route, ok := r.Resolve(t.Context(), "acme", "widget", repository.BackendKindSstate)
+	if !ok || route.ReadAuthRequired {
+		t.Fatalf("first Resolve ok=%v ReadAuthRequired=%v, want ok=true public", ok, route.ReadAuthRequired)
+	}
+
+	// The admin makes the cache private (e.g. after a leak). The DB row now says so.
+	store.backend.ReadAuthRequired = true
+
+	// Within the TTL the change is not yet visible -- the bounded staleness window.
+	clock = clock.Add(defaultRouteTTL - time.Second)
+
+	route, _ = r.Resolve(t.Context(), "acme", "widget", repository.BackendKindSstate)
+	if route.ReadAuthRequired {
+		t.Fatal("within the TTL the route re-queried early; the cache should still be serving the prior entry")
+	}
+
+	if got := store.backendCalls.Load(); got != 1 {
+		t.Errorf("within TTL GetBackend called %d times, want 1 (still a cache hit)", got)
+	}
+
+	// Past the TTL the entry is stale and must be re-read -- the flip to private now takes
+	// effect. This is the assertion that goes red if the TTL expiry is removed.
+	clock = clock.Add(2 * time.Second)
+
+	route, ok = r.Resolve(t.Context(), "acme", "widget", repository.BackendKindSstate)
+	if !ok {
+		t.Fatal("post-TTL Resolve = not found, want found")
+	}
+
+	if !route.ReadAuthRequired {
+		t.Error("after the TTL a cache flipped private still resolved ReadAuthRequired=false: " +
+			"the private cache stayed world-readable")
+	}
+
+	if got := store.backendCalls.Load(); got != 2 {
+		t.Errorf("post-TTL GetBackend called %d times, want 2 (a stale entry must be re-read)", got)
 	}
 }
 

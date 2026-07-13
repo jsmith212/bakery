@@ -5,12 +5,26 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/jsmith212/bakery/internal/cache"
 	"github.com/jsmith212/bakery/internal/db/repository"
 )
+
+// defaultRouteTTL bounds how long a resolved route -- INCLUDING its ReadAuthRequired
+// and Enabled flags -- may keep being served from cache after the control plane rewrites
+// the backend row. It converts an auth-policy change (a public mirror flipped private
+// after a leak, a backend disabled on decommission) from "stale until the process
+// restarts" -- a world-readable "private" cache indefinitely -- into "stale for at most
+// this long". The control plane should ALSO call Invalidate for immediate effect (that
+// wiring lives in internal/api / internal/server and is a follow-up); this TTL is the
+// backstop that bounds the window even when that call is absent. It is comfortably longer
+// than one build's BB_NUMBER_THREADS HEAD storm -- every HEAD for one org/project/kind
+// shares a single routeKey, so one resolution absorbs the whole storm -- so it keeps the
+// route layer off the hot path while never pinning a stale auth decision forever.
+const defaultRouteTTL = 30 * time.Second
 
 // RouteStore is the CONSUMER-SIDE database surface the resolver needs: the two cold
 // route-fill queries and nothing else. *db.Store satisfies it. Declaring it here keeps
@@ -28,21 +42,33 @@ type routeKey struct {
 	kind    repository.BackendKind
 }
 
+// cachedRoute is a resolved route plus the instant it goes stale. The expiry is what
+// keeps an auth-policy change (ReadAuthRequired, Enabled) from being served indefinitely
+// out of cache after the control plane rewrites the backend row.
+type cachedRoute struct {
+	route   cache.Route
+	expires time.Time
+}
+
 // CachedResolver fronts ResolveRoute + GetBackend (two cold index probes) with an
 // in-process cache. The boot advisory lock refuses a second instance, which is what
 // makes an in-process cache sound: exactly one process writes this database.
 //
-// It caches POSITIVE resolutions only. A miss (org/project/backend absent) is not
-// cached, so a backend created after its first probe takes effect immediately rather
-// than being pinned absent. A resolution that later changes -- a backend disabled or
-// deleted through the API -- is stale until Invalidate is called or the process
-// restarts; wiring Invalidate into the control-plane mutations is a follow-up.
+// It caches POSITIVE resolutions only, each with a TTL. A miss (org/project/backend
+// absent) is not cached, so a backend created after its first probe takes effect
+// immediately rather than being pinned absent. A resolution that later changes -- a
+// backend disabled, deleted, or flipped between public and private through the API --
+// is served from cache for at most ttl before it is re-read from the database.
+// Invalidate forces that re-read immediately; wiring it into the control-plane
+// mutations is a follow-up, and the TTL is the backstop until then.
 type CachedResolver struct {
 	store RouteStore
 	log   *slog.Logger
+	ttl   time.Duration
+	now   func() time.Time // injectable clock; time.Now in production, fixed in tests
 
 	mu    sync.RWMutex
-	cache map[routeKey]cache.Route
+	cache map[routeKey]cachedRoute
 }
 
 // NewCachedResolver builds a resolver over store.
@@ -54,7 +80,9 @@ func NewCachedResolver(store RouteStore, log *slog.Logger) *CachedResolver {
 	return &CachedResolver{
 		store: store,
 		log:   log,
-		cache: make(map[routeKey]cache.Route),
+		ttl:   defaultRouteTTL,
+		now:   time.Now,
+		cache: make(map[routeKey]cachedRoute),
 	}
 }
 
@@ -64,22 +92,28 @@ func (c *CachedResolver) Resolve(
 	ctx context.Context, org, project string, kind repository.BackendKind,
 ) (cache.Route, bool) {
 	k := routeKey{org: org, project: project, kind: kind}
+	now := c.now()
 
 	c.mu.RLock()
-	route, ok := c.cache[k]
+	ent, ok := c.cache[k]
 	c.mu.RUnlock()
 
-	if ok {
-		return route, true
+	// A cached entry is only good until it expires. A stale entry is treated exactly
+	// like a miss: re-read from the database so an auth-policy change (a cache flipped
+	// private, a backend disabled) cannot outlive the TTL. Failing the re-read renders
+	// 404 (load returns ok=false), which is the fail-safe direction -- 404 a build's HEAD
+	// rather than serve a possibly-private object on a stale open route.
+	if ok && now.Before(ent.expires) {
+		return ent.route, true
 	}
 
-	route, ok = c.load(ctx, org, project, kind)
+	route, ok := c.load(ctx, org, project, kind)
 	if !ok {
 		return cache.Route{}, false
 	}
 
 	c.mu.Lock()
-	c.cache[k] = route
+	c.cache[k] = cachedRoute{route: route, expires: now.Add(c.ttl)}
 	c.mu.Unlock()
 
 	return route, true
