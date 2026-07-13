@@ -7,10 +7,14 @@ import (
 	"io/fs"
 	"log/slog"
 	"net"
+	"net/http"
 	"time"
 
 	"github.com/jsmith212/bakery/internal/api"
 	"github.com/jsmith212/bakery/internal/auth"
+	"github.com/jsmith212/bakery/internal/blob"
+	"github.com/jsmith212/bakery/internal/cache"
+	"github.com/jsmith212/bakery/internal/cache/httpblob"
 	"github.com/jsmith212/bakery/internal/config"
 	"github.com/jsmith212/bakery/internal/db"
 	"github.com/jsmith212/bakery/internal/metrics"
@@ -168,6 +172,36 @@ func Boot(ctx context.Context, p BootParams) error {
 		return fmt.Errorf("build api: %w", err)
 	}
 
+	// The blob service: the ONE writer of object metadata and the only door to the
+	// bytes. Its Reader/Txer are the same *db.Store; dedup, refcounts, the LRU,
+	// singleflight and the headline cache metrics all live behind it.
+	blobs, err := blob.New(blob.Config{
+		Reader:  store,
+		Tx:      store,
+		Storage: byteStore,
+		Metrics: m,
+	})
+	if err != nil {
+		return fmt.Errorf("build blob service: %w", err)
+	}
+
+	// The M2 cache backends: sstate and downloads, both the shared httpblob handler
+	// with different Policy. The route resolver fronts ResolveRoute + GetBackend with
+	// the in-process cache the boot advisory lock makes sound; the auth adapter widens
+	// auth.Principal to httpblob's narrow capability interface.
+	cacheDeps := cache.Deps{Blobs: blobs, Metrics: m, Logger: log}
+	if err := cacheDeps.Validate(); err != nil {
+		return fmt.Errorf("build cache deps: %w", err)
+	}
+
+	routes := httpblob.NewCachedResolver(store, log)
+	authn := cacheAuth{svc: authSvc}
+
+	cacheBackends := []cache.Backend{
+		httpblob.NewSstate(cacheDeps, routes, authn),
+		httpblob.NewDownloads(cacheDeps, routes, authn),
+	}
+
 	// Background maintenance. Both are tied to ctx, so they stop when the server
 	// does; both are loops, so both must be goroutines.
 	go authSvc.StartKeyToucher(ctx, keyTouchInterval)
@@ -183,17 +217,29 @@ func Boot(ctx context.Context, p BootParams) error {
 	)
 
 	return New(Config{
-		Addr:        cmd.Addr(),
-		Version:     p.Version,
-		MetricsAddr: cmd.MetricsAddr,
-		Dist:        p.Dist,
-		Headless:    cmd.Headless,
-		API:         apiSrv.Handler(),
-		Pool:        pool,
-		Metrics:     m,
-		Storage:     byteStore,
-		Ready:       p.Ready,
+		Addr:          cmd.Addr(),
+		Version:       p.Version,
+		MetricsAddr:   cmd.MetricsAddr,
+		Dist:          p.Dist,
+		Headless:      cmd.Headless,
+		API:           apiSrv.Handler(),
+		Pool:          pool,
+		Metrics:       m,
+		Storage:       byteStore,
+		CacheBackends: cacheBackends,
+		Ready:         p.Ready,
 	}).Run(ctx)
+}
+
+// cacheAuth adapts *auth.Service to httpblob.Authenticator. It exists only to widen
+// auth.Principal (the sealed, unforgeable identity) to httpblob.Principal (the narrow
+// CanReadProject/CanWriteProject surface the cache handler needs) -- an auth.Principal
+// satisfies httpblob.Principal structurally, so this is a pure type-widening delegate.
+// The token stays inside internal/auth; nothing here touches it.
+type cacheAuth struct{ svc *auth.Service }
+
+func (a cacheAuth) AuthenticateCache(ctx context.Context, r *http.Request) (httpblob.Principal, error) {
+	return a.svc.AuthenticateCache(ctx, r)
 }
 
 // buildAuth assembles the auth service: the pgxpool-backed session store, the

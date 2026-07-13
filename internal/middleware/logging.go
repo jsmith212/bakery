@@ -1,7 +1,10 @@
 package middleware
 
 import (
+	"bufio"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 )
@@ -23,6 +26,48 @@ func (rr *responseRecorder) Write(b []byte) (int, error) {
 	rr.bytes += n
 
 	return n, err //nolint:wrapcheck // transparent pass-through of the wrapped writer
+}
+
+// writerOnly hides every method of the wrapped value except Write, so that
+// io.Copy cannot rediscover ReadFrom on it and recurse back into the recorder.
+type writerOnly struct{ io.Writer }
+
+// ReadFrom forwards to the wrapped writer's io.ReaderFrom when it has one. This
+// is what keeps the sendfile fast path alive on /cache GETs: net/http's
+// *response implements ReadFrom (zero-copy from an *os.File), and http.ServeContent
+// streams via io.CopyN, which only takes that path when the destination it is
+// handed exposes ReadFrom. Because we wrap the ResponseWriter, we must re-expose
+// it, or every multi-GB sstate download degrades to a 32 KiB userspace copy.
+func (rr *responseRecorder) ReadFrom(src io.Reader) (int64, error) {
+	if rf, ok := rr.ResponseWriter.(io.ReaderFrom); ok {
+		n, err := rf.ReadFrom(src)
+		rr.bytes += int(n)
+
+		return n, err //nolint:wrapcheck // transparent pass-through of the wrapped writer
+	}
+
+	// No fast path available: copy through Write so byte accounting still holds.
+	// writerOnly prevents io.Copy from finding this recorder's own ReadFrom.
+	n, err := io.Copy(writerOnly{rr}, src)
+
+	return n, err //nolint:wrapcheck // transparent pass-through of the wrapped writer
+}
+
+// Flush forwards to the wrapped writer when it is an http.Flusher.
+func (rr *responseRecorder) Flush() {
+	if f, ok := rr.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack forwards to the wrapped writer when it is an http.Hijacker (the
+// hashserv wss upgrade will need this once it lands behind this middleware).
+func (rr *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := rr.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack() //nolint:wrapcheck // transparent pass-through of the wrapped writer
+	}
+
+	return nil, nil, http.ErrNotSupported
 }
 
 // RequestLogger logs one structured line per completed request.

@@ -296,9 +296,10 @@ func TestPrincipalHasNoExportedConstructor(t *testing.T) {
 	// The exported functions that may hand out a Principal, and why each is safe.
 	// Adding a name here should require justifying it out loud.
 	allowed := map[string]string{
-		"Authenticate": "verifies the request's credential before it returns one",
-		"FromContext":  "reads back a Principal this package already verified and put there",
-		"FromRequest":  "ditto",
+		"Authenticate":      "verifies the request's credential before it returns one",
+		"AuthenticateCache": "verifies the Basic/Bearer/cookie credential (constant-time key probe) before it returns one",
+		"FromContext":       "reads back a Principal this package already verified and put there",
+		"FromRequest":       "ditto",
 	}
 
 	entries, err := os.ReadDir(".")

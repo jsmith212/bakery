@@ -12,6 +12,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/alecthomas/kong"
+
+	"github.com/jsmith212/bakery/internal/config"
 )
 
 // repoRoot walks up from the test's working directory to the directory holding
@@ -250,4 +254,98 @@ func looksLikePortMapping(s string) bool {
 	}
 
 	return true
+}
+
+// TestClientConfigDoc_BakeryCommandsParse fails if any `bakery ...` example inside
+// a fenced code block in client-config.md is rejected by the real Kong grammar the
+// shipped binary uses. That doc is declared the source of truth for the config-
+// snippet generator, so a copy-paste that Kong refuses -- an unknown flag, a
+// missing positional -- is a documentation bug that silently fails at the user's
+// terminal. This drives the actual parser (kong.New(&config.CLI{})), not a
+// re-description of it: the M2 regression was `bakery sstate push --project
+// {org}/{proj} <dir>`, and --project is a flag the CLI does not define.
+func TestClientConfigDoc_BakeryCommandsParse(t *testing.T) {
+	doc := readRepoFile(t, "docs/design/protocols/client-config.md")
+
+	commands := fencedBakeryCommands(doc)
+	if len(commands) == 0 {
+		t.Fatal("no `bakery ...` examples found in client-config.md; the extractor or the doc changed shape")
+	}
+
+	// A real, existing directory to stand in for the DIR positional, which the CLI
+	// validates with Kong's `existingdir` type at parse time. Without it a correct
+	// command would fail parsing for a reason unrelated to its grammar.
+	dir := t.TempDir()
+
+	for _, raw := range commands {
+		t.Run(raw, func(t *testing.T) {
+			args := docCommandToArgs(raw, dir)
+
+			var cli config.CLI
+
+			parser, err := kong.New(&cli, kong.Name("bakery"))
+			if err != nil {
+				t.Fatalf("build parser: %v", err)
+			}
+
+			if _, err := parser.Parse(args); err != nil {
+				t.Errorf("client-config.md documents `%s`, but the real CLI rejects it: %v\n"+
+					"the doc is the source of truth for the snippet generator; align the example with the shipped grammar",
+					raw, err)
+			}
+		})
+	}
+}
+
+// fencedBakeryCommands returns every line that begins with `bakery ` inside a
+// fenced code block of the markdown source. Restricting to fenced blocks avoids
+// matching prose that mentions the binary in backticks.
+func fencedBakeryCommands(md string) []string {
+	var (
+		out    []string
+		inCode bool
+	)
+
+	for _, line := range strings.Split(md, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			inCode = !inCode
+
+			continue
+		}
+
+		if !inCode {
+			continue
+		}
+
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "bakery ") {
+			out = append(out, trimmed)
+		}
+	}
+
+	return out
+}
+
+// docCommandToArgs turns a documented `bakery ...` line into an argv the parser
+// can consume: it drops the leading `bakery`, fills the `{org}`/`{proj}`
+// placeholders with real slugs, and replaces any path-shaped positional with a
+// directory that actually exists (so the CLI's `existingdir` validation passes and
+// the test measures grammar, not the temp filesystem).
+func docCommandToArgs(command, existingDir string) []string {
+	fields := strings.Fields(command)
+
+	var args []string
+
+	for _, f := range fields[1:] { // skip "bakery"
+		f = strings.ReplaceAll(f, "{org}", "acme")
+		f = strings.ReplaceAll(f, "{proj}", "web")
+
+		if !strings.HasPrefix(f, "-") && strings.Contains(f, "/") {
+			f = existingDir
+		}
+
+		args = append(args, f)
+	}
+
+	return args
 }

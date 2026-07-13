@@ -19,13 +19,15 @@ type CLI struct {
 	// The same binary is the API client. There is no second `bakeryctl` to ship,
 	// version-skew or forget to update: the client speaks the wire types the server
 	// it was built from defines.
-	Login   LoginCmd   `cmd:"" help:"Sign in to a Bakery server with the OIDC device grant."`
-	Logout  LogoutCmd  `cmd:"" help:"Clear the cached tokens for a Bakery server."`
-	Whoami  WhoamiCmd  `cmd:"" help:"Print who you are signed in as, and what you may do."`
-	Org     OrgCmd     `cmd:"" help:"Manage organizations."`
-	Project ProjectCmd `cmd:"" help:"Manage projects."`
-	Member  MemberCmd  `cmd:"" help:"Manage project memberships."`
-	Key     KeyCmd     `cmd:"" help:"Manage project API keys."`
+	Login     LoginCmd     `cmd:"" help:"Sign in to a Bakery server with the OIDC device grant."`
+	Logout    LogoutCmd    `cmd:"" help:"Clear the cached tokens for a Bakery server."`
+	Whoami    WhoamiCmd    `cmd:"" help:"Print who you are signed in as, and what you may do."`
+	Org       OrgCmd       `cmd:"" help:"Manage organizations."`
+	Project   ProjectCmd   `cmd:"" help:"Manage projects."`
+	Member    MemberCmd    `cmd:"" help:"Manage project memberships."`
+	Key       KeyCmd       `cmd:"" help:"Manage project API keys."`
+	Sstate    SstateCmd    `cmd:"" help:"Push a local Yocto sstate cache to a Bakery server."`
+	Downloads DownloadsCmd `cmd:"" help:"Push a local Yocto downloads (source premirror) directory."`
 
 	// User is the ONLY command group that does not go through the API. It needs
 	// DB_URL and it speaks to Postgres directly -- see UserCmd.
@@ -217,6 +219,45 @@ type KeyRevokeCmd struct {
 	Org     string `arg:"" help:"Organization slug."`
 	Project string `arg:"" help:"Project slug."`
 	Key     string `arg:"" help:"Key id, as shown by bakery key list."`
+}
+
+// SstateCmd groups the sstate verbs. The only one is push: reads are BitBake's, and it
+// speaks the HTTP mirror protocol directly.
+type SstateCmd struct {
+	Push SstatePushCmd `cmd:"" help:"Upload a local sstate cache's missing objects to a Bakery server."`
+}
+
+// SstatePushCmd walks a local SSTATE_DIR and PUTs the objects the server is missing.
+//
+// It HEADs every object first and uploads only the misses, so a warm cache is a cheap
+// no-op. The default credential is the logged-in session (no --key needed); --key or
+// BAKERY_API_KEY is the CI override, presented as HTTP Basic exactly as BitBake reads.
+type SstatePushCmd struct {
+	Org     string `arg:"" help:"Organization slug."`
+	Project string `arg:"" help:"Project slug."`
+	Dir     string `arg:"" help:"Local SSTATE_DIR to walk." type:"existingdir"`
+
+	Concurrency int    `default:"8" help:"Parallel HEAD/PUT operations." name:"concurrency" short:"j"`
+	Key         string `env:"BAKERY_API_KEY" help:"API key (bkry_...). Omit to use the logged-in session." name:"key"`
+	DryRun      bool   `help:"Report what would upload; PUT nothing." name:"dry-run"`
+}
+
+// DownloadsCmd groups the downloads (source premirror) verbs.
+type DownloadsCmd struct {
+	Push DownloadsPushCmd `cmd:"" help:"Upload a local downloads directory's missing files to a Bakery server."`
+}
+
+// DownloadsPushCmd walks the top level of a local DL_DIR and PUTs the missing files. It
+// is the sstate engine over a flat walk: subdirectories (git2/ and other VCS mirror
+// trees) and .done / .lock / .tmp control files are skipped.
+type DownloadsPushCmd struct {
+	Org     string `arg:"" help:"Organization slug."`
+	Project string `arg:"" help:"Project slug."`
+	Dir     string `arg:"" help:"Local DL_DIR to walk." type:"existingdir"`
+
+	Concurrency int    `default:"8" help:"Parallel HEAD/PUT operations." name:"concurrency" short:"j"`
+	Key         string `env:"BAKERY_API_KEY" help:"API key (bkry_...). Omit to use the logged-in session." name:"key"`
+	DryRun      bool   `help:"Report what would upload; PUT nothing." name:"dry-run"`
 }
 
 // DBFlags is the database connection, shared by every command that needs one.

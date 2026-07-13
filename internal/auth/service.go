@@ -386,6 +386,45 @@ func (s *Service) Authenticate(ctx context.Context, r *http.Request) (Principal,
 	return nil, ErrUnauthenticated
 }
 
+// AuthenticateCache resolves a CACHE request's credential.
+//
+// It exists because the cache clients speak a scheme Authenticate does not: BitBake's
+// fetcher (and wget, and curl --netrc) present the API key as HTTP Basic and nothing
+// else -- no Bearer, no cookie. Authenticate handles Bearer + session; this method
+// adds the Basic arm in front of it and delegates everything else unchanged, so the
+// CLI's device-grant Bearer token and a browser session still work over /cache/*.
+//
+// The bkry_ token is base64url and therefore contains no ':', so it rides
+// unambiguously in EITHER Basic field: `login bkry password <token>` (netrc) puts it
+// in the password, `http://<token>@host` puts it in the username. Whichever field
+// looks like a key is validated by authenticateKey -- the SAME constant-time,
+// zero-join index probe the Bearer arm uses -- so a key presented as Basic is neither
+// more nor less trusted than one presented as Bearer, and the token is never logged.
+//
+// Like Authenticate, it must be safe on a context that never went through
+// LoadAndSave: the cache mux is outside the session middleware, and the Basic arm
+// never touches scs, while the delegated arm already guards session access with
+// sessionLoaded.
+func (s *Service) AuthenticateCache(ctx context.Context, r *http.Request) (Principal, error) {
+	if user, pass, ok := r.BasicAuth(); ok {
+		// Prefer the password field (netrc, the documented client config) and fall
+		// back to the username field (URL-embedded credentials). looksLikeAPIKey is a
+		// cheap shape check, so a non-key in either field falls through to
+		// authenticateKey's own rejection rather than a second guess here.
+		token := pass
+		if !looksLikeAPIKey(token) {
+			token = user
+		}
+
+		p, err := s.authenticateKey(ctx, token)
+		s.observeErr(MethodAPIKey, err)
+
+		return p, err
+	}
+
+	return s.Authenticate(ctx, r)
+}
+
 // sessionMethod distinguishes a DEV_LOGIN session from a real OIDC one, so the
 // method a Principal reports is the truth about how it was obtained.
 func (s *Service) sessionMethod() Method {

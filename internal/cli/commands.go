@@ -78,6 +78,11 @@ func Run(ctx context.Context, command string, cli config.CLI) error {
 	case "key revoke":
 		return keyRevoke(ctx, client, out, cli.Key.Revoke)
 
+	case "sstate push":
+		return sstatePush(ctx, client, r, cli.Sstate.Push)
+	case "downloads push":
+		return downloadsPush(ctx, client, r, cli.Downloads.Push)
+
 	default:
 		return fmt.Errorf("unknown command: %q", command)
 	}
