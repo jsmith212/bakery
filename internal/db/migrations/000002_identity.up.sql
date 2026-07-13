@@ -15,6 +15,10 @@ CREATE TABLE users (
     -- Reconciled from OIDC group claims on EVERY login. Never edited in-app.
     -- NOT NULL + default: "no site role" and "the ordinary site role" are the same
     -- thing, so there is nothing for a NULL to mean.
+    --
+    -- SUPERSEDED BY 000008/000009: the site role is now HYBRID too. `site_role` is a
+    -- generated greatest(site_role_oidc, site_role_local), and a local grant IS
+    -- editable in-app (or by `bakery user site-admin`, the break-glass).
     site_role     site_role NOT NULL DEFAULT 'user',
     last_login_at timestamptz,
     created_at    timestamptz NOT NULL DEFAULT now(),
@@ -58,9 +62,19 @@ CREATE TABLE projects (
 CREATE TRIGGER projects_touch BEFORE UPDATE ON projects
     FOR EACH ROW EXECUTE FUNCTION bakery_touch_updated_at();
 
--- Org roles are 100% derived from OIDC group claims and reconciled on EVERY login.
--- There is deliberately NO `source` column: a manually granted org role would be
--- silently deleted by the user's next login, so it must be unrepresentable.
+-- SUPERSEDED BY 000008 (M1.5, the hybrid role model). READ THIS BEFORE TRUSTING IT.
+--
+-- As written here, an org role is 100% derived from OIDC group claims, and there is
+-- deliberately no `source` column, because a manually granted role would be silently
+-- deleted by the user's next login. That reasoning was sound and its conclusion is
+-- now WRONG: it left a freshly-created org unusable by its own creator (no
+-- membership -> no project role -> CreateAPIKey refuses with scope_exceeds_role).
+--
+-- 000008 splits `role` into `oidc_role` + `local_role` and regenerates `role` as
+-- greatest() of the two. The state is REPRESENTABLE, and it is safe because the
+-- reconciler writes only the oidc_* half -- a login cannot clobber a local grant.
+-- What did NOT change, and must not: ONE ROW per (user_id, org_id). The sources are
+-- COLUMNS. See the composite FK below.
 CREATE TABLE org_memberships (
     user_id    uuid NOT NULL REFERENCES users (id) ON DELETE CASCADE,
     org_id     uuid NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
@@ -86,10 +100,16 @@ CREATE TRIGGER org_memberships_touch BEFORE UPDATE ON org_memberships
 --       pins org_id to EXACTLY the project's org. It cannot disagree.
 --   FK (user_id, org_id) -> org_memberships (user_id, org_id)
 --       makes "a project member is an org member" a fact the DATABASE enforces.
--- Together: when login reconciliation deletes an org membership (the user left the
--- OIDC group), that user's project memberships in that org go with it -- and 000004's
--- API keys go with those. ONE DELETE revokes every key the user holds in that org.
--- That is what makes a self-contained (join-free) API key grant safe to trust.
+-- Together: when an org membership is deleted, that user's project memberships in
+-- that org go with it -- and 000004's API keys go with those. ONE DELETE revokes every
+-- key the user holds in that org. That is what makes a self-contained (join-free) API
+-- key grant safe to trust.
+--
+-- Under 000008 the membership row is deleted exactly when BOTH of its sources are gone
+-- (the OIDC group went away AND there is no local grant). That is why the sources had
+-- to be COLUMNS on this one row and not rows of their own: two rows per (user, org)
+-- would destroy the uniqueness this FK targets, and take the cascade -- and every key
+-- revocation that depends on it -- with them.
 CREATE TABLE project_memberships (
     user_id    uuid NOT NULL,
     project_id uuid NOT NULL,

@@ -68,3 +68,38 @@ Vite's dev server.
 
 The binary is configured by flags or environment variables (Kong binds both). `stack.env.tmpl` is
 the template for the compose stack's `stack.env`, which is gitignored.
+
+## Authorization
+
+Roles live on four independent planes. One OIDC group lookup used to answer three questions at once;
+it now answers one each.
+
+| Plane | Question | Source of truth |
+|---|---|---|
+| Login gate | May this human use Bakery at all? | `login_groups` in the group map. **Empty or unset admits any successful OIDC auth** — the IdP has already decided who may authenticate. |
+| Site role | May they run the platform? | Hybrid: `site_admin_groups` **or** an in-app grant (`ALLOW_LOCAL_SITE_ADMINS`, default on). |
+| Org membership | Which orgs are they in? | Hybrid: the group map **or** an in-app grant. The effective role is the greater of the two. |
+| Project role | What may they do in a project? | In-app only. Never group-mapped. |
+
+So there are two ways into an org, and they compose: a directory group can grant membership centrally,
+and an org admin can grant it in the console. **Login reconciliation writes only the claim-derived half**,
+so a login can never delete a grant a human made. Removing someone's group removes their claim-derived
+membership — and if that was their only source, the row goes, which cascades away their project roles and
+every API key they held in that org. If they also hold a local grant, they stay.
+
+Creating an org makes you its owner, in the same transaction (`ALLOW_SELF_SERVE_ORGS`, default on —
+turn it off to restrict creation to site admins). So the first-run flow works with no directory at all:
+sign in, create an org, create a project, mint a key.
+
+**A groups claim we cannot *read* is a refused login.** "The IdP says you are in zero groups" and "we
+could not read your groups" are different facts, and only the first is safe to act on: Azure AD replaces
+a large groups claim with a `_claim_names` overage pointing at Graph, and reading that as "zero groups"
+would cascade away a real user's entire access. An empty `groups: []` is fine and ordinary — it means
+"local memberships only".
+
+**Break-glass.** A fresh deployment with no `site_admin_groups` has no site admin, and every path to
+making one requires already being one. `bakery user site-admin <email>` writes straight to the database
+(it needs `DB_URL`) and has no HTTP or API path at all — reaching it takes infrastructure access, not a
+session.
+
+See `groups.example.json` for the group map, and the comments in `stack.env.tmpl` for the flags.
