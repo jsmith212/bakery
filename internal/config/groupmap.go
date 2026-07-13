@@ -154,6 +154,19 @@ type GroupMapOrg struct {
 type Resolution struct {
 	SiteRole SiteRole
 
+	// SiteGroup is the group that JUSTIFIED SiteRole, empty unless SiteRole is admin.
+	//
+	// It is written to users.site_oidc_group, and it is audit, not authorization --
+	// exactly like OrgGroups below. The site-admin listing has to be able to say
+	// `ldap: platform-admins` rather than a bare "the claims said so", because the one
+	// real risk in a hybrid site role is a LOCAL grant outliving the LDAP revocation
+	// that was meant to remove it, and the defence against that is being able to see
+	// which half holds each admin up.
+	//
+	// Unlike OrgGroups, this is DETERMINISTIC: site_admin_groups is a slice, so the
+	// first one the user holds wins, in file order.
+	SiteGroup string
+
 	// Orgs maps org slug -> role.
 	//
 	// LEGITIMATELY EMPTY. It used to be "never empty: Resolve returns an error
@@ -341,22 +354,33 @@ func (g *GroupMap) Resolve(claim GroupsClaim) (Resolution, error) {
 	}
 
 	site := SiteRoleUser
-	if anyClaimed(claimed, g.SiteAdminGroups) {
+
+	// firstClaimed, not anyClaimed: the site-admin listing must be able to NAME the
+	// group, so which one won has to be an answer and not merely a boolean.
+	siteGroup := firstClaimed(claimed, g.SiteAdminGroups)
+	if siteGroup != "" {
 		site = SiteRoleAdmin
 	}
 
-	return Resolution{SiteRole: site, Orgs: orgs, OrgGroups: groups}, nil
+	return Resolution{SiteRole: site, SiteGroup: siteGroup, Orgs: orgs, OrgGroups: groups}, nil
 }
 
 // anyClaimed reports whether the user holds any of want.
 func anyClaimed(claimed map[string]struct{}, want []string) bool {
+	return firstClaimed(claimed, want) != ""
+}
+
+// firstClaimed returns the first of want the user holds, in the order the file lists
+// them -- so two site-admin groups do not make the recorded provenance a coin toss.
+// An empty group name cannot reach here: validate() refuses one.
+func firstClaimed(claimed map[string]struct{}, want []string) string {
 	for _, group := range want {
 		if _, ok := claimed[group]; ok {
-			return true
+			return group
 		}
 	}
 
-	return false
+	return ""
 }
 
 // OrgSlugs returns every org slug the file mentions, sorted. Boot logs it, so an

@@ -56,6 +56,14 @@ func TestRouteTable(t *testing.T) {
 
 		{AccessAuthenticated, "GET /api/v1/me"},
 
+		// Site admins. All three are AccessSiteAdmin, which the guard admits no API key
+		// to -- an API-key principal can never grant a site role. There is deliberately
+		// no route that can mint the FIRST site admin; that is `bakery user site-admin`,
+		// which needs DB_URL and no session.
+		{AccessSiteAdmin, "GET /api/v1/site-admins"},
+		{AccessSiteAdmin, "PUT /api/v1/site-admins/{user}"},
+		{AccessSiteAdmin, "DELETE /api/v1/site-admins/{user}"},
+
 		{AccessAuthenticated, "GET /api/v1/orgs"},
 		{AccessUser, "POST /api/v1/orgs"},
 		{AccessOrgView, "GET /api/v1/orgs/{org}"},
@@ -89,7 +97,8 @@ func TestRouteTable(t *testing.T) {
 
 	a := &API{
 		store: fixtureStore(t), auth: devLoginAuth{enabled: false}, keys: nil,
-		log: discardLogger(), allowSelfServeOrgs: true, metrics: nil, routes: nil,
+		log: discardLogger(), allowSelfServeOrgs: true, allowLocalSiteAdmins: true,
+		metrics: nil, routes: nil,
 	}
 	a.mount(http.NewServeMux())
 
@@ -133,7 +142,8 @@ func TestDevLoginRouteDoesNotExistWhenDisabled(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			a := &API{
 				store: fixtureStore(t), auth: devLoginAuth{enabled: tt.enabled}, keys: nil,
-				log: discardLogger(), allowSelfServeOrgs: true, metrics: nil, routes: nil,
+				log: discardLogger(), allowSelfServeOrgs: true, allowLocalSiteAdmins: true,
+				metrics: nil, routes: nil,
 			}
 
 			mux := http.NewServeMux()

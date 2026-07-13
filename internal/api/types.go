@@ -160,19 +160,141 @@ const (
 	OrgRoleSourceBoth  = "oidc_groups+local"
 )
 
-// orgRoleSource summarises which halves justify a membership.
-func orgRoleSource(oidc, local bool) string {
+// Site-admin provenance uses the SAME vocabulary, deliberately with the same values:
+// both roles are hybrid in exactly the same way, and a console that renders one
+// source badge should not have to learn two spellings of it.
+const (
+	SiteRoleSourceOIDC  = OrgRoleSourceOIDC
+	SiteRoleSourceLocal = OrgRoleSourceLocal
+	SiteRoleSourceBoth  = OrgRoleSourceBoth
+)
+
+// roleSource summarises which halves justify a hybrid role -- an org membership or a
+// site role, which are the same shape.
+func roleSource(oidc, local bool) string {
 	switch {
 	case oidc && local:
 		return OrgRoleSourceBoth
 	case local:
 		return OrgRoleSourceLocal
 	default:
-		// Includes the impossible neither-half case: a row with no source cannot
-		// exist (the generated `role` would be NULL and the column is NOT NULL), so
-		// there is nothing honest to say but "the claims put them here".
+		// Includes the neither-half case, which neither caller can reach: an org
+		// membership row with no source cannot exist (the generated `role` would be
+		// NULL and the column is NOT NULL), and the site-admin listing selects on
+		// site_role = 'admin', which is greatest(oidc, local) and so requires one of
+		// them to BE 'admin'. There is nothing honest to say but "the claims put them
+		// here".
 		return OrgRoleSourceOIDC
 	}
+}
+
+// SiteAdmin is one site administrator, WITH THE SOURCE OF THE ROLE. It is the whole
+// reason a hybrid site role is safe to offer.
+//
+// A site admin may be claim-derived (an OIDC group), locally granted (by another site
+// admin, or by the CLI break-glass), or BOTH. The failure this type exists to prevent
+// is a local grant that outlives the LDAP revocation that was supposed to remove
+// it: the directory says the person is no longer a platform admin, and Bakery, on a
+// grant nobody remembers making, says they still are.
+//
+// That state is not preventable -- it is inherent in having two sources -- so it is
+// made VISIBLE instead. Every row says which half holds the role up: `ldap:
+// platform-admins`, or `local: granted by jsmith on 2026-07-12`. A backdoor you can
+// see on a screen is not much of a backdoor, and this listing is that screen. It is
+// the mitigation, not a nice-to-have.
+type SiteAdmin struct {
+	UserID      string `json:"user_id"`
+	Email       string `json:"email"`
+	DisplayName string `json:"display_name"`
+
+	// SiteRole is the EFFECTIVE role: coalesce(greatest(oidc, local), 'user'), computed
+	// by the database. Always "admin" on this listing.
+	SiteRole string `json:"site_role"`
+
+	// OIDCRole and OIDCGroup are the claim half: `admin` and the group that conferred
+	// it. Empty when no group claim makes this user a site admin. Read-only over this
+	// API -- change the group in the IdP or in site_admin_groups.
+	OIDCRole  string `json:"site_role_oidc,omitempty"`
+	OIDCGroup string `json:"site_oidc_group,omitempty"`
+
+	// LocalRole is the in-app half. GrantedBy/GrantedByEmail/GrantedAt are its audit
+	// trail; granted_by is EMPTY for a grant made by the CLI break-glass, which has no
+	// session and therefore no granter to name. That emptiness is a finding, not a
+	// gap: it says someone with database access made this grant.
+	LocalRole      string     `json:"site_role_local,omitempty"`
+	GrantedBy      string     `json:"granted_by,omitempty"`
+	GrantedByEmail string     `json:"granted_by_email,omitempty"`
+	GrantedAt      *time.Time `json:"granted_at"`
+
+	// Source is oidc_groups | local | oidc_groups+local. `oidc_groups+local` is the
+	// state in which a DELETE clears the local grant and the user REMAINS a site
+	// admin.
+	Source string `json:"site_role_source"`
+}
+
+// newSiteAdmin renders one row of the site-admin listing.
+func newSiteAdmin(a repository.ListSiteAdminsRow) SiteAdmin {
+	return SiteAdmin{
+		UserID: uuidString(a.ID), Email: a.Email, DisplayName: a.DisplayName,
+		SiteRole:  string(a.SiteRole),
+		OIDCRole:  siteRoleString(a.SiteRoleOidc),
+		OIDCGroup: a.SiteOidcGroup.String,
+		LocalRole: siteRoleString(a.SiteRoleLocal),
+		GrantedBy: uuidString(a.SiteGrantedBy), GrantedByEmail: a.GrantedByEmail.String,
+		GrantedAt: timePtr(a.SiteGrantedAt),
+		Source:    roleSource(a.SiteRoleOidc.Valid, a.SiteRoleLocal.Valid),
+	}
+}
+
+// newSiteAdminFromUser renders a users row the API just wrote. It is the same shape,
+// from the whole-row RETURNING of the grant and revoke queries. granted_by_email is
+// supplied by the caller, which resolved the granter before writing.
+func newSiteAdminFromUser(u repository.User, grantedByEmail string) SiteAdmin {
+	return SiteAdmin{
+		UserID: uuidString(u.ID), Email: u.Email, DisplayName: u.DisplayName,
+		SiteRole:  string(u.SiteRole),
+		OIDCRole:  siteRoleString(u.SiteRoleOidc),
+		OIDCGroup: u.SiteOidcGroup.String,
+		LocalRole: siteRoleString(u.SiteRoleLocal),
+		GrantedBy: uuidString(u.SiteGrantedBy), GrantedByEmail: grantedByEmail,
+		GrantedAt: timePtr(u.SiteGrantedAt),
+		Source:    roleSource(u.SiteRoleOidc.Valid, u.SiteRoleLocal.Valid),
+	}
+}
+
+// SiteAdminRemoval is the response to DELETE /site-admins/{user}, and it exists for
+// the same reason OrgMemberRemoval does: a bare 204 would be a LIE half the time.
+//
+// This endpoint owns only the LOCAL half of a site role. Clearing it demotes the user
+// only if no OIDC group claim also makes them an admin; if one does, they are STILL A
+// SITE ADMIN -- with every privilege in the installation -- and an operator who saw a
+// success and concluded otherwise has a security incident, not a UI annoyance.
+type SiteAdminRemoval struct {
+	UserID string `json:"user_id"`
+
+	// LocalRoleRevoked is true when a local grant was actually cleared.
+	LocalRoleRevoked bool `json:"local_role_revoked"`
+
+	// StillASiteAdmin is TRUE when the user REMAINS a site admin because an OIDC group
+	// claim makes them one, independently of the grant just removed.
+	StillASiteAdmin bool `json:"still_a_site_admin"`
+
+	// Admin is the surviving site admin, present exactly when StillASiteAdmin. It
+	// names the group that is holding the role up.
+	Admin *SiteAdmin `json:"admin,omitempty"`
+
+	// Message is prose for a human, shown verbatim.
+	Message string `json:"message"`
+}
+
+// siteRoleString renders a nullable site role, with NULL as "" -- never as the zero
+// SiteRole, which is an empty string that LOOKS like a role.
+func siteRoleString(r repository.NullSiteRole) string {
+	if !r.Valid {
+		return ""
+	}
+
+	return string(r.SiteRole)
 }
 
 // newOrgMember renders one row of the org roster.
@@ -186,7 +308,7 @@ func newOrgMember(m repository.ListOrgMembersRow) Member {
 		GrantedBy: uuidString(m.GrantedBy), GrantedByEmail: m.GrantedByEmail.String,
 		GrantedAt:   timePtr(m.GrantedAt),
 		ProjectRole: "",
-		Source:      orgRoleSource(m.OidcRole.Valid, m.LocalRole.Valid),
+		Source:      roleSource(m.OidcRole.Valid, m.LocalRole.Valid),
 	}
 }
 
@@ -203,7 +325,7 @@ func newMembership(m repository.OrgMembership, email, displayName, grantedByEmai
 		GrantedBy: uuidString(m.GrantedBy), GrantedByEmail: grantedByEmail,
 		GrantedAt:   timePtr(m.GrantedAt),
 		ProjectRole: "",
-		Source:      orgRoleSource(m.OidcRole.Valid, m.LocalRole.Valid),
+		Source:      roleSource(m.OidcRole.Valid, m.LocalRole.Valid),
 	}
 }
 

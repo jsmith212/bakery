@@ -27,6 +27,10 @@ type CLI struct {
 	Member  MemberCmd  `cmd:"" help:"Manage project memberships."`
 	Key     KeyCmd     `cmd:"" help:"Manage project API keys."`
 
+	// User is the ONLY command group that does not go through the API. It needs
+	// DB_URL and it speaks to Postgres directly -- see UserCmd.
+	User UserCmd `cmd:"" help:"Out-of-band user administration, straight against the database."`
+
 	// Server is global rather than per-command because it is the one thing every
 	// client command needs and no client command chooses: it is a property of the
 	// installation, and it belongs in the environment of a shell that talks to one.
@@ -286,6 +290,23 @@ type ServeCmd struct {
 	// master key, least of all the master of a brand-new tenant.
 	AllowSelfServeOrgs bool `default:"true" env:"ALLOW_SELF_SERVE_ORGS" help:"Let any signed-in user create an organization. They become its owner. Off restricts creation to site admins." negatable:""`
 
+	// Local site-admin grants: a site admin may make another user a site admin
+	// through the API, recorded with provenance. Default ON.
+	//
+	// Off closes that path ENTIRELY -- the endpoint 403s for everyone, site admins
+	// included -- for a deployment that wants the platform-admin roster to live in the
+	// directory and nowhere else. Revoking an existing local grant keeps working when
+	// it is off, because turning the flag off is exactly when an operator needs to
+	// clean up the grants that predate it.
+	//
+	// It does NOT gate `bakery user site-admin` (see UserSiteAdminCmd). That is the
+	// break-glass, it needs DB_URL, and anyone holding DB_URL could UPDATE the column
+	// by hand anyway -- so gating it would buy no security and would make a fresh
+	// deployment with no site admin unbootstrappable, which is the very thing the
+	// break-glass exists to prevent. Every grant it makes is visible in the site-admin
+	// listing, with no granter named, which is itself the tell.
+	AllowLocalSiteAdmins bool `default:"true" env:"ALLOW_LOCAL_SITE_ADMINS" help:"Let a site admin grant another user the site-admin role in-app. Off restricts site admins to OIDC group claims." negatable:""`
+
 	// DEV_LOGIN_ENABLED is reachable ONLY from here -- this flag or its env var.
 	//
 	// There is deliberately no UI control, no API endpoint and no database column
@@ -325,6 +346,48 @@ type MigrateDownCmd struct {
 // MigrateVersionCmd prints the applied schema version.
 type MigrateVersionCmd struct {
 	DBFlags
+}
+
+// UserCmd is the BREAK-GLASS, and it is the only command group that never speaks
+// HTTP.
+//
+// # The bootstrap problem it exists for
+//
+// With `login_groups` empty and no `site_admin_groups`, a fresh deployment has no
+// site admin -- and every path to making one requires already being one. The API
+// cannot solve this: an endpoint that could mint the first site admin without
+// already having one would be an unauthenticated privilege-escalation endpoint, and
+// gating it on "only when there are no site admins yet" is a race with the first
+// person to find it.
+//
+// So the path out of the deadlock is deliberately NOT ON THE NETWORK. It needs
+// DB_URL, which means it needs infrastructure access, not a session -- exactly the
+// shape of DEV_LOGIN_ENABLED, which is settable only by env var or flag and which no
+// UI or API path can reach. Reaching this requires being able to reach the database,
+// and anyone who can do that could write the column by hand regardless.
+type UserCmd struct {
+	SiteAdmin UserSiteAdminCmd `cmd:"" help:"Grant a user the site-admin role by writing to the database. The break-glass: no API, no session." name:"site-admin"`
+}
+
+// UserSiteAdminCmd grants (or revokes) a LOCAL site-admin role, in the database.
+//
+// It writes site_role_local and its provenance, and NEVER site_role_oidc: no group
+// claim says this, and forging one would be a lie the user's next login would
+// rightly reconcile away. The local half is the half the reconciler cannot touch, so
+// the grant survives every login.
+//
+// It leaves site_granted_by NULL -- there is no session, so there is nobody to name
+// -- and that is informative rather than lossy: a site admin with a local grant and
+// no granter is one that was made with database access. The site-admin listing shows
+// exactly that, which is the point. This grant is not invisible; it is the opposite.
+//
+// --allow-local-site-admins does NOT gate this. See ServeCmd.
+type UserSiteAdminCmd struct {
+	DBFlags
+
+	Email string `arg:"" help:"Email of the user. They must have signed in at least once -- users are provisioned at their first login."`
+
+	Revoke bool `help:"Remove the local site-admin grant instead of making one. A site role held by an OIDC group claim is untouched -- remove them from the group in the identity provider." name:"revoke"`
 }
 
 // VersionCmd takes no configuration.

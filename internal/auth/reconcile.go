@@ -97,12 +97,19 @@ func (s *Service) Reconcile(ctx context.Context, id Identity) (pgtype.UUID, erro
 	var userID pgtype.UUID
 
 	err = s.store.Tx(ctx, func(q *repository.Queries) error {
+		// site_role_OIDC and site_oidc_group, never site_role_local: the local half of
+		// a site role is granted in-app (or by the CLI break-glass) and MUST survive a
+		// login, so this reconciler does not name the column that holds it. The group
+		// is audit -- it is what lets the site-admin listing say `ldap: platform-admins`
+		// beside `local: granted by jsmith`, which is the whole mitigation for a hybrid
+		// site admin.
 		user, err := q.UpsertUser(ctx, repository.UpsertUserParams{
 			Issuer:      id.Issuer,
 			Subject:     id.Subject,
 			Email:       id.Email,
 			DisplayName: id.DisplayName,
 			SiteRole:    siteRole(res.SiteRole),
+			SiteGroup:   pgtype.Text{String: res.SiteGroup, Valid: res.SiteGroup != ""},
 		})
 		if err != nil {
 			return fmt.Errorf("upsert user: %w", err)

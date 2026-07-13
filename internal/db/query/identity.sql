@@ -18,18 +18,93 @@
 -- claim of one. Storing it would assert the IdP affirmatively claimed it, and
 -- would make an ordinary user indistinguishable from one the IdP had demoted.
 --
+-- site_oidc_group records WHICH group made them a site admin. Audit, not
+-- authorization -- site_role_oidc is what confers the role. It is what lets the
+-- site-admin listing say `ldap: platform-admins` instead of a bare "oidc", and that
+-- distinction is the whole mitigation for the hybrid site role: the risk is a local
+-- grant outliving an LDAP revocation, and the defence is being able to SEE which
+-- half holds each admin up.
+--
 -- name: UpsertUser :one
-INSERT INTO users (issuer, subject, email, display_name, site_role_oidc, last_login_at)
-VALUES ($1, $2, $3, $4, NULLIF(sqlc.arg(site_role)::site_role, 'user'), now())
+INSERT INTO users (issuer, subject, email, display_name,
+                   site_role_oidc, site_oidc_group, last_login_at)
+VALUES ($1, $2, $3, $4,
+        NULLIF(sqlc.arg(site_role)::site_role, 'user'), sqlc.narg(site_group), now())
 ON CONFLICT (issuer, subject) DO UPDATE
-   SET email          = EXCLUDED.email,
-       display_name   = EXCLUDED.display_name,
-       site_role_oidc = EXCLUDED.site_role_oidc,
-       last_login_at  = now()
+   SET email           = EXCLUDED.email,
+       display_name    = EXCLUDED.display_name,
+       site_role_oidc  = EXCLUDED.site_role_oidc,
+       site_oidc_group = EXCLUDED.site_oidc_group,
+       last_login_at   = now()
 RETURNING *;
 
 -- name: GetUser :one
 SELECT * FROM users WHERE id = $1;
+
+-- LOCAL SITE-ADMIN GRANTS -- the API's half of the site role, and ONLY its half.
+--
+-- Mirror image of UpsertUser above: these name site_role_local, site_granted_by and
+-- site_granted_at and NEVER site_role_oidc or site_oidc_group. Neither source can
+-- clobber the other, because neither statement names the other's columns, and the
+-- effective site_role is GENERATED from both -- coalesce(greatest(oidc, local),
+-- 'user') -- and writable by nobody.
+--
+-- granted_by is NULLABLE, and that is not an oversight. The CLI break-glass
+-- (`bakery user site-admin`) writes straight to the database with no session, so
+-- there is no granting user to name -- and a fresh deployment with no site admin at
+-- all is exactly the case it exists for. A NULL granted_by is itself informative:
+-- it says this grant was made with infrastructure access rather than through the
+-- console. The provenance CHECK from 000008 is on site_granted_at, not on
+-- site_granted_by, precisely so that this is representable.
+--
+-- name: GrantSiteAdminLocal :one
+UPDATE users
+   SET site_role_local = 'admin',
+       site_granted_by = sqlc.narg(granted_by),
+       site_granted_at = now()
+ WHERE id = sqlc.arg(id)
+RETURNING *;
+
+-- Clears the LOCAL half of a site role. Guarded on `site_role_local IS NOT NULL` so
+-- that "there was nothing to revoke" comes back as no rows rather than as a silent
+-- success -- an admin who revokes a site admin and is told it worked, when the role
+-- is claim-derived and untouched, has been lied to.
+--
+-- It CANNOT remove a claim-derived site admin. That is LDAP's to remove, and the
+-- API must not be able to reach it, not even by accident: site_role_oidc is not
+-- named here.
+--
+-- name: RevokeSiteAdminLocal :one
+UPDATE users
+   SET site_role_local = NULL,
+       site_granted_by = NULL,
+       site_granted_at = NULL
+ WHERE id = $1 AND site_role_local IS NOT NULL
+RETURNING *;
+
+-- EVERY site admin, WITH THE SOURCE OF EACH. This listing is the mitigation for the
+-- hybrid site role, not a convenience.
+--
+-- A local grant that outlives the LDAP revocation it was supposed to be superseded
+-- by is the one real risk in the hybrid design. It is a backdoor exactly to the
+-- extent that it is invisible, so every row carries both halves: the group that
+-- claims them (site_oidc_group) and the grant that was made in-app (site_role_local
+-- + who + when). A listing that returned only the effective role would report a
+-- stale local grant and a live directory membership identically.
+--
+-- site_granted_by is LEFT JOINed, not inner: it is ON DELETE SET NULL, and the CLI
+-- break-glass leaves it NULL outright. An inner join would silently drop exactly the
+-- rows an audit most wants to see -- the grants with no accountable granter.
+--
+-- name: ListSiteAdmins :many
+SELECT u.id, u.email, u.display_name, u.site_role,
+       u.site_role_oidc, u.site_oidc_group,
+       u.site_role_local, u.site_granted_by, u.site_granted_at,
+       g.email AS granted_by_email
+  FROM users u
+  LEFT JOIN users g ON g.id = u.site_granted_by
+ WHERE u.site_role = 'admin'
+ ORDER BY u.email;
 
 -- name: GetUserByIssuerSubject :one
 SELECT * FROM users WHERE issuer = $1 AND subject = $2;

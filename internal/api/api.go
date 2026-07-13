@@ -58,6 +58,17 @@ type Config struct {
 	// it lives where a deployment decision belongs -- the Kong flag
 	// (--allow-self-serve-orgs / ALLOW_SELF_SERVE_ORGS), which defaults to true.
 	AllowSelfServeOrgs bool
+
+	// AllowLocalSiteAdmins lets a site admin grant ANOTHER user the site-admin role
+	// in-app, recorded with provenance. Off closes that path for everyone -- site
+	// admins included -- so the platform-admin roster lives in the directory and
+	// nowhere else.
+	//
+	// Same convention as above: the zero value is OFF (restrictive), and the product
+	// default (on) lives on the Kong flag. It never gates REVOCATION of an existing
+	// local grant, which is exactly what an operator needs on the day they turn it
+	// off.
+	AllowLocalSiteAdmins bool
 }
 
 // API is the control-plane API.
@@ -70,6 +81,11 @@ type API struct {
 	// allowSelfServeOrgs: see Config.AllowSelfServeOrgs. Read only by
 	// handleCreateOrg, and never written after New.
 	allowSelfServeOrgs bool
+
+	// allowLocalSiteAdmins: see Config.AllowLocalSiteAdmins. Read only by
+	// handlePutSiteAdmin -- never by the revoke or the listing -- and never written
+	// after New.
+	allowLocalSiteAdmins bool
 
 	metrics *metrics.Metrics
 
@@ -112,13 +128,14 @@ func New(cfg Config) (*API, error) {
 	}
 
 	return &API{
-		store:              cfg.Store,
-		auth:               cfg.Auth,
-		keys:               serviceKeyMinter{svc: cfg.Auth},
-		log:                log,
-		allowSelfServeOrgs: cfg.AllowSelfServeOrgs,
-		metrics:            cfg.Metrics,
-		routes:             nil,
+		store:                cfg.Store,
+		auth:                 cfg.Auth,
+		keys:                 serviceKeyMinter{svc: cfg.Auth},
+		log:                  log,
+		allowSelfServeOrgs:   cfg.AllowSelfServeOrgs,
+		allowLocalSiteAdmins: cfg.AllowLocalSiteAdmins,
+		metrics:              cfg.Metrics,
+		routes:               nil,
 	}, nil
 }
 
@@ -222,6 +239,25 @@ func (a *API) mount(mux *http.ServeMux) {
 
 	// ---- me
 	a.route(mux, AccessAuthenticated, "GET "+p+"/me", a.handleMe)
+
+	// ---- site admins. HYBRID, like org membership: an OIDC half the reconciler owns
+	// and a local half these routes own.
+	//
+	// All three are AccessSiteAdmin, which the guard admits no API key to at any
+	// scope -- so an API-key principal can NEVER grant a site role. That is belt and
+	// braces with the principal itself, whose IsSiteAdmin() is false for a key even
+	// when the owning human is an admin. A delegation must not become a master key.
+	//
+	// GET reports the SOURCE of every admin, and that is the mitigation the whole
+	// hybrid site role rests on, not a nicety: a local grant that outlives an LDAP
+	// revocation is a backdoor precisely and only while it is invisible.
+	//
+	// There is no route that grants the FIRST site admin, and there cannot be -- it
+	// would have to be reachable by someone who is not one. That is the CLI
+	// break-glass (`bakery user site-admin`), which needs DB_URL and not a session.
+	a.route(mux, AccessSiteAdmin, "GET "+p+"/site-admins", a.handleListSiteAdmins)
+	a.route(mux, AccessSiteAdmin, "PUT "+p+"/site-admins/{user}", a.handlePutSiteAdmin)
+	a.route(mux, AccessSiteAdmin, "DELETE "+p+"/site-admins/{user}", a.handleDeleteSiteAdmin)
 
 	// ---- organizations
 	a.route(mux, AccessAuthenticated, "GET "+p+"/orgs", a.handleListOrgs)

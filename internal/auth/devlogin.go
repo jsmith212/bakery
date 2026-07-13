@@ -77,12 +77,17 @@ func (s *Service) seedDevUser(ctx context.Context) (pgtype.UUID, error) {
 	var userID pgtype.UUID
 
 	err = s.store.Tx(ctx, func(q *repository.Queries) error {
+		// The dev user's site-admin role is a synthetic CLAIM (site_role_oidc), not a
+		// local grant, and it names DevLoginGroup as its source -- so it reconciles away
+		// like any other claim, and the site-admin listing reports it honestly as
+		// claim-derived rather than as a local grant nobody can account for.
 		user, err := q.UpsertUser(ctx, repository.UpsertUserParams{
 			Issuer:      DevIssuer,
 			Subject:     DevSubject,
 			Email:       DevEmail,
 			DisplayName: DevDisplayName,
 			SiteRole:    SiteRoleAdmin,
+			SiteGroup:   pgtype.Text{String: DevLoginGroup, Valid: true},
 		})
 		if err != nil {
 			return fmt.Errorf("upsert dev user: %w", err)

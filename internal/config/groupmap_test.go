@@ -468,6 +468,64 @@ func TestOrgFreeGroupMapResolves(t *testing.T) {
 	}
 }
 
+// TestResolveNamesTheGroupThatConferredSiteAdmin.
+//
+// The site-admin listing has to say `ldap: platform-admins`, not merely "the claims
+// said so" -- a hybrid site role is only safe while a LOCAL grant that outlived its
+// LDAP revocation is DISTINGUISHABLE from a live directory membership on the screen.
+// That distinction starts here: if Resolve cannot name the group, nothing downstream
+// can, because site_oidc_group is what it writes.
+//
+// It is also DETERMINISTIC, unlike OrgGroups: site_admin_groups is a slice, so the
+// first group the user holds wins in file order. Two site-admin groups must not make
+// the recorded provenance a coin toss.
+func TestResolveNamesTheGroupThatConferredSiteAdmin(t *testing.T) {
+	gm, err := ParseGroupMap([]byte(`{
+	  "site_admin_groups": ["platform-admins", "sre-oncall"]
+	}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		claim    GroupsClaim
+		wantRole SiteRole
+		wantFrom string
+	}{
+		{"one site-admin group", present("platform-admins"), SiteRoleAdmin, "platform-admins"},
+		{"the other one", present("sre-oncall"), SiteRoleAdmin, "sre-oncall"},
+		{
+			"BOTH: the first in FILE order wins, deterministically",
+			present("sre-oncall", "platform-admins"), SiteRoleAdmin, "platform-admins",
+		},
+		{
+			"an ordinary user names no group: 'user' is the ABSENCE of a grant, not a claim of one",
+			present("engineering"), SiteRoleUser, "",
+		},
+		{"no groups at all", present(), SiteRoleUser, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := gm.Resolve(tt.claim)
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+
+			if got.SiteRole != tt.wantRole {
+				t.Errorf("SiteRole = %q, want %q", got.SiteRole, tt.wantRole)
+			}
+
+			if got.SiteGroup != tt.wantFrom {
+				t.Errorf("SiteGroup = %q, want %q. The site-admin listing cannot report "+
+					"`ldap: <group>` for an admin whose group it was never told.",
+					got.SiteGroup, tt.wantFrom)
+			}
+		})
+	}
+}
+
 func TestLoadGroupMap(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "groups.json")

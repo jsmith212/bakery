@@ -39,6 +39,12 @@ type harness struct {
 	client *http.Client
 	store  *db.Store
 	auth   *auth.Service
+
+	// api is the live *API the server is serving. It is here so a test can flip a
+	// deployment flag (--allow-local-site-admins) on a RUNNING installation, which is
+	// the only honest way to ask "can an operator still clean up the local grants that
+	// predate the lockdown?".
+	api *API
 }
 
 // newHarness boots the full stack: real Postgres, real auth.Service with dev-login
@@ -66,7 +72,7 @@ func newHarness(t *testing.T) *harness {
 
 	a, err := New(Config{
 		Store: store, Auth: svc, Metrics: metrics.New(), Log: log,
-		AllowSelfServeOrgs: true,
+		AllowSelfServeOrgs: true, AllowLocalSiteAdmins: true,
 	})
 	if err != nil {
 		t.Fatalf("api.New: %v", err)
@@ -81,7 +87,7 @@ func newHarness(t *testing.T) *harness {
 	}
 
 	return &harness{
-		t: t, server: server, store: store, auth: svc,
+		t: t, server: server, store: store, auth: svc, api: a,
 		client: &http.Client{Jar: jar},
 	}
 }

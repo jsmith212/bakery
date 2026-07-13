@@ -158,10 +158,10 @@ func TestMigrationVersion(t *testing.T) {
 		t.Error("dirty = true on a cleanly migrated database")
 	}
 
-	// 8 up/down pairs ship in internal/db/migrations. If this number changes, the
+	// 9 up/down pairs ship in internal/db/migrations. If this number changes, the
 	// change was deliberate and this line moves with it.
-	if version != 8 {
-		t.Errorf("version = %d, want 8", version)
+	if version != 9 {
+		t.Errorf("version = %d, want 9", version)
 	}
 }
 

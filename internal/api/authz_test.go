@@ -57,6 +57,7 @@ func fixtureStore(t *testing.T) *fakeStore {
 			{ID: anna, Email: "anna@acme.dev", DisplayName: "Anna Keller"},
 			{ID: marko, Email: "marko@acme.dev", DisplayName: "Marko Ilic"},
 		},
+		siteAdmins:           nil,
 		backends:             nil,
 		keys:                 nil,
 		calls:                nil,
@@ -79,7 +80,8 @@ func testAPI(t *testing.T, store Store, minter keyMinter) *API {
 
 	return &API{
 		store: store, auth: devLoginAuth{enabled: false}, keys: minter,
-		log: discardLogger(), allowSelfServeOrgs: true, metrics: nil, routes: nil,
+		log: discardLogger(), allowSelfServeOrgs: true, allowLocalSiteAdmins: true,
+		metrics: nil, routes: nil,
 	}
 }
 

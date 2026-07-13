@@ -39,6 +39,21 @@ type Store interface {
 	GetUser(ctx context.Context, id pgtype.UUID) (repository.User, error)
 	GetUserByEmail(ctx context.Context, email string) (repository.User, error)
 
+	// The SITE role, which is hybrid in exactly the same way an org membership is:
+	// these two writes name site_role_local and its provenance and NEVER
+	// site_role_oidc, so a login cannot clobber a local grant and a local grant cannot
+	// forge a claim.
+	//
+	// ListSiteAdmins is not a convenience. It reports the SOURCE of every site admin,
+	// and that is the mitigation that makes a hybrid site role safe to have at all: a
+	// local grant outliving an LDAP revocation is a backdoor only for as long as
+	// nobody can see it.
+	ListSiteAdmins(ctx context.Context) ([]repository.ListSiteAdminsRow, error)
+	GrantSiteAdminLocal(
+		ctx context.Context, arg repository.GrantSiteAdminLocalParams,
+	) (repository.User, error)
+	RevokeSiteAdminLocal(ctx context.Context, id pgtype.UUID) (repository.User, error)
+
 	// Memberships. The three local-grant queries name local_role, granted_by and
 	// granted_at and NOTHING else -- the OIDC half belongs to internal/auth's
 	// reconciler, and neither can clobber the other because neither names the

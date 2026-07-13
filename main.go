@@ -99,6 +99,13 @@ func run(command string, cli config.CLI) error {
 		return migrateDown(ctx, cli.Migrate.Down)
 	case "migrate version":
 		return migrateVersion(ctx, cli.Migrate.Version)
+	case "user site-admin":
+		// The BREAK-GLASS, and it is dispatched HERE rather than in internal/cli for a
+		// reason that is the whole point of it: internal/cli is the HTTP client. This
+		// command speaks to Postgres directly and has no API path, no endpoint and no
+		// session -- reaching it requires DB_URL, i.e. infrastructure access. See
+		// siteadmin.go.
+		return userSiteAdmin(ctx, os.Stdout, cli.User.SiteAdmin)
 	case "version":
 		fmt.Println(buildVersion())
 
@@ -114,8 +121,17 @@ func run(command string, cli config.CLI) error {
 	}
 }
 
+// The three migrate verbs open a BOOTSTRAP pool, and it is not a preference.
+//
+// db.NewPool registers the enum types on every connection and REFUSES a connection
+// where any of them is missing -- which is exactly the state of a virgin database,
+// because the enums are created BY the migrations these commands are here to run.
+// Using it here means `bakery migrate up` fails its own Ping with "enum type missing
+// from database" on a fresh install and can never create the types that would let it
+// connect. server.Boot already does the right thing (ping/lock/migrate on a
+// bootstrap pool, serve on the real one); these three were left behind.
 func migrateUp(ctx context.Context, cmd config.MigrateUpCmd) error {
-	pool, err := db.NewPool(ctx, db.Config{URL: cmd.DBURL, MaxConns: 0})
+	pool, err := db.NewBootstrapPool(ctx, db.Config{URL: cmd.DBURL, MaxConns: 0})
 	if err != nil {
 		return fmt.Errorf("connect to database: %w", err)
 	}
@@ -145,7 +161,7 @@ func migrateDown(ctx context.Context, cmd config.MigrateDownCmd) error {
 		return errors.New("migrate down drops every table in the database; pass --yes to confirm")
 	}
 
-	pool, err := db.NewPool(ctx, db.Config{URL: cmd.DBURL, MaxConns: 0})
+	pool, err := db.NewBootstrapPool(ctx, db.Config{URL: cmd.DBURL, MaxConns: 0})
 	if err != nil {
 		return fmt.Errorf("connect to database: %w", err)
 	}
@@ -162,7 +178,7 @@ func migrateDown(ctx context.Context, cmd config.MigrateDownCmd) error {
 }
 
 func migrateVersion(ctx context.Context, cmd config.MigrateVersionCmd) error {
-	pool, err := db.NewPool(ctx, db.Config{URL: cmd.DBURL, MaxConns: 0})
+	pool, err := db.NewBootstrapPool(ctx, db.Config{URL: cmd.DBURL, MaxConns: 0})
 	if err != nil {
 		return fmt.Errorf("connect to database: %w", err)
 	}

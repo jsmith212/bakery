@@ -161,7 +161,8 @@ func Boot(ctx context.Context, p BootParams) error {
 
 	apiSrv, err := api.New(api.Config{
 		Store: store, Auth: authSvc, Metrics: m, Log: log,
-		AllowSelfServeOrgs: cmd.AllowSelfServeOrgs,
+		AllowSelfServeOrgs:   cmd.AllowSelfServeOrgs,
+		AllowLocalSiteAdmins: cmd.AllowLocalSiteAdmins,
 	})
 	if err != nil {
 		return fmt.Errorf("build api: %w", err)
