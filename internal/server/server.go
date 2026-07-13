@@ -29,6 +29,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jsmith212/bakery/internal/api"
+	"github.com/jsmith212/bakery/internal/cache"
 	"github.com/jsmith212/bakery/internal/metrics"
 	"github.com/jsmith212/bakery/internal/middleware"
 	"github.com/jsmith212/bakery/internal/storage"
@@ -66,6 +67,13 @@ type Config struct {
 	// API is the /api/v1 subtree from api.API.Handler(). Nil in the tests that
 	// only exercise the static routes.
 	API http.Handler
+
+	// CacheBackends are the M2+ cache backends (sstate, downloads, ...). Each mounts
+	// its own /cache/{org}/{project}/... patterns on the public mux. They are served
+	// in headless mode too -- "no console" does not mean "no cache". Nil is fine: a
+	// deployment with no cache backends (or the static-route tests) simply registers
+	// none.
+	CacheBackends []cache.Backend
 
 	// Pool backs /readyz. Nil means "no database", and /readyz then reports 503 --
 	// never 200.
@@ -115,6 +123,14 @@ func NewHandler(cfg Config) http.Handler {
 	if cfg.API != nil {
 		// Methodless: the subtree owns its own method routing.
 		mux.Handle(api.Prefix+"/", cfg.API)
+	}
+
+	// The cache backends mount their /cache/{org}/{project}/... patterns. They
+	// register GET/HEAD/PUT on LITERAL 4th segments (sstate, downloads), which is why
+	// they coexist with each other and with the methodless /api/v1/ and SPA / without
+	// the ServeMux "neither is more specific" panic. Served in headless mode too.
+	for _, backend := range cfg.CacheBackends {
+		backend.Register(mux)
 	}
 
 	if !cfg.Headless {
