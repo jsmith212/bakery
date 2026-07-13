@@ -105,7 +105,19 @@ func TestBootEndToEnd(t *testing.T) {
 		t.Fatalf("/me: got method %v, want dev", me["method"])
 	}
 
-	// ---- create an org (site admin only).
+	// ---- create an org.
+	//
+	// THE HEADLINE FLOW, AND IT IS THE ONE M1 COULD NOT DO: create org -> create
+	// project -> mint a key, all inside the BRAND-NEW org, with no group map, no
+	// LDAP round-trip and no pre-existing membership anywhere.
+	//
+	// Under M1 this dead-ended at the project-member grant: org membership was 100%
+	// claim-derived, so a fresh org had no members -- not even the site admin who
+	// had just created it -- the {user} path segment resolved against the org roster
+	// and 404'd, and CreateAPIKey then refused with scope_exceeds_role because it
+	// requires a real project membership and site admin deliberately does not bypass
+	// it. M1.5 gives the creator a LOCAL owner grant in the same transaction as the
+	// org. That is what makes every line below this one work.
 	var org map[string]any
 
 	do(t, c, http.MethodPost, public+"/api/v1/orgs", "",
@@ -115,37 +127,63 @@ func TestBootEndToEnd(t *testing.T) {
 		t.Fatalf("create org: got slug %v, want acme", org["slug"])
 	}
 
-	// ---- create a project.
-	//
-	// In dev-org, not in acme, and that is not an accident: ORG membership is
-	// derived from OIDC group claims and reconciled at login, so a brand new org
-	// has no members at all until the group map names it -- not even the site admin
-	// who just created it. The dev seed puts the dev user in dev-org, which is the
-	// only org anyone is a member of on this deployment. Creating a project in acme
-	// would work; getting a project ROLE in it, which is what a key is minted
-	// against, would not.
-	var project map[string]any
-
-	do(t, c, http.MethodPost, public+"/api/v1/orgs/dev-org/projects", "",
-		map[string]any{"slug": "widget", "name": "Widget"}, http.StatusCreated, &project)
-
-	// ---- grant the caller a project role. Site admin is enough to ADMINISTER the
-	// project, but a key is a per-user delegation of a project role, and the schema
-	// enforces that with a foreign key onto project_memberships: there is no row to
-	// cap the scope against until this call has happened. Project roles are managed
-	// in-app -- unlike org roles, which are claim-derived and read-only here.
 	userID, _ := me["user_id"].(string)
 	if userID == "" {
 		t.Fatal("/me returned no user_id")
 	}
 
-	do(t, c, http.MethodPut, public+"/api/v1/orgs/dev-org/projects/widget/members/"+userID, "",
+	// ---- the creator is on the new org's roster, as a LOCAL owner. Provenance is
+	// visible: an in-app grant that no group claim justifies must be legible as one,
+	// not laundered into something the IdP appears to have said.
+	var roster map[string]any
+
+	do(t, c, http.MethodGet, public+"/api/v1/orgs/acme/members", "", nil, http.StatusOK, &roster)
+
+	items, _ := roster["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("new org roster: got %d members, want exactly the creator: %+v", len(items), roster)
+	}
+
+	creator, _ := items[0].(map[string]any)
+	if creator["org_role"] != "owner" || creator["local_role"] != "owner" {
+		t.Fatalf("creator of a new org: got org_role=%v local_role=%v, want owner/owner -- the "+
+			"creator MUST own the org they just made, or it is an org nobody can ever join: %+v",
+			creator["org_role"], creator["local_role"], creator)
+	}
+
+	// The effective role is owner because the LOCAL half says so and the claim half
+	// says nothing. Reporting it as claim-derived would be a lie -- and one the next
+	// login would rightly reconcile away, taking the org's only owner with it.
+	if creator["oidc_role"] != nil || creator["org_role_source"] != "local" {
+		t.Errorf("creator's grant is not reported as purely local: oidc_role=%v source=%v",
+			creator["oidc_role"], creator["org_role_source"])
+	}
+
+	if creator["granted_by_email"] != "dev@bakery.local" || creator["granted_at"] == nil {
+		t.Errorf("the local grant carries no provenance: granted_by_email=%v granted_at=%v",
+			creator["granted_by_email"], creator["granted_at"])
+	}
+
+	// ---- create a project IN THE NEW ORG.
+	var project map[string]any
+
+	do(t, c, http.MethodPost, public+"/api/v1/orgs/acme/projects", "",
+		map[string]any{"slug": "widget", "name": "Widget"}, http.StatusCreated, &project)
+
+	// ---- grant the caller a project role. Org owner is enough to ADMINISTER the
+	// project, but a key is a per-user delegation of a project role, and the schema
+	// enforces that with a foreign key onto project_memberships: there is no row to
+	// cap the scope against until this call has happened. This is the call that
+	// 404'd under M1, because the {user} segment resolves against the ORG roster --
+	// which was empty.
+	do(t, c, http.MethodPut, public+"/api/v1/orgs/acme/projects/widget/members/"+userID, "",
 		map[string]any{"role": "admin"}, http.StatusOK, nil)
 
-	// ---- mint an API key. The plaintext is returned exactly once, here.
+	// ---- mint an API key. The plaintext is returned exactly once, here. Under M1
+	// this was a 409 scope_exceeds_role, and the console's headline flow dead-ended.
 	var key map[string]any
 
-	do(t, c, http.MethodPost, public+"/api/v1/orgs/dev-org/projects/widget/keys", "",
+	do(t, c, http.MethodPost, public+"/api/v1/orgs/acme/projects/widget/keys", "",
 		map[string]any{"name": "ci", "scope": "write"}, http.StatusCreated, &key)
 
 	token, _ := key["token"].(string)
