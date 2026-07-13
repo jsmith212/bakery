@@ -3,9 +3,11 @@ package middleware
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -87,6 +89,93 @@ func TestRequestLoggerPassesResponseThrough(t *testing.T) {
 				t.Errorf("got body %q, want %q", got, tt.body)
 			}
 		})
+	}
+}
+
+// readerFromWriter models what net/http's *response gives a /cache handler: a
+// ResponseWriter that also implements io.ReaderFrom for the zero-copy sendfile
+// path. http.ServeContent's io.CopyN only takes that path when the destination
+// it is handed exposes ReadFrom, so the recorder must forward to it.
+type readerFromWriter struct {
+	http.ResponseWriter
+
+	readFromCalled bool
+	body           bytes.Buffer
+}
+
+func (w *readerFromWriter) ReadFrom(src io.Reader) (int64, error) {
+	w.readFromCalled = true
+
+	return io.Copy(&w.body, src)
+}
+
+// The recorder must expose io.ReaderFrom and delegate to the wrapped writer's
+// ReadFrom, or every multi-GB /cache download loses the sendfile fast path and
+// falls back to a 32 KiB userspace copy. Before the ReadFrom forwarder existed,
+// responseRecorder embedded only the http.ResponseWriter interface (whose method
+// set has no ReadFrom), so this assertion failed and the delegation never ran.
+func TestResponseRecorderForwardsReaderFrom(t *testing.T) {
+	underlying := &readerFromWriter{ResponseWriter: httptest.NewRecorder()}
+	rr := &responseRecorder{ResponseWriter: underlying, status: http.StatusOK}
+
+	rf, ok := any(rr).(io.ReaderFrom)
+	if !ok {
+		t.Fatal("responseRecorder must implement io.ReaderFrom to preserve the sendfile fast path")
+	}
+
+	const payload = "a multi-gig sstate tarball, in spirit"
+
+	n, err := rf.ReadFrom(strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+
+	if !underlying.readFromCalled {
+		t.Error("ReadFrom did not delegate to the wrapped writer; sendfile fast path is defeated")
+	}
+
+	if n != int64(len(payload)) {
+		t.Errorf("got n=%d, want %d", n, len(payload))
+	}
+
+	if got := underlying.body.String(); got != payload {
+		t.Errorf("got forwarded body %q, want %q", got, payload)
+	}
+
+	if rr.bytes != len(payload) {
+		t.Errorf("got %d bytes accounted, want %d", rr.bytes, len(payload))
+	}
+}
+
+// When the wrapped writer has no ReadFrom (e.g. the S3-deferred non-seekable
+// path, or a plain recorder), ReadFrom must still copy the bytes through and
+// keep byte accounting intact -- without recursing back into itself.
+func TestResponseRecorderReadFromFallback(t *testing.T) {
+	rec := httptest.NewRecorder()
+
+	if _, ok := any(rec).(io.ReaderFrom); ok {
+		t.Skip("httptest.ResponseRecorder unexpectedly implements io.ReaderFrom; fallback path not exercised")
+	}
+
+	rr := &responseRecorder{ResponseWriter: rec, status: http.StatusOK}
+
+	const payload = "buffered copy still accounts every byte"
+
+	n, err := rr.ReadFrom(strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+
+	if n != int64(len(payload)) {
+		t.Errorf("got n=%d, want %d", n, len(payload))
+	}
+
+	if got := rec.Body.String(); got != payload {
+		t.Errorf("got written body %q, want %q", got, payload)
+	}
+
+	if rr.bytes != len(payload) {
+		t.Errorf("got %d bytes accounted, want %d", rr.bytes, len(payload))
 	}
 }
 
