@@ -328,6 +328,22 @@ type ServeCmd struct {
 	// the schema and no S3 driver in the binary.
 	StorageDir string `default:"./data" env:"STORAGE_DIR" help:"Directory the local storage driver writes blobs to." type:"path"`
 
+	// The hashserv upstream-chaining KILL SWITCH. Server-wide, and it overrides every
+	// backend: when set, a backend whose cache_backends.config names an upstream behaves
+	// as though it named none.
+	//
+	// Chaining puts a THIRD PARTY inside a build's setscene burst. It is off by default
+	// and opt-in per backend, but the day the public Yocto hashserv is down -- or slow,
+	// which is worse, because a build stalls rather than fails -- it is showing up in
+	// every customer build at once, and the fix has to be reachable by an operator who
+	// is not going to run a database migration under an incident. So it is a flag, not a
+	// column: restart with it set and every backend serves from local data alone, which
+	// is exactly what they all did yesterday.
+	//
+	// It cannot turn chaining ON. There is no server-wide enable, because "chain to
+	// somewhere" needs an address and the address is per-backend.
+	HashservDisableUpstream bool `env:"HASHSERV_DISABLE_UPSTREAM" help:"Ignore every hashserv backend's configured upstream. The kill switch for when the public hashserv is down." name:"hashserv-disable-upstream"`
+
 	// Self-serve orgs: ANY signed-in human may create an organization, and becomes
 	// its LOCAL OWNER (see internal/api's handleCreateOrg). Default ON.
 	//

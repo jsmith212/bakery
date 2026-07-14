@@ -51,7 +51,7 @@ These are the facts that shape the architecture. Each was confirmed by reading c
 - **Stream mode has an evil wire detail:** server sends `"ok"` (JSON-quoted) to *enter*, and `ok` (raw, unquoted) to *exit*. Getting this wrong is a silent hang, not an error.
 - Errors are `{"invoke-error":{"message":…}}` followed by **closing the connection** — there's no way to resynchronize without request IDs.
 - **`BB_HASHSERVE_UPSTREAM` is PULL-ONLY.** The local hashserv reads from upstream but *never reports to it*. So the `BB_HASHSERVE="auto"` + upstream topology would mean **Bakery never receives a single hash report.** ⇒ We support and document *only* the direct topology.
-- **Anonymous `ping` always succeeds upstream**, even with `@none` perms. So an RPC-level auth denial isn't discovered until mid-build and surfaces as an unhandled traceback. ⇒ **Reject unauthenticated connections at the HTTP upgrade with 401.**
+- **Anonymous `ping` always succeeds upstream**, even with `@none` perms. ⇒ ~~Reject unauthenticated connections at the HTTP upgrade with 401.~~ **This conclusion was wrong and is superseded — see "M3: verified before implementation" below. Deny auth IN-BAND, never at the upgrade.**
 - Upstream's `DEFAULT_ANON_PERMS` grants anonymous `@read` + `@report` + **`@db-admin`** (a stranger can `gc-sweep` your DB). **Do not copy this default.**
 - Equivalence logic on `report`: insert the outhash; if the row is *new*, find a *different* taskhash with the same `(method, outhash)` and adopt the unihash of the **oldest** such row; else mint the reported one. `unihashes(method, taskhash)` is **write-once**.
 - netrc gotcha to document: the `machine` token must be the **full `BB_HASHSERVE` URL** (`machine wss://bakery/c/org/proj/hashserv`), not the hostname. Exact string match.
@@ -140,7 +140,7 @@ One credential — a project-scoped API key — presented five ways:
 | sstate / downloads | HTTP Basic (bitbake supports nothing else) |
 | ccache / sccache | Basic, or Bearer via `bearer-token` |
 | moon gRPC | `authorization: Bearer` metadata (sent on every call) |
-| hashserv | Native `auth` RPC (username + token), **401 at the WS upgrade if absent** |
+| hashserv | Native `auth` RPC (username + token). Deny **in-band** with `{"invoke-error":…}` + close. **Never 401 the upgrade** — see the M3 note |
 | Docker | Registry Bearer token flow (`/v2/token`) |
 
 Humans log in via OIDC (Google, Authelia, GitHub). `DEV_LOGIN_ENABLED` is settable **only** by env var / CLI flag — no UI or API path can enable it, and it defaults off.
@@ -172,10 +172,59 @@ Each is independently shippable and leaves the tree green.
 - **M1 — Control plane + storage. ✅ DONE** (see "M1 as landed" below). Postgres schema + sqlc; orgs, projects, users, roles, memberships, API keys; OIDC login + DEV_LOGIN; `storage.Store` (**local only — S3 is deferred**) + `blob.Service` (dedup, refcount, LRU, singleflight). The HEAD-path benchmark and its three gates landed with it, before any backend exists.
 - **M1.5 — Hybrid role model. ✅ DONE** (see "M1.5 as landed" below). ([spec](specs/2026-07-12-hybrid-role-model.md)) M1 derives site *and* org roles purely from OIDC group claims, which forces a group-per-org into the directory and leaves a freshly-created org unusable by its own creator. M1.5 splits the one group lookup that was answering three questions into four planes: a **login gate** (`login_groups`, independent of org mapping — empty admits any successful OIDC auth), a **hybrid site role**, **hybrid org membership** (claims *and* in-app grants, effective role `greatest(oidc, local)` computed by the database), and **project roles in-app only**. Org creation grants the creator a local owner role. Fail-closed moves from *"no orgs ⇒ refuse"* to *"an **unreadable** groups claim ⇒ refuse and reconcile nothing"* — empty is not unreadable, and only the former is safe to act on. Also fixes `RevokeAPIKeysForMembership`, which has never worked (pgx cannot encode an enum array without the type registered on the pool). **Lands before the SPA→API wiring wave**, which depends on its membership screens.
 - **M2 — Yocto sstate + downloads. ✅ DONE** (see "M2 as landed" below). `httpblob` + two Policies + `bakery sstate push`. First thing a user can actually point bitbake at.
-- **M3 — hashserv.** Framing-first, pure and DB-free, with an exhaustive table-driven suite. **Run upstream's own hashserv test suite and the real `bitbake-hashclient` against our server in CI — this is non-negotiable.**
+- **M3 — hashserv. ✅ DONE** (see "M3 as landed" below). ([spec](specs/2026-07-13-m3-hashserv.md)) WebSocket-only, framing-first, one writer goroutine per connection, auth denied in-band. Upstream bitbake's own hashserv suite **and** the real `bitbake-hashclient` both run against Bakery in CI, and the gate earned its keep on day one — it caught a real divergence the design review had not.
 - **M4 — Bazel REAPI (gRPC) + `/ac` `/cas` HTTP.** Ships moon, ccache, and sccache together.
 - **M5 — Docker OCI pull-through proxy.** Byte-exact manifests, stale-while-revalidate, own 401 challenge.
 - **M6 — GC, retention, quotas + UI polish.** (The GC *write barrier* and refcount tests land with M1, not here.)
+
+### M3: what the pre-implementation review got right, and what it got wrong
+
+M3 was preceded by a source-reading review that produced four findings. It is worth recording how they
+fared, because the score is the argument for the CI gate.
+
+**Findings 1, 2 and 4 held exactly, and all three are now enforced by tests.**
+
+1. **Auth must be denied IN-BAND. A 401 at the WS upgrade is the SILENT failure, not the loud one.** 401 → `websockets` raises `InvalidStatus` → `asyncrpc/client.py` re-raises as `ConnectionError` → `_send_wrapper` retries 3× then re-raises → **`siggen.py` catches `ConnectionError`, `bb.warn()`s, and sets `unihash = taskhash`**. The build *completes*, with a silently degraded cache — sstate object filenames embed the unihash, so every task the server would have remapped now misses its object. The loud path is `{"invoke-error":…}` + close: `InvokeError` is in no retry tuple and is caught nowhere on the build path, so it halts the build. `TestAuthIsDeniedInBand` and the conformance gate both assert it.
+2. **A stock client sends NO `Authorization` header on the upgrade.** Credentials go in-band via the `auth` RPC. Gating the upgrade rejects the connection before the client can present anything. `TestUpgradeCarriesNoCredentialAndStillSucceeds` asserts the upgrade returns 101 with no credential even when `read_auth_required` is set.
+4. **`coder/websocket`'s default 32768-byte read limit; `SetReadLimit` is mandatory.** `TestHugeSiginfo` sends upstream's own 128 KiB `outhash_siginfo` in one frame.
+
+**Finding 3 was half right, and the half it missed set the whole auth design.** It correctly saw that
+`setUp`/`tearDown` call `client.remove()` and that the 15 `test_auth_*` tests skip without
+`BB_TEST_HASHSERV_USERNAME`. It concluded the gate therefore "holds without letting a cache client mint
+credentials." But it missed that `setUp`'s client is **anonymous** unless those vars are set — so running
+the suite anonymously would demand an anonymous `@db-admin`, i.e. an unauthenticated write, which the
+invariants forbid outright. It also undercounted the skips (18, not 15: three more call `start_server()`).
+The resolution: run **authenticated** with a real `bkry_` write key and exclude the deliberately-absent
+surface by name. See "M3 as landed".
+
+**Two things the review missed entirely, both of which would have shipped as silent, build-hanging bugs:**
+
+5. **Over WebSocket, the handshake is ONE MESSAGE PER LINE with no newlines.** `protocols/yocto.md`
+   documented it as "each line `\n`-terminated" without saying that is **stream-transport-only**.
+   `setup_connection` sends through the polymorphic `send()`: `StreamConnection` appends `\n`,
+   `WebsocketConnection` does not — it emits one WS message per line, and the header terminator is an
+   **empty message**. A server built to the documented spec waits forever for a frame that never comes,
+   and so does the build. The doc is now fixed.
+
+6. **The 64-hex `UNIHASH_REGEX` does not exist in bitbake 2.8.** It is a **2.10+** addition — which
+   `yocto.md`'s own version table already said, while §2.1 and §2.5 of the same document claimed
+   otherwise. Scarthgap's `handle_report` validates nothing, and upstream's own suite reports **40-hex**
+   unihashes. Enforcing 64 refused a legitimate Scarthgap client and **failed 11 of the 17 gate tests**.
+   We accept `^[0-9a-f]{1,64}$` — the union of every supported release, still hex-only because the
+   unihash lands in an sstate *filename*.
+
+   The method lesson is sharper than the bug: the finding came from reading git branch `2.8`, which
+   tracks later 2.8.x, while the build pins tag **`2.8.0`**. **Verify against the tree the build actually
+   pins.** (A third bug — `get-outhash` keying on `taskhash`, when upstream keys on `(method, outhash)`
+   alone — was caught in test rather than by the gate; it would have delivered an open mirror that served
+   every request, looked healthy, and produced *zero* equivalence.)
+
+**The score is the point.** Three of four findings held; one was half wrong; two of the three bugs that
+actually shipped into the branch were invisible to source review and were caught only by running the real
+client. This is why the gate is non-negotiable, and why "verified by reading" is not the same as
+"verified".
+
+**Inherited gap, unrelated to the protocol:** `cache_objects.gc_root` — the unihash GC root — was promised by migration `000006` ("it lands in M2 with sstate, before any production rows exist") and **never landed**. M2 shipped and sstate rows now exist. It stays deferred (it is derivable by parsing the unihash out of the sstate key at sweep time), but M6 must not assume the column is there. Note that `hashserv_unihashes` and `hashserv_outhashes` **do** carry both halves of the GC write barrier (`created_at` *and* `live_xid`) from birth, precisely so M6 does not inherit the same problem twice.
 
 ### M1 as landed
 
@@ -270,6 +319,86 @@ M2 builds the **first two backends that serve traffic**, and it is the first mil
 **Metrics.** The headline `bakery_cache_requests_total{org,project,backend,kind,op,result}` is emitted by `blob.Service`, so every backend is normalized for free and a backend **must not re-emit it**. It is labeled from the resolved `Route.Ref`, never `r.URL.Path`: a HEAD storm over thousands of distinct sstate keys collapses onto **one series per `(kind,op,result)`** (proven end-to-end: 60 HEADs across 22 distinct keys stayed at 32 total series), not one per object. Served on `--metrics-addr` only; the public listener 404s `/metrics`.
 
 **What M2 did NOT build:** hashserv (M3), bazel (M4), OCI (M5), the GC loop (M6), S3, a `bakery.bbclass` (the CLI is the v1 write path), and the SPA wiring for the snippet screen (the endpoint exists; the screen still renders mock data). `PUT` overwrite, sig verification on `/cas`, and the other Policy flags exist as fields for later backends but are `Overwrite=false`/`Verify=NoVerify` for both M2 mounts.
+
+### M3 as landed
+
+([spec](specs/2026-07-13-m3-hashserv.md)) `internal/cache/hashserv/` — the one backend that does **not**
+route through `blob.Service` (it stores hash rows, not objects), so it carries its own narrow `Queries`
+surface and owns its own metrics. It implements `cache.StreamBackend`, the seam M1 wrote for it.
+
+**Mount:** `/cache/{org}/{project}/hashserv`, a WebSocket upgrade on the shared mux. Registered in
+headless mode too — "no console" is not "no cache".
+
+**Scope is deliberately smaller than upstream's, and the reason is a grep.** Every hashserv client method
+was checked against bitbake's `lib/bb` (the build path). A real build calls only `ping`, `auth`, `get`,
+`get-stream`, `exists-stream`, `report`, `report-equiv`. The GC RPCs (`gc-mark`, `gc-sweep`, `gc-status`,
+`clean-unused`, `get-db-usage`, …) and the user-admin RPCs (`new-user`, `set-user-perms`, `become-user`,
+`refresh-token`, …) have **zero call sites** there — they exist for the `bitbake-hashclient` operator CLI
+and for upstream's own tests.
+
+So they are **not implemented**, and that is a position, not an omission:
+
+- **No GC RPCs.** Bakery garbage-collects **in-process** in M6, under the two-half write barrier.
+  Exposing upstream's `gc_mark` mark-and-sweep would put a *second, competing* GC mechanism on the same
+  tables, reachable by any cache client, for no production benefit. There is therefore **no `gc_mark`
+  column and no `config` table**.
+- **No user-admin RPCs.** Credentials are minted by the Bakery API. A cache client never mints one.
+- `remove` **is** served (project-scoped, write-key-gated): an operator legitimately wants "purge this
+  project's hash equivalence", and it is what the conformance harness resets with.
+
+**Transport: WebSocket only.** Raw TCP/unix are deferred. This was free risk reduction — the chunked
+`chunk-stream` framing that this document called the highest-risk file **exists only on the raw-TCP
+path**. Over WebSocket a message is one JSON document, whole. Not implementing TCP means never writing it.
+
+**Permissions** (`perms.go`). An API-key principal is structurally hollow — `CanAdminProject` is
+hard-false for `MethodAPIKey` — so only two questions can ever be true of a cache credential:
+
+| hashserv perm | Source | Grants |
+|---|---|---|
+| `@read` | `CanReadProject`, **or anonymous when `read_auth_required = false`** | `get`, `get-stream`, `exists-stream`, `get-outhash`, `ping` |
+| `@report` | `CanWriteProject` — a write-scoped key, **always** | the write path of `report` / `report-equiv` |
+| `@db-admin` | `CanWriteProject` | `remove`, and nothing else |
+| `@user-admin` | **unreachable** | nothing; the RPCs do not exist |
+
+There is **no anon-perms knob**, deliberately: upstream's `DEFAULT_ANON_PERMS` hands a stranger
+`@read + @report + @db-admin`, and an unauthenticated write must not be a representable state. An
+anonymous `report` on an open mirror takes upstream's `report_readonly` path — answered, never written —
+and is **metered** (`bakery_hashserv_reports_dropped_total`), because a silent non-write that nobody can
+see is how a cache quietly stops earning its keep.
+
+**Schema** (`000010_hashserv`): `hashserv_unihashes` + `hashserv_outhashes`, both scoped by `backend_id`
+— the multi-tenancy boundary, and a parameter of every query rather than a filter someone can forget.
+`(backend_id, method, taskhash) → unihash` is **write-once**. Both tables carry **both halves of the M6
+GC write barrier** (`created_at` *and* `live_xid`) from birth. `outhash_siginfo` is a `text` column, as
+upstream does.
+
+**Upstream chaining** is in, and disableable. A backend may name an upstream in its `config`
+(`{"upstream": "wss://hashserv.yoctoproject.org/ws"}`); absent means off, which is the default. On a
+`get-stream` miss Bakery asks upstream, answers the build **immediately**, and backfills the row behind
+it — the write never touches the hot path. `--hashserv-disable-upstream` / `HASHSERV_DISABLE_UPSTREAM` is
+the kill switch for the day the public server is slow and it is showing up in customer builds. Unlike the
+reference implementation, which opens **one upstream connection per downstream client**, Bakery pools
+them.
+
+**The CI gate** (`just hashserv-conformance`, wired into `image.needs`) has **two halves, and upstream
+only gives you one:**
+
+- **Half 1 — upstream bitbake's own suite**, external mode, driving the real server over the real
+  multi-tenant WebSocket mount. It runs **authenticated** with a real `bkry_` write key, because
+  `setUp`/`tearDown` call `remove()`. `ran=17 failures=0 errors=0 skipped=3`, and **all four counts are
+  pinned** — `get_env()` skips on an empty string, so a harness that handed through an empty
+  `BB_TEST_HASHSERV` would skip everything and report a triumphant green. The 22 excluded tests each
+  carry a written reason, and `TestUpstreamSuiteCoversEveryTest` asserts the partition against unittest's
+  own introspection, so a bitbake bump that adds a test **fails the gate instead of slipping past it**.
+- **Half 2 — the real `bitbake-hashclient`**, which upstream's external suite **never runs**: all 27 of
+  its `run_hashclient` call sites live in a class that spawns its own local `unix://` server. So this
+  half is Bakery-authored. It also carries the one-writer-per-connection proof (1000 concurrent lookups
+  over 20 connections, cold then warm, none crossed) — because upstream's `test_stress` is **vacuous in
+  2.8.0**: it calls `Client(...)`, a name `tests.py` never imports, so all 100 threads die with a
+  `NameError` that `threading` swallows and `assertFalse(failures)` passes.
+
+**What M3 did NOT build:** raw TCP/unix transports, the GC and user-admin RPCs (above), `get-stats` /
+`reset-stats`, and the SPA screen for hashserv config (the backend CRUD API already covers it).
 
 ---
 

@@ -185,6 +185,78 @@ jobs:
           name: conformance-log
           path: build/conformance.log
 
+  # M3's gate, and DESIGN.md calls it non-negotiable. Two halves: bitbake's OWN hashserv
+  # suite in external mode (BB_TEST_HASHSERV, authenticated with a real write-scoped key,
+  # exact ran/failures/errors/skipped counts pinned), and the real bitbake-hashclient
+  # binary -- which upstream's external suite never runs, because all its run_hashclient
+  # call sites spawn a local unix:// python server instead.
+  #
+  # A SEPARATE job from `build`, like `conformance`: it needs a bitbake checkout and a
+  # pinned python `websockets` that `build` has no use for. It runs through
+  # `just hashserv-conformance`, where a skip FAILS -- a gate that skips itself and reports
+  # green is the one outcome worse than having no gate.
+  hashserv-conformance:
+    runs-on: ubuntu-latest
+
+    # Same postgres service as `build` and `conformance`: dbtest uses TEST_DB_URL and never
+    # touches Docker, so the ephemeral database the backend boots against is this service.
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --health-start-period 10s
+
+    env:
+      TEST_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - uses: extractions/setup-just@v3
+
+      # ubuntu-latest's system python is EXTERNALLY-MANAGED (PEP 668): a bare
+      # `pip3 install websockets` there dies with `error: externally-managed-environment`.
+      # setup-python puts an interpreter we own first on PATH -- and it is the SAME python3
+      # the Go harness exec.Commands and the same one `just hashserv-conformance` installs
+      # the pinned websockets for, because all three resolve `python3` from PATH.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The same 13 MB shallow clone the `conformance` job caches, under the same key: one
+      # checkout, cached once, restored by both. Key on the pinned tag, which the recipe's
+      # bb_tag must match -- bump both together.
+      - name: Cache the bitbake checkout
+        uses: actions/cache@v4
+        with:
+          path: build/bitbake
+          key: bitbake-2.8.0
+
+      - name: Hashserv conformance (bitbake's own suite + the real hashclient; a skip fails the job)
+        run: just hashserv-conformance
+
+      - name: Upload the hashserv conformance log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hashserv-conformance-log
+          path: build/hashserv-conformance.log
+
   commit:
     runs-on: ubuntu-latest
     steps:
@@ -197,7 +269,10 @@ jobs:
   image:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
-    needs: [build, check, commit, conformance]
+
+    # hashserv-conformance is in this list, and that is the point of having written it: a
+    # gate that runs, goes red, and still lets the image push to ghcr.io gates nothing.
+    needs: [build, check, commit, conformance, hashserv-conformance]
 
     permissions:
       contents: read

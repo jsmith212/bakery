@@ -9,6 +9,9 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // tokenPrefixPattern is the CHECK constraint the schema puts on token_prefix. A
@@ -265,6 +268,179 @@ func TestAuthenticateKey(t *testing.T) {
 			t.Fatalf("authenticateKey() with a broken store = %v, want the store's error to surface", err)
 		}
 	})
+}
+
+// TestAuthenticateToken drives the seam hashserv authenticates through.
+//
+// hashserv's credential arrives IN-BAND, in a WebSocket `auth` RPC, so there is no
+// *http.Request to hand to AuthenticateCache and no HTTP layer in front of this
+// path at all. What has to be true is that it is the SAME probe, not a second,
+// weaker one -- so this runs against a REAL database. Revocation and expiry are
+// enforced by validateKeySQL's predicate, and a fake store cannot pose that
+// question: a row it was never given is not a row that was revoked.
+func TestAuthenticateToken(t *testing.T) {
+	t.Parallel()
+
+	ts := newTestService(t, testGroupMap, false)
+	ctx := t.Context()
+
+	orgID, projectID, owner := seedMember(t, ts, ProjectRoleWriter)
+
+	// The key owner is made a SITE ADMIN, which is what turns the IsSiteAdmin
+	// assertion below into a real question instead of a tautology. A key is a
+	// delegation capped at one project and one scope; if this path ever loaded its
+	// owner's site role, the read-scoped key minted here would be a master key for
+	// the whole installation -- and hashserv, whose perms table (spec §4) reads
+	// exactly these capabilities, would honour it.
+	//
+	// site_role itself is GENERATED (greatest of the two halves), so the claim half
+	// is what there is to write.
+	tag, err := ts.pool.Exec(ctx,
+		`UPDATE users SET site_role_oidc = 'admin' WHERE id = $1`, owner.UserID())
+	if err != nil {
+		t.Fatalf("promote the key owner to site admin: %v", err)
+	}
+
+	// An UPDATE that matched nothing would leave the owner an ordinary user and make
+	// every IsSiteAdmin assertion below pass for the wrong reason.
+	if tag.RowsAffected() != 1 {
+		t.Fatalf("promoting the key owner updated %d rows, want 1", tag.RowsAffected())
+	}
+
+	mint := func(name string, scope Scope, expires *time.Time) (string, pgtype.UUID) {
+		t.Helper()
+
+		key, row, err := ts.CreateAPIKey(ctx, owner, CreateKeyInput{
+			OrgID: pgtype.UUID{}, ProjectID: projectID, Name: name, Scope: scope, ExpiresAt: expires,
+		})
+		if err != nil {
+			t.Fatalf("CreateAPIKey(%q): %v", name, err)
+		}
+
+		return key.Token, row.ID
+	}
+
+	writeToken, _ := mint("ci-write", ScopeWrite, nil)
+	readToken, _ := mint("ci-read", ScopeRead, nil)
+
+	revokedToken, revokedID := mint("revoked", ScopeWrite, nil)
+	if _, err := ts.store.RevokeAPIKey(ctx, revokedID); err != nil {
+		t.Fatalf("RevokeAPIKey: %v", err)
+	}
+
+	// Aged, not born expired: api_keys_expires_after_created refuses
+	// expires_at <= created_at, so both timestamps move into the past.
+	expiredToken, expiredID := mint("expired", ScopeWrite, ptr(time.Now().Add(time.Hour)))
+	if _, err := ts.pool.Exec(ctx, `
+		UPDATE api_keys
+		   SET created_at = now() - interval '2 hours',
+		       expires_at = now() - interval '1 hour'
+		 WHERE id = $1`, expiredID); err != nil {
+		t.Fatalf("age the key: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		token     string
+		wantErr   bool
+		wantRead  bool
+		wantWrite bool
+	}{
+		{
+			name:  "a write-scoped key reads and writes its project",
+			token: writeToken, wantErr: false, wantRead: true, wantWrite: true,
+		},
+		{
+			name:  "a read-scoped key reads its project and writes nothing",
+			token: readToken, wantErr: false, wantRead: true, wantWrite: false,
+		},
+		{
+			name:  "a revoked key is refused",
+			token: revokedToken, wantErr: true, wantRead: false, wantWrite: false,
+		},
+		{
+			name:  "an expired key is refused",
+			token: expiredToken, wantErr: true, wantRead: false, wantWrite: false,
+		},
+		{
+			// The auth RPC is client-supplied JSON. Garbage is a rejection, never a panic.
+			name:  "a malformed token is refused",
+			token: "bkry_", wantErr: true, wantRead: false, wantWrite: false,
+		},
+		{
+			// What an anonymous client's auth RPC carries if it sends one at all.
+			name:  "the empty token is refused",
+			token: "", wantErr: true, wantRead: false, wantWrite: false,
+		},
+		{
+			name:  "a token that is not a bkry_ token at all is refused",
+			token: "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhIn0.sig", wantErr: true, wantRead: false, wantWrite: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p, err := ts.AuthenticateToken(ctx, tt.token)
+
+			if tt.wantErr {
+				// Every rejection is the SAME error. Distinguishing "unknown" from
+				// "revoked" from "expired" to a client that just failed to authenticate
+				// is an oracle, and the in-band invoke-error hashserv sends back carries
+				// whatever this says.
+				if !errors.Is(err, ErrKeyInvalid) {
+					t.Fatalf("AuthenticateToken() = (%v, %v), want ErrKeyInvalid", p, err)
+				}
+
+				if p != nil {
+					t.Fatalf("AuthenticateToken() returned a Principal (%#v) alongside an error", p)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("AuthenticateToken() error = %v", err)
+			}
+
+			if p.Method() != MethodAPIKey {
+				t.Errorf("Method() = %q, want %q", p.Method(), MethodAPIKey)
+			}
+
+			if got := p.CanReadProject(orgID, projectID); got != tt.wantRead {
+				t.Errorf("CanReadProject() = %v, want %v", got, tt.wantRead)
+			}
+
+			if got := p.CanWriteProject(orgID, projectID); got != tt.wantWrite {
+				t.Errorf("CanWriteProject() = %v, want %v", got, tt.wantWrite)
+			}
+
+			// The cap, on THIS path. The owning user is a site admin in the database.
+			if p.IsSiteAdmin() {
+				t.Error("IsSiteAdmin() = true: the key principal inherited its owner's site admin")
+			}
+
+			grant, ok := p.APIKey()
+			if !ok {
+				t.Fatal("APIKey() reported no grant on a principal built from a key")
+			}
+
+			if grant.ProjectID != projectID {
+				t.Errorf("APIKey().ProjectID = %v, want the project the key was minted for (%v)",
+					grant.ProjectID, projectID)
+			}
+		})
+	}
+
+	// And a key for THIS project authorizes nothing in another one: hashserv is
+	// multi-tenant on exactly this check.
+	p, err := ts.AuthenticateToken(ctx, writeToken)
+	if err != nil {
+		t.Fatalf("AuthenticateToken() error = %v", err)
+	}
+
+	if p.CanReadProject(orgB, projectB) || p.CanWriteProject(orgB, projectB) {
+		t.Error("the key authorized a project it was not minted for")
+	}
 }
 
 // TestKeyToucherCoalesces: last_used_at must never be written on the request path.

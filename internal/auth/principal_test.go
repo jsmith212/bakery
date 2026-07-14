@@ -298,8 +298,11 @@ func TestPrincipalHasNoExportedConstructor(t *testing.T) {
 	allowed := map[string]string{
 		"Authenticate":      "verifies the request's credential before it returns one",
 		"AuthenticateCache": "verifies the Basic/Bearer/cookie credential (constant-time key probe) before it returns one",
-		"FromContext":       "reads back a Principal this package already verified and put there",
-		"FromRequest":       "ditto",
+		"AuthenticateToken": "verifies a bare token through the SAME constant-time zero-join key probe before it " +
+			"returns one -- it is authenticateKey with no HTTP in front of it, for hashserv's in-band `auth` RPC, " +
+			"and it cannot mint a Principal the Basic and Bearer arms would have refused",
+		"FromContext": "reads back a Principal this package already verified and put there",
+		"FromRequest": "ditto",
 	}
 
 	entries, err := os.ReadDir(".")
