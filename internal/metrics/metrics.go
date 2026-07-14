@@ -170,6 +170,11 @@ type Metrics struct {
 	// so passing it straight to a label is exactly as unbounded as r.URL.Path.
 	HTTPDuration *prometheus.HistogramVec // {pattern,method,code}
 	HTTPInFlight prometheus.Gauge
+
+	// hashserv. UNEXPORTED on purpose -- reach it through Metrics.Hashserv, which
+	// takes closed Go types. hashserv.go explains why an exported CounterVec here
+	// would be a cardinality hole.
+	hashserv hashservCollectors
 }
 
 // httpBuckets start at 100us. prometheus' DefBuckets start at 5ms, which would
@@ -283,6 +288,8 @@ func New() *Metrics {
 			Name: "bakery_http_requests_in_flight",
 			Help: "HTTP requests currently being served.",
 		}),
+
+		hashserv: newHashservCollectors(f),
 	}
 }
 

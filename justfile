@@ -3,6 +3,14 @@ default: help
 # The bitbake tag the conformance suite pins. Keep in step with the CI cache key.
 bb_tag := "2.8.0"
 
+# The websockets version the hashserv gate pins, and it is a MATCHED PAIR with bb_tag.
+# bitbake 2.8 calls the LEGACY top-level `websockets.connect(uri, ping_interval=None)`
+# (lib/bb/asyncrpc/client.py). That API was deprecated and then REMOVED in websockets 14,
+# so an unpinned `pip install websockets` gives a red gate that is not a Bakery bug. 12.0
+# is the version contemporary with scarthgap. Bump it only with bb_tag, and only after
+# checking that bitbake still calls the legacy API.
+websockets_pin := "12.0"
+
 # Install the pre-commit hooks
 bootstrap:
   pre-commit install --hook-type commit-msg --hook-type pre-push
@@ -104,6 +112,56 @@ conformance: generate
       exit 1; \
     fi; \
     echo "conformance: the real bitbake fetcher ran green" '
+
+# Drive bitbake's OWN hashserv suite + the real bitbake-hashclient at the hashserv backend (a skip FAILS)
+hashserv-conformance: generate
+  # M3's gate, and it has TWO halves. Half 1 is bitbake's own hashserv test suite in
+  # external mode (BB_TEST_HASHSERV), authenticated with a real write-scoped bkry_ key --
+  # its setUp AND tearDown both call remove(), which Bakery maps to a write key, so an
+  # unauthenticated run errors in every setUp. Half 2 is the real bitbake-hashclient
+  # binary, which upstream's external suite NEVER runs (all its run_hashclient call sites
+  # spawn a local unix:// python server instead).
+  #
+  # Not in `just test-db` (which globs ./internal/...): this suite legitimately skips on a
+  # laptop with no bitbake checkout. This recipe is its home, and it provides the checkout
+  # and the pinned websockets -- so a skip here means the real client did not run, which is
+  # a failure.
+  #
+  # bash + pipefail (not `sh`): with `sh` the exit status of `go test | tee` is TEE's, so a
+  # failing suite would report as a pass -- the same trap `test-db` and `conformance`
+  # document.
+  #
+  # websockets goes in with `pip install --target`, not into the interpreter: ubuntu-latest
+  # (and Debian) mark the system python EXTERNALLY-MANAGED (PEP 668), where a bare
+  # `pip3 install websockets` dies with `error: externally-managed-environment`. --target
+  # writes a plain directory, which PYTHONPATH picks up and pip does not refuse -- and it
+  # keeps the pin off the interpreter the rest of the machine shares.
+  mkdir -p build
+  bash -euo pipefail -c ' \
+    if [ -z "${BB_LIB:-}" ]; then \
+      if [ ! -d build/bitbake/lib ]; then \
+        echo "cloning bitbake {{bb_tag}} (shallow) into build/bitbake ..."; \
+        git clone --depth 1 --branch {{bb_tag}} https://git.openembedded.org/bitbake build/bitbake; \
+      fi; \
+      BB_LIB="$(pwd)/build/bitbake/lib"; \
+    fi; \
+    export BB_LIB; \
+    test -d "${BB_LIB}/hashserv" || { echo "FAIL: no hashserv/ under BB_LIB=${BB_LIB}"; exit 1; }; \
+    test -x "$(dirname "${BB_LIB}")/bin/bitbake-hashclient" || { echo "FAIL: no bitbake-hashclient beside BB_LIB=${BB_LIB}"; exit 1; }; \
+    pylib="$(pwd)/build/hashserv-pylib"; \
+    if [ ! -d "${pylib}/websockets-{{websockets_pin}}.dist-info" ]; then \
+      echo "installing websockets=={{websockets_pin}} into ${pylib} (bitbake {{bb_tag}} needs the legacy connect API) ..."; \
+      rm -rf "${pylib}"; \
+      python3 -m pip install --quiet --disable-pip-version-check --target "${pylib}" "websockets=={{websockets_pin}}"; \
+    fi; \
+    export PYTHONPATH="${pylib}"; \
+    go test -v -count=1 -timeout 20m ./test/hashserv/... 2>&1 | tee build/hashserv-conformance.log; \
+    if grep -q -- "--- SKIP" build/hashserv-conformance.log; then \
+      grep -- "--- SKIP" build/hashserv-conformance.log; \
+      echo "FAIL: the hashserv conformance suite SKIPPED -- the real client did not run. Ensure docker or TEST_DB_URL, python3 with pip, and a bitbake checkout (BB_LIB)."; \
+      exit 1; \
+    fi; \
+    echo "hashserv-conformance: bitbake own suite + the real bitbake-hashclient ran green" '
 
 # Run the race detector
 race: web generate

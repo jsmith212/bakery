@@ -183,6 +183,61 @@ func TestDevLoginDefaultsOffAndIsFlagOrEnvOnly(t *testing.T) {
 	}
 }
 
+// The hashserv upstream kill switch. It must default to OFF -- chaining is opt-in per
+// backend, and a switch that defaulted to "disable" would silently ignore an upstream an
+// operator had deliberately configured.
+//
+// The point of it being a flag/env var at all is that it is reachable DURING AN INCIDENT:
+// when the public Yocto hashserv is down and it is showing up in customer builds, pulling
+// chaining must not require a database migration. So both routes are tested, not just one.
+func TestHashservDisableUpstreamIsOffByDefaultAndFlagOrEnvSettable(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		args []string
+		want bool
+	}{
+		{
+			name: "off by default: a configured upstream is honoured",
+			env:  map[string]string{"DB_URL": dsn},
+			args: []string{"serve"},
+			want: false,
+		},
+		{
+			name: "env var pulls chaining",
+			env:  map[string]string{"DB_URL": dsn, "HASHSERV_DISABLE_UPSTREAM": "true"},
+			args: []string{"serve"},
+			want: true,
+		},
+		{
+			name: "flag pulls chaining",
+			env:  map[string]string{"DB_URL": dsn},
+			args: []string{"serve", "--hashserv-disable-upstream"},
+			want: true,
+		},
+		{
+			name: "env var explicitly false leaves chaining on",
+			env:  map[string]string{"DB_URL": dsn, "HASHSERV_DISABLE_UPSTREAM": "false"},
+			args: []string{"serve"},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+
+			_, cli := parse(t, tt.args...)
+
+			if got := cli.Serve.HashservDisableUpstream; got != tt.want {
+				t.Errorf("HashservDisableUpstream = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCommandTree(t *testing.T) {
 	tests := []struct {
 		name string

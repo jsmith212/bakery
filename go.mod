@@ -5,6 +5,7 @@ go 1.26.1
 require (
 	github.com/alecthomas/kong v1.15.0
 	github.com/alexedwards/scs/v2 v2.9.0
+	github.com/coder/websocket v1.8.15
 	github.com/coreos/go-oidc/v3 v3.20.0
 	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/jackc/pgerrcode v0.0.0-20220416144525-469b46aa5efa

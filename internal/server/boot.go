@@ -14,6 +14,7 @@ import (
 	"github.com/jsmith212/bakery/internal/auth"
 	"github.com/jsmith212/bakery/internal/blob"
 	"github.com/jsmith212/bakery/internal/cache"
+	"github.com/jsmith212/bakery/internal/cache/hashserv"
 	"github.com/jsmith212/bakery/internal/cache/httpblob"
 	"github.com/jsmith212/bakery/internal/config"
 	"github.com/jsmith212/bakery/internal/db"
@@ -197,9 +198,33 @@ func Boot(ctx context.Context, p BootParams) error {
 	routes := httpblob.NewCachedResolver(store, log)
 	authn := cacheAuth{svc: authSvc}
 
+	// M3: hashserv. It shares the route resolver and the auth service with the M2
+	// backends, but nothing else -- it is the one backend that does not route through
+	// blob.Service, so it takes the Store directly (a narrow, hashserv-only Queries
+	// surface) and owns its own metrics.
+	//
+	// Upstreams is lazy: no upstream is dialled until a backend that configures one takes
+	// its first miss, so a dead or slow third party can never stall boot. Its Close tears
+	// down the pooled upstream connections and the backfill workers.
+	upstreams := hashserv.NewUpstreams(store, m, log, cmd.HashservDisableUpstream)
+
+	// Run below BLOCKS until both listeners have drained, so this defer really does fire
+	// at shutdown rather than at the top of a still-serving process.
+	defer func() {
+		if err := upstreams.Close(); err != nil {
+			log.Warn("closing hashserv upstreams", "error", err)
+		}
+	}()
+
+	if cmd.HashservDisableUpstream {
+		log.Warn("hashserv upstream chaining is disabled server-wide: every backend's configured " +
+			"upstream is ignored")
+	}
+
 	cacheBackends := []cache.Backend{
 		httpblob.NewSstate(cacheDeps, routes, authn),
 		httpblob.NewDownloads(cacheDeps, routes, authn),
+		hashserv.New(cacheDeps, routes, hashservAuth{svc: authSvc}, store, upstreams),
 	}
 
 	// Background maintenance. Both are tied to ctx, so they stop when the server
@@ -240,6 +265,23 @@ type cacheAuth struct{ svc *auth.Service }
 
 func (a cacheAuth) AuthenticateCache(ctx context.Context, r *http.Request) (httpblob.Principal, error) {
 	return a.svc.AuthenticateCache(ctx, r)
+}
+
+// hashservAuth adapts *auth.Service to hashserv.Authenticator. Same pure type-widening
+// delegate as cacheAuth above, and it exists for the same reason -- but it wraps
+// AuthenticateToken, not AuthenticateCache, because the hashserv credential does not
+// arrive in an *http.Request.
+//
+// It cannot: a stock bitbake client sends NO Authorization header on the WebSocket
+// upgrade (asyncrpc/client.py calls websockets.connect with no headers). The token
+// arrives IN BAND, in the `auth` RPC, after the upgrade has already completed -- so by
+// the time there is a credential to check there is no request left to check it against.
+// AuthenticateToken is the same authenticateKey the Basic path runs, with the HTTP
+// peeled off; the widening here is identical.
+type hashservAuth struct{ svc *auth.Service }
+
+func (a hashservAuth) AuthenticateToken(ctx context.Context, token string) (hashserv.Principal, error) {
+	return a.svc.AuthenticateToken(ctx, token)
 }
 
 // buildAuth assembles the auth service: the pgxpool-backed session store, the

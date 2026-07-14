@@ -295,7 +295,9 @@ This is the part with an actual protocol. Everything below is from bitbake maste
   # size, and sha256 of contents...
   ```
   (sstatesig.py:539+). Note it hashes `SSTATE_PKGSPEC` and the task name into the outhash — so outputs are only "equivalent" within the same recipe/task identity.
-- **unihash** — the *stable identity* used everywhere downstream, in particular in the **sstate object filename**. 64 lowercase hex chars (`UNIHASH_REGEX = r"^[0-9a-f]{64}$"`, `is_valid_unihash()`). Initially a task's unihash == its taskhash; the server may replace it with an older, equivalent one.
+- **unihash** — the *stable identity* used everywhere downstream, in particular in the **sstate object filename**. Initially a task's unihash == its taskhash; the server may replace it with an older, equivalent one.
+  ⚠️ **`UNIHASH_REGEX = r"^[0-9a-f]{64}$"` / `is_valid_unihash()` DO NOT EXIST IN BITBAKE 2.8** (Scarthgap), which is our floor. They are a **2.10+ addition** — consistent with the version table in §2.10, and contradicting what the rest of this section used to claim. In 2.8, `handle_report` performs **no validation at all**, and upstream's own test suite reports **40-hex** unihashes (`tests.py create_test_hash` → `f46d3fbb439bd9b921095da657a4de906510d2cd`).
+  ⇒ A server that enforces 64-hex **rejects a legitimate Scarthgap client.** (M3 shipped that and it failed 11 of 17 tests in the conformance gate — which is what the gate is for.) Bakery accepts `^[0-9a-f]{1,64}$`: the union of every supported release, still hex-only and length-bounded because the unihash lands in an sstate *filename*.
 - **method** — a namespace string. It is the *value of `SSTATE_HASHEQUIV_METHOD`*, so on the wire it is literally **`"oe.sstatesig.OEOuthashBasic"`** (the fully-qualified Python path), **not** `"OEOuthashBasic"`. A per-task suffix may be appended via `siggen.extramethod[tid]` (rarely used). Do not assume a fixed value; treat it as an opaque string key.
 
 **The point of the whole system:** if recipe A's task inputs change in a way that doesn't change its *output* (e.g. a whitespace-only change in a dependency), the taskhash changes but the outhash doesn't. The server maps the new taskhash to the *existing* unihash, so all downstream tasks keep their old unihashes and their old sstate objects remain valid → the rebuild stops propagating.
@@ -314,7 +316,9 @@ Parsed by `bb.asyncrpc.client.parse_address()` (asyncrpc/client.py:32). TCP sock
 
 **It is NOT JSON-RPC.** There is no `id`, no `jsonrpc` field, no `method`/`params` envelope. It is a line-oriented, single-key-object protocol with a stateful mode switch.
 
-#### Handshake (client → server), each line `\n`-terminated:
+#### Handshake (client → server) — ⚠️ THE FRAMING IS TRANSPORT-DEPENDENT
+
+**On the STREAM transports (TCP/unix), each line is `\n`-terminated:**
 
 ```
 OEHASHEQUIV 1.1\n
@@ -322,6 +326,29 @@ needs-headers: false\n
 [<extra-header>: <value>\n ...]
 \n                              <- empty line terminates headers
 ```
+
+**On WEBSOCKET, each line is ITS OWN MESSAGE, and there are NO NEWLINES AT ALL:**
+
+```
+msg 1:  OEHASHEQUIV 1.1
+msg 2:  needs-headers: false
+msg 3:  <EMPTY MESSAGE>          <- an empty message terminates headers
+```
+
+This is not a stylistic difference and it is very easy to miss. `setup_connection`
+(asyncrpc/client.py:99-109) sends the handshake through the transport-polymorphic `send()`, and
+the two transports implement it differently:
+
+- `StreamConnection.send(msg)` → `writer.write(msg + "\n")` — newline-terminated lines.
+- `WebsocketConnection.send(msg)` → `socket.send(msg)` — one WebSocket message, **no newline**.
+
+A WebSocket server built to the stream spec — waiting for `"OEHASHEQUIV 1.1\nneeds-headers:
+false\n\n"` in a single frame — **waits forever, and so does the build.** There is no error and no
+timeout: bitbake simply hangs. The same asymmetry governs every subsequent message, including
+stream mode's `"ok"`/`ok` pair (§2.3): over WebSocket neither carries a trailing newline.
+
+(Recorded here because the original version of this section described only the stream framing and
+presented it as universal. That is the bug that M3 nearly shipped.)
 
 Server side (`AsyncServerConnection.process_requests`, asyncrpc/serv.py:52-80):
 ```python
@@ -450,7 +477,7 @@ Registered in `ServerClient.__init__` (server.py:239-275). Read-only servers exp
 |---|---|---|---|
 | `ping` | – | `{}` | `{"alive": true}` |
 | `get` | `@read` | `{"taskhash": "<hex>", "method": "<str>", "all": false}` | `{"taskhash":..,"method":..,"unihash":..}` or `null`. With `"all": true`, returns the **joined outhash row**: all columns of `outhashes_v2` + `unihash` (i.e. `id, method, taskhash, outhash, created, owner, PN, PV, PR, task, outhash_siginfo, unihash`) |
-| `get-outhash` | `@read` | `{"method":..,"outhash":..,"taskhash":..,"with_unihash": true}` | joined row (as above) or `null`. `with_unihash:false` → raw `outhashes_v2` row only |
+| `get-outhash` | `@read` | `{"method":..,"outhash":..,"taskhash":..,"with_unihash": true}` | joined row (as above) or `null`. `with_unihash:false` → raw `outhashes_v2` row only. **See the trap below.** |
 | `get-stream` | `@read` | `null` | `"ok"` then stream mode |
 | `exists-stream` | `@read` | `null` | `"ok"` then stream mode |
 | `get-stats` | `@read` | `null` | `{"requests": {"num":N,"total_time":f,"max_time":f,"average":f,"stdev":f}}` |
@@ -502,6 +529,22 @@ C: END\n
 S: ok\n
 ```
 
+⚠️ **`get-outhash` accepts a `taskhash` and then IGNORES it — do not put it in your WHERE clause.**
+Both DB queries behind it key on `(method, outhash)` **alone**, ordered oldest-first
+(`sqlite.py get_unihash_by_outhash` / `get_outhash`; only `get_equivalent_for_outhash` uses the
+taskhash, and only to *exclude* it). The question being asked is *"has **any** task ever produced
+this output?"* — which is the only form of the question that can discover an equivalence the caller
+does not already know about.
+
+Filtering by taskhash as well looks tighter and is silently catastrophic: the lookup can then only
+ever return the caller's own row, so `report_readonly` — the anonymous / read-scoped path — finds an
+equivalent **exactly never**. An open mirror would serve every request, return valid-looking
+answers, and deliver **zero equivalence**, forever, with nothing in any log. (M3 shipped this bug and
+caught it in test; hence this note.)
+
+Also: `with_unihash` **defaults to `true`** when the key is absent
+(`request.get("with_unihash", True)`), not false.
+
 ### 2.5 Equivalence logic on `report` — the core algorithm
 
 `handle_report` (server.py:478-536). Reproduce this exactly:
@@ -509,7 +552,9 @@ S: ok\n
 ```python
 @permissions(READ_PERM)
 async def handle_report(self, data):
-    validate_unihash(data.get("unihash"))          # must be ^[0-9a-f]{64}$
+    # NB: this line is 2.10+ ONLY. bitbake 2.8 (Scarthgap, our floor) does NOT validate --
+    # see the unihash bullet in 2.1. Do not enforce 64-hex against a 2.8 client.
+    validate_unihash(data.get("unihash"))
 
     if self.server.read_only or not self.user_has_permissions(REPORT_PERM):
         return await self.report_readonly(data)    # lookup only, no writes

@@ -240,6 +240,31 @@ func (s *Service) authenticateKey(ctx context.Context, token string) (Principal,
 	}, nil
 }
 
+// AuthenticateToken resolves a bare token -- no HTTP -- to a verified Principal.
+//
+// It exists for hashserv, whose credential arrives IN-BAND, in a WebSocket `auth`
+// RPC, after the upgrade has already completed. There is no *http.Request to hand
+// to Authenticate or AuthenticateCache at that point, and inventing one would be a
+// lie about where the credential came from.
+//
+// It is a thin wrapper over authenticateKey and MUST stay one: the same
+// constant-time, zero-join, index-only probe the Bearer and Basic arms run. A
+// second validation path here would be a second place for a key to be accepted
+// that the other two would refuse -- and being the one path with no HTTP in front
+// of it, it would be the weakest.
+//
+// Choosing WHICH field of the calling protocol holds the token is the caller's
+// job, not this method's: hashserv's auth RPC carries {"username","token"} and a
+// Bakery credential is one opaque bkry_ token, not an id:secret pair, so it may
+// arrive in either field. A token of the wrong shape never reaches the database --
+// looksLikeAPIKey turns it into ErrKeyInvalid inside authenticateKey.
+func (s *Service) AuthenticateToken(ctx context.Context, token string) (Principal, error) {
+	p, err := s.authenticateKey(ctx, token)
+	s.observeErr(MethodAPIKey, err)
+
+	return p, err
+}
+
 // keyToucher coalesces last_used_at updates off the request path.
 //
 // mark() is what the hot path calls: one mutex-guarded map insert, no I/O. The
