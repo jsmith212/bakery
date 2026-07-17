@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestSccache drives the REAL sccache binary against Bakery's sccache WebDAV mount.
@@ -95,7 +96,13 @@ func TestSccache(t *testing.T) {
 	// PUT the silently-read-only failure mode would swallow.
 	compile(t, "cold")
 
-	cold := sccacheStats(t, run(t, "stats-cold", "--show-stats", "--stats-format=json"))
+	// The storage write is ASYNC: sccache returns the compile result and completes the
+	// PUT in the background, so an immediate stats snapshot races it -- 0.16 usually
+	// wins that race, 0.8.2 reliably loses it. Poll with a deadline; cache_writes
+	// staying 0 past it is the real silently-read-only failure.
+	cold := pollStats(t, func() sccStats {
+		return sccacheStats(t, run(t, "stats-cold", "--show-stats", "--stats-format=json"))
+	}, func(s sccStats) bool { return s.writes() >= 1 })
 	if cold.writes() < 1 {
 		t.Errorf("cold sccache compile reported no cache write (cache_writes=%d): the WebDAV PUT "+
 			"was silently dropped -- opendal latched read-only. stats=%+v", cold.writes(), cold)
@@ -212,4 +219,22 @@ func freePort(t *testing.T) int {
 	}
 
 	return port
+}
+
+// pollStats re-reads sccache's stats until ok(stats) or a deadline. The cache write
+// happens AFTER the compile returns (async), so a single immediate snapshot is a race
+// the test would lose or win by sccache version.
+func pollStats(t *testing.T, read func() sccStats, ok func(sccStats) bool) sccStats {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for {
+		s := read()
+		if ok(s) || time.Now().After(deadline) {
+			return s
+		}
+
+		time.Sleep(200 * time.Millisecond)
+	}
 }

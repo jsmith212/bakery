@@ -216,7 +216,7 @@ func (b *Backend) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		b.servePropfind(w, r)
+		b.servePropfind(w, r, route)
 
 		return
 

@@ -142,9 +142,11 @@ func bazelRoute() cache.Route {
 	return r
 }
 
-// TestPropfindDeclaresACollection: PROPFIND -> 207 with the two fields opendal cannot
-// deserialize without -- <D:collection/> and an RFC 2822 <D:getlastmodified>. Missing
-// either makes sccache go silently read-only.
+// TestPropfindDeclaresACollection: a DIRECTORY PROPFIND (trailing slash -- opendal's own
+// convention, visible in both real-client wire traces) -> 207 with the two fields opendal
+// cannot deserialize without: <D:collection/> and an RFC 2822 <D:getlastmodified>.
+// Missing either makes sccache go silently read-only. File-shaped paths are covered by
+// TestPropfindDistinguishesFilesFromCollections.
 func TestPropfindDeclaresACollection(t *testing.T) {
 	t.Parallel()
 
@@ -154,7 +156,7 @@ func TestPropfindDeclaresACollection(t *testing.T) {
 	NewSccache(blobs.deps(), fakeResolver{route: bazelRoute(), found: true}, &fakeAuthenticator{}).Register(mux)
 
 	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest(methodPropfind, "/cache/acme/widget/sccache/a/b/c", nil))
+	mux.ServeHTTP(rec, httptest.NewRequest(methodPropfind, "/cache/acme/widget/sccache/a/b/c/", nil))
 
 	if rec.Code != http.StatusMultiStatus {
 		t.Fatalf("PROPFIND status = %d, want 207", rec.Code)
@@ -549,5 +551,60 @@ func TestWebDAVMountRootIsACollection(t *testing.T) {
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("MKCOL on the mount root = %d, want 201", rec.Code)
+	}
+}
+
+// TestPropfindDistinguishesFilesFromCollections is the regression fence for the CI
+// failure sccache v0.8.2 exposed: its opendal (0.4x) PROPFINDs the OBJECT PATH ITSELF
+// before every write -- a file stat -- where opendal 0.55 (sccache 0.16) only probes
+// parents. Declaring every path a collection makes the old writer see "a directory sits
+// where my file goes" and abort the PUT: cache_writes=0, silently read-only, while the
+// newer client passes. opendal's own convention disambiguates: a directory path carries
+// a trailing slash (the mount root arrives empty); everything else names a file, and the
+// honest stat answers are 207+getcontentlength when the object exists and 404 -- never
+// 400 -- when it does not (opendal maps the 404 to "no conflict, proceed to PUT").
+func TestPropfindDistinguishesFilesFromCollections(t *testing.T) {
+	authn := &fakeAuthenticator{principal: fakePrincipal{canWrite: true, canRead: true}}
+	f := newBazelFixture(t, authn, NewSccache)
+
+	// Seed one object so the exists-branch is reachable.
+	const key = "7/5/e/75e95ce7f187ebaca8ab13b24ef58f2cb6297c79d3bfe2d706c37670bf2be924"
+	if rec := putRaw(t, f.handler, "/cache/acme/widget/sccache/"+key,
+		bytes.NewReader([]byte("obj-bytes")), nil); rec.Code != http.StatusCreated {
+		t.Fatalf("seed PUT = %d, want 201", rec.Code)
+	}
+
+	cases := []struct {
+		name       string
+		target     string
+		want       int
+		collection bool // want <D:collection/> in the 207 body
+		length     bool // want <D:getcontentlength> in the 207 body
+	}{
+		{"trailing-slash dir is a collection", "/cache/acme/widget/sccache/7/5/e/", http.StatusMultiStatus, true, false},
+		{"mount root is a collection", "/cache/acme/widget/sccache/", http.StatusMultiStatus, true, false},
+		{"existing object is a FILE with a length", "/cache/acme/widget/sccache/" + key, http.StatusMultiStatus, false, true},
+		{"absent object is 404, never 400", "/cache/acme/widget/sccache/.sccache_check", http.StatusNotFound, false, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			f.handler.ServeHTTP(rec, httptest.NewRequest(methodPropfind, tc.target, nil))
+
+			if rec.Code != tc.want {
+				t.Fatalf("PROPFIND %s = %d, want %d", tc.target, rec.Code, tc.want)
+			}
+
+			body := rec.Body.String()
+
+			if got := strings.Contains(body, "<D:collection/>"); got != tc.collection {
+				t.Errorf("PROPFIND %s: collection marker = %v, want %v:\n%s", tc.target, got, tc.collection, body)
+			}
+
+			if got := strings.Contains(body, "<D:getcontentlength>"); got != tc.length {
+				t.Errorf("PROPFIND %s: getcontentlength = %v, want %v:\n%s", tc.target, got, tc.length, body)
+			}
+		})
 	}
 }
