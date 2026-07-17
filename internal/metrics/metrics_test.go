@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -337,4 +338,81 @@ func counterValue(t *testing.T, m *Metrics, name string, want map[string]string)
 	}
 
 	return 0
+}
+
+// TestResponseRecorderImplementsFlushReadFromHijack disarms a landmine before it is
+// ever armed. metrics.HTTPMiddleware's recorder is mounted only inside /api/v1 today,
+// so the gRPC/websocket demux never reaches it -- but if it is ever hoisted above the
+// public mux, a recorder missing these methods is silently catastrophic:
+//
+//   - grpc.Server.ServeHTTP does a BARE `w.(http.Flusher)` assertion (no Unwrap, no
+//     ResponseController) and HTTP 500s every gRPC call at once without Flush.
+//   - net/http's sendfile fast path on /cache GETs is only taken when the writer
+//     exposes io.ReaderFrom; without it every multi-GB download degrades to a 32 KiB
+//     userspace copy.
+//   - a WebSocket upgrade needs http.Hijacker to detach the connection.
+//
+// The assertion is on the recorder's OWN type, not on a middleware round-trip, because
+// that is exactly what grpc-go asserts against.
+func TestResponseRecorderImplementsFlushReadFromHijack(t *testing.T) {
+	var w http.ResponseWriter = &responseRecorder{ResponseWriter: httptest.NewRecorder()}
+
+	if _, ok := w.(http.Flusher); !ok {
+		t.Error("responseRecorder does not implement http.Flusher -- grpc.Server.ServeHTTP " +
+			"500s every call without it")
+	}
+
+	if _, ok := w.(io.ReaderFrom); !ok {
+		t.Error("responseRecorder does not implement io.ReaderFrom -- the sendfile fast path " +
+			"on /cache GETs degrades to a 32 KiB userspace copy without it")
+	}
+
+	if _, ok := w.(http.Hijacker); !ok {
+		t.Error("responseRecorder does not implement http.Hijacker -- a WebSocket upgrade " +
+			"cannot detach the connection without it")
+	}
+}
+
+// TestResponseRecorderFlushReadFromForward proves the three methods are not inert
+// stubs: each must forward to the wrapped writer. A recorder that satisfies the
+// interfaces but drops the calls is worse than one that lacks them -- it lies.
+func TestResponseRecorderFlushReadFromForward(t *testing.T) {
+	inner := &recordingWriter{ResponseWriter: httptest.NewRecorder()}
+	rec := &responseRecorder{ResponseWriter: inner, status: http.StatusOK}
+
+	rec.Flush()
+
+	if !inner.flushed {
+		t.Error("Flush did not forward to the wrapped writer")
+	}
+
+	n, err := rec.ReadFrom(strings.NewReader("hello bakery"))
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+
+	if n != int64(len("hello bakery")) {
+		t.Errorf("ReadFrom reported %d bytes, want %d", n, len("hello bakery"))
+	}
+
+	if !inner.readFrom {
+		t.Error("ReadFrom did not forward to the wrapped writer's io.ReaderFrom fast path")
+	}
+}
+
+// recordingWriter is a ResponseWriter that also implements Flusher and ReaderFrom, so a
+// test can prove the recorder forwards to them rather than swallowing the call.
+type recordingWriter struct {
+	http.ResponseWriter
+
+	flushed  bool
+	readFrom bool
+}
+
+func (w *recordingWriter) Flush() { w.flushed = true }
+
+func (w *recordingWriter) ReadFrom(src io.Reader) (int64, error) {
+	w.readFrom = true
+
+	return io.Copy(w.ResponseWriter, src)
 }

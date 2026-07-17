@@ -33,7 +33,10 @@
 package metrics
 
 import (
+	"bufio"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -175,6 +178,11 @@ type Metrics struct {
 	// takes closed Go types. hashserv.go explains why an exported CounterVec here
 	// would be a cardinality hole.
 	hashserv hashservCollectors
+
+	// bazel. UNEXPORTED, reached through Metrics.Bazel. The REAPI backend routes CAS
+	// and AC bytes through blob.Service and so gets the headline series for free;
+	// these are the ones blob.Service cannot know about. See bazel.go.
+	bazel bazelCollectors
 }
 
 // httpBuckets start at 100us. prometheus' DefBuckets start at 5ms, which would
@@ -290,6 +298,7 @@ func New() *Metrics {
 		}),
 
 		hashserv: newHashservCollectors(f),
+		bazel:    newBazelCollectors(f),
 	}
 }
 
@@ -440,6 +449,68 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 
 	return n, nil
 }
+
+// Flush, ReadFrom and Hijack keep this recorder transparent to the fast paths and the
+// escape hatches, mirroring middleware/logging.go's recorder. They are disarmed here
+// even though this recorder is mounted ONLY inside /api/v1 today (metrics.HTTPMiddleware
+// never sits above the gRPC/websocket demux):
+//
+//   - Flush: grpc.Server.ServeHTTP does a BARE `w.(http.Flusher)` type assertion -- no
+//     Unwrap, no http.NewResponseController -- and HTTP 500s a writer that lacks it. If
+//     this recorder is ever hoisted above the public mux without Flush, EVERY gRPC call
+//     500s at once. The landmine is invisible until then, so it is defused now.
+//   - ReadFrom: net/http's *response implements io.ReaderFrom (zero-copy sendfile from an
+//     *os.File); http.ServeContent only takes that path when the destination it is handed
+//     exposes ReadFrom. Wrapping the writer without re-exposing it degrades every multi-GB
+//     /cache download to a 32 KiB userspace copy.
+//   - Hijack: what a WebSocket upgrade needs to detach the connection.
+func (r *responseRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (r *responseRecorder) ReadFrom(src io.Reader) (int64, error) {
+	if !r.wrote {
+		r.status = http.StatusOK
+		r.wrote = true
+	}
+
+	if rf, ok := r.ResponseWriter.(io.ReaderFrom); ok {
+		n, err := rf.ReadFrom(src)
+		if err != nil {
+			return n, fmt.Errorf("read from source: %w", err)
+		}
+
+		return n, nil
+	}
+
+	// No fast path: copy through Write so the status bookkeeping still holds. writerOnly
+	// hides ReadFrom so io.Copy cannot rediscover it on this recorder and recurse.
+	n, err := io.Copy(writerOnly{r}, src)
+	if err != nil {
+		return n, fmt.Errorf("copy response: %w", err)
+	}
+
+	return n, nil
+}
+
+func (r *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := r.ResponseWriter.(http.Hijacker); ok {
+		conn, rw, err := hj.Hijack()
+		if err != nil {
+			return nil, nil, fmt.Errorf("hijack connection: %w", err)
+		}
+
+		return conn, rw, nil
+	}
+
+	return nil, nil, http.ErrNotSupported
+}
+
+// writerOnly hides every method of the wrapped value except Write, so io.Copy cannot
+// rediscover ReadFrom on the recorder and recurse back into it.
+type writerOnly struct{ io.Writer }
 
 // knownMethods is an allow-list, not a formality. See the note on
 // Metrics.HTTPDuration.

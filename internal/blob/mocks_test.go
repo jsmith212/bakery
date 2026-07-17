@@ -93,6 +93,54 @@ func (f *fakeReader) StatObject(
 	return row, nil
 }
 
+// StatObjectsBatch is the ExistsBatch probe. It counts as ONE query no matter how
+// many keys it is handed -- that is the whole point of the batch, and counting per
+// key would silently defeat the db/batch gates. It returns only the keys that exist,
+// exactly as the SQL does.
+func (f *fakeReader) StatObjectsBatch(
+	ctx context.Context, arg repository.StatObjectsBatchParams,
+) ([]repository.StatObjectsBatchRow, error) {
+	f.queries.Add(1)
+
+	if f.entered != nil {
+		f.entered <- struct{}{}
+	}
+
+	if f.gate != nil {
+		select {
+		case <-f.gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	if f.latency > 0 {
+		time.Sleep(f.latency)
+	}
+
+	if f.err != nil {
+		return nil, f.err
+	}
+
+	out := make([]repository.StatObjectsBatchRow, 0, len(arg.Keys))
+
+	for _, k := range arg.Keys {
+		row, ok := f.rows[k]
+		if !ok {
+			continue
+		}
+
+		out = append(out, repository.StatObjectsBatchRow{
+			Key:       k,
+			Digest:    row.Digest,
+			SizeBytes: row.SizeBytes,
+			UpdatedAt: row.UpdatedAt,
+		})
+	}
+
+	return out, nil
+}
+
 // add seeds one object.
 func (f *fakeReader) add(key string, digest []byte, size int64) {
 	f.rows[key] = repository.StatObjectRow{

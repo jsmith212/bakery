@@ -56,7 +56,7 @@ func TestBootEndToEnd(t *testing.T) {
 			},
 			Version: "test",
 			Dist:    testDist(),
-			Ready: func(public, metricsAddr net.Addr) {
+			Ready: func(public, _, metricsAddr net.Addr) {
 				ready <- [2]string{public.String(), metricsAddr.String()}
 			},
 		})
@@ -274,7 +274,7 @@ func TestBootRefusesASecondInstance(t *testing.T) {
 			},
 			Version: "test",
 			Dist:    testDist(),
-			Ready:   func(_, _ net.Addr) { ready <- struct{}{} },
+			Ready:   func(_, _, _ net.Addr) { ready <- struct{}{} },
 		})
 	}()
 
@@ -354,7 +354,7 @@ func TestBootRejectsAnUnusableStorageDir(t *testing.T) {
 			Version: "test",
 			Dist:    testDist(),
 			// If Boot ever binds a listener with this storage dir, it validated nothing.
-			Ready: func(_, _ net.Addr) { ready <- struct{}{} },
+			Ready: func(_, _, _ net.Addr) { ready <- struct{}{} },
 		})
 	}()
 

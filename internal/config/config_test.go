@@ -116,6 +116,13 @@ func TestServeCmdDefaults(t *testing.T) {
 		t.Errorf("MetricsAddr default = %q, want 127.0.0.1:9090 -- /metrics must not default to a public bind", got)
 	}
 
+	// The Bazel REAPI listener defaults to loopback, like metrics: an operator opts into a
+	// public bind by setting the flag. Empty would disable it; a non-empty loopback default
+	// keeps `bakery serve` speaking REAPI locally out of the box.
+	if got := cli.Serve.GRPCAddr; got != "127.0.0.1:9092" {
+		t.Errorf("GRPCAddr default = %q, want 127.0.0.1:9092", got)
+	}
+
 	if cli.Serve.Headless {
 		t.Error("Headless defaults to true; the console should be served unless asked otherwise")
 	}

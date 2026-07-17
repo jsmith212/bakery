@@ -127,7 +127,9 @@ internal/
 
 ### Listener topology
 
-**One port.** `h2c.NewHandler` wrapping a content-type demux (`application/grpc` + `ProtoMajor == 2` → gRPC server, else the HTTP mux). Not `cmux` (unmaintained, tangles graceful shutdown); not `connect-go` (moon speaks *real* gRPC with streaming ByteStream — don't bet the primary protocol on "should work"). Escape hatch: `--grpc-addr` to split gRPC onto its own listener if the shared path bottlenecks. `/metrics` on a **separate** `--metrics-addr` — serving it publicly leaks project names and sizes.
+**~~One port.~~ SUPERSEDED by M4 (see "M4 as landed").** The plan was `h2c.NewHandler` wrapping a content-type demux. Empirical spikes killed it: `grpc.Server.ServeHTTP` has an unimplemented `Drain`, so `GracefulStop` panics on the shared path when an RPC is in flight; and a shared h2c port lets an ingress silently break the M3 hashserv WebSocket (coder/websocket can't serve WS-over-HTTP/2). **gRPC now serves on a DEDICATED `--grpc-addr` listener** (a third listener beside public + metrics), which is where `GracefulStop` actually drains. `/metrics` on a **separate** `--metrics-addr` — serving it publicly leaks project names and sizes. Three listeners, three protocols; all bind before any serves, and if one dies all come down.
+
+hashserv is a WebSocket upgrade on the **public** mux (same TLS + ingress + `Authorization`). Raw TCP stays behind an off-by-default flag. Note the deployment constraint the dedicated gRPC listener creates: the public port stays HTTP/1.1 (so hashserv survives), and REAPI clients take an explicit `grpc://host:port` endpoint — the tenant still rides in the REAPI `instance_name = "{org}/{project}"`, so the addressing scheme is unchanged; only the port moves.
 
 hashserv is a WebSocket upgrade on the shared mux (so it gets the same TLS + ingress + `Authorization` header). Raw TCP stays behind an off-by-default flag.
 
@@ -173,7 +175,7 @@ Each is independently shippable and leaves the tree green.
 - **M1.5 — Hybrid role model. ✅ DONE** (see "M1.5 as landed" below). ([spec](specs/2026-07-12-hybrid-role-model.md)) M1 derives site *and* org roles purely from OIDC group claims, which forces a group-per-org into the directory and leaves a freshly-created org unusable by its own creator. M1.5 splits the one group lookup that was answering three questions into four planes: a **login gate** (`login_groups`, independent of org mapping — empty admits any successful OIDC auth), a **hybrid site role**, **hybrid org membership** (claims *and* in-app grants, effective role `greatest(oidc, local)` computed by the database), and **project roles in-app only**. Org creation grants the creator a local owner role. Fail-closed moves from *"no orgs ⇒ refuse"* to *"an **unreadable** groups claim ⇒ refuse and reconcile nothing"* — empty is not unreadable, and only the former is safe to act on. Also fixes `RevokeAPIKeysForMembership`, which has never worked (pgx cannot encode an enum array without the type registered on the pool). **Lands before the SPA→API wiring wave**, which depends on its membership screens.
 - **M2 — Yocto sstate + downloads. ✅ DONE** (see "M2 as landed" below). `httpblob` + two Policies + `bakery sstate push`. First thing a user can actually point bitbake at.
 - **M3 — hashserv. ✅ DONE** (see "M3 as landed" below). ([spec](specs/2026-07-13-m3-hashserv.md)) WebSocket-only, framing-first, one writer goroutine per connection, auth denied in-band. Upstream bitbake's own hashserv suite **and** the real `bitbake-hashclient` both run against Bakery in CI, and the gate earned its keep on day one — it caught a real divergence the design review had not.
-- **M4 — Bazel REAPI (gRPC) + `/ac` `/cas` HTTP.** Ships moon, ccache, and sccache together.
+- **M4 — Bazel REAPI (gRPC) + `/ac` `/cas` `/sccache` HTTP. ✅ DONE** (see "M4 as landed" below). Ships moon (gRPC), Bazel (gRPC + HTTP), ccache and sccache together.
 - **M5 — Docker OCI pull-through proxy.** Byte-exact manifests, stale-while-revalidate, own 401 challenge.
 - **M6 — GC, retention, quotas + UI polish.** (The GC *write barrier* and refcount tests land with M1, not here.)
 
@@ -399,6 +401,48 @@ only gives you one:**
 
 **What M3 did NOT build:** raw TCP/unix transports, the GC and user-admin RPCs (above), `get-stats` /
 `reset-stats`, and the SPA screen for hashserv config (the backend CRUD API already covers it).
+
+### M4 as landed
+
+`internal/cache/bazel/` — the REAPI backend: four gRPC services (Capabilities, ActionCache,
+ContentAddressableStorage, ByteStream) on a **dedicated `--grpc-addr` listener**, plus the HTTP `/ac`
+and `/cas` mounts it owns and delegates to `httpblob`. It implements `cache.GRPCBackend`
+(`RegisterGRPC(*grpc.Server)` — the concrete type, because ByteStream's legacy genproto codegen demands
+it). One `bazel` `cache_backends` row serves all of it; `sccache` is a fifth `httpblob` mount in its own
+namespace. Ships **moon (gRPC default), Bazel (gRPC + HTTP), ccache (`@layout=bazel`, plaintext + bearer
+token), and sccache (WebDAV)**.
+
+**The design was settled by two research waves (13 source-reading agents) and six empirical Go spikes
+against the repo's pinned deps** — the spikes overturned the pre-implementation plan on three points, and
+the correction table lives in the durable rulings (scratch `SPIKE-final.md` / the workflow journals).
+Every load-bearing decision is now a CLAUDE.md invariant. Highlights:
+
+- **Listener topology reversed** (see above): one-port h2c → dedicated listener. `GracefulStop` panics on
+  the `ServeHTTP` path; a shared h2c port silently breaks M3 hashserv. Both proven with real programs.
+- **The `/ac` namespace is SPLIT** into `ac` (opaque HTTP) and `ac-grpc` (typed gRPC), because moon uses
+  the same action digest over both transports with different encodings — sharing is a hard client error.
+- **`/cas` needs `cache_objects` rows** (a pure `blobs` lookup is a cross-tenant existence oracle and a
+  GC-eats-it-immediately bug). `blob.ExistsBatch` (one `key = ANY($n::text[])` query) answers the
+  `FindMissingBlobs` storm; the CAS PUT skip-ingest kills the redundant-PUT storm (the inverse of the
+  sstate HEAD storm) while keeping the body drain except on `Expect: 100-continue`.
+- **GetCapabilities is a gate**: `update_enabled=true`, `max_batch_total_size_bytes=4 MiB` (never 0),
+  IDENTITY-only compressors, api 2.0–2.3 — three silent-catastrophe fields, each with a named regression
+  test. No zstd, no `GetTree`/`Execute`, no AC completeness check (a SHOULD, and forbidden by `/ac`
+  opacity — it becomes the M6 GC ordering constraint above), no inlining.
+
+**The CI gate** (`just bazel-conformance`, wired into `image.needs`) has three clients: the
+`remote-apis-sdks` Go client (all 8 RPCs over a real gRPC listener — runs everywhere), and real `ccache`
+and `sccache` (which assert a **write** round-trips, because the sccache failure mode is a silently
+read-only backend). It also fixed a **shipped M2/M3 bug found during the research**: the SPA catch-all
+answered unrouted `/cache/…` and `/v2/…` GETs with `200 + index.html` (a poisoned cache hit); now they
+404 (its own commit, ahead of the feature).
+
+**What M4 did NOT build:** zstd / `compressed-blobs` (Unimplemented; IDENTITY-only — both clients default
+compression off), a `--grpc-addr`-less shared-port mode, the AC completeness check, inlined
+stdout/stderr, `cache_objects.accessed_at` (an M6 call), moon in the CI gate (a manual `moon` run is in
+the DoD; `just moon-conformance` is a followup), and the SPA snippet wiring (the endpoint grows to
+moon/ccache/sccache/bazel; the screen still renders mock data — and the snippet's gRPC endpoint still
+assumes a single-ingress host, which the SPA-wiring wave must resolve).
 
 ---
 

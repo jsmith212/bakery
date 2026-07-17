@@ -10,16 +10,28 @@ import (
 	"net/http"
 	"time"
 
+	"google.golang.org/grpc"
+
 	"github.com/jsmith212/bakery/internal/api"
 	"github.com/jsmith212/bakery/internal/auth"
 	"github.com/jsmith212/bakery/internal/blob"
 	"github.com/jsmith212/bakery/internal/cache"
+	"github.com/jsmith212/bakery/internal/cache/bazel"
 	"github.com/jsmith212/bakery/internal/cache/hashserv"
 	"github.com/jsmith212/bakery/internal/cache/httpblob"
 	"github.com/jsmith212/bakery/internal/config"
 	"github.com/jsmith212/bakery/internal/db"
 	"github.com/jsmith212/bakery/internal/metrics"
 	"github.com/jsmith212/bakery/internal/storage"
+)
+
+const (
+	// grpcMaxMsgSize is 4x the advertised max_batch_total_size_bytes (4 MiB). moon's
+	// worst-case BatchUpdateBlobs at B=4 MiB is 4,097,613 bytes -- inside grpc-go's 4 MiB
+	// default by only 2.3%, which is not a margin. 16 MiB gives real headroom for both the
+	// recv (BatchUpdateBlobs) and send (BatchReadBlobs) directions without risking the
+	// 64 MiB ceiling moon's own max_decoding_message_size imposes.
+	grpcMaxMsgSize = 16 << 20
 )
 
 const (
@@ -45,9 +57,9 @@ type BootParams struct {
 	// not the embedder's business.
 	Dist fs.FS
 
-	// Ready is called once both listeners are bound, with the addresses they got.
+	// Ready is called once all three listeners are bound, with the addresses they got.
 	// See Config.Ready: it is how a caller that asked for port 0 learns its port.
-	Ready func(public, metricsAddr net.Addr)
+	Ready func(public, grpcAddr, metricsAddr net.Addr)
 }
 
 // bootstrapMaxConns sizes the bootstrap pool: one connection pinned by BootLock
@@ -221,10 +233,40 @@ func Boot(ctx context.Context, p BootParams) error {
 			"upstream is ignored")
 	}
 
+	// M4: the Bazel REAPI. bazel.New OWNS the /ac and /cas httpblob mounts (it constructs
+	// them internally); sccache is a sibling httpblob backend on its own WebDAV route and
+	// namespace. Both are cache.Backends and mount in headless mode too -- "no console" is
+	// not "no cache". The bazel backend ALSO implements cache.GRPCBackend, which the loop
+	// below detects and registers on the gRPC server.
+	//
+	// The gRPC server is constructed unconditionally so RegisterGRPC always runs; the
+	// listener that serves it only binds when --grpc-addr is non-empty (see server.New).
+	grpcSrv := grpc.NewServer(
+		grpc.MaxRecvMsgSize(grpcMaxMsgSize),
+		grpc.MaxSendMsgSize(grpcMaxMsgSize),
+	)
+
 	cacheBackends := []cache.Backend{
 		httpblob.NewSstate(cacheDeps, routes, authn),
 		httpblob.NewDownloads(cacheDeps, routes, authn),
 		hashserv.New(cacheDeps, routes, hashservAuth{svc: authSvc}, store, upstreams),
+		bazel.New(cacheDeps, routes, authn, bazelAuth{svc: authSvc}),
+		httpblob.NewSccache(cacheDeps, routes, authn),
+	}
+
+	// Any backend that speaks gRPC registers its services here. Today only bazel does; the
+	// loop is the seam so a future gRPC backend needs no boot change. A registration
+	// failure is a wrapped boot error, never a panic -- a half-registered gRPC server is
+	// not a state we serve from.
+	for _, backend := range cacheBackends {
+		gb, ok := backend.(cache.GRPCBackend)
+		if !ok {
+			continue
+		}
+
+		if err := gb.RegisterGRPC(grpcSrv); err != nil {
+			return fmt.Errorf("register grpc backend %q: %w", backend.Kind(), err)
+		}
 	}
 
 	// Background maintenance. Both are tied to ctx, so they stop when the server
@@ -235,6 +277,7 @@ func Boot(ctx context.Context, p BootParams) error {
 	log.Info("bakery ready",
 		"version", p.Version,
 		"address", cmd.Addr(),
+		"grpc", cmd.GRPCAddr,
 		"metrics", cmd.MetricsAddr,
 		"headless", cmd.Headless,
 		"console", !cmd.Headless,
@@ -245,6 +288,8 @@ func Boot(ctx context.Context, p BootParams) error {
 		Addr:          cmd.Addr(),
 		Version:       p.Version,
 		MetricsAddr:   cmd.MetricsAddr,
+		GRPC:          grpcSrv,
+		GRPCAddr:      cmd.GRPCAddr,
 		Dist:          p.Dist,
 		Headless:      cmd.Headless,
 		API:           apiSrv.Handler(),
@@ -281,6 +326,18 @@ func (a cacheAuth) AuthenticateCache(ctx context.Context, r *http.Request) (http
 type hashservAuth struct{ svc *auth.Service }
 
 func (a hashservAuth) AuthenticateToken(ctx context.Context, token string) (hashserv.Principal, error) {
+	return a.svc.AuthenticateToken(ctx, token)
+}
+
+// bazelAuth adapts *auth.Service to bazel.Authenticator. Same pure type-widening delegate
+// as hashservAuth: the REAPI credential arrives in gRPC "authorization" metadata, not an
+// *http.Request, so the gRPC handlers need AuthenticateToken (the same constant-time,
+// zero-join, index-only key probe the Basic path runs), widened from auth.Principal to
+// bazel's narrow CanReadProject/CanWriteProject surface. The /ac and /cas HTTP mounts the
+// bazel backend owns keep using cacheAuth (AuthenticateCache) -- this is only for gRPC.
+type bazelAuth struct{ svc *auth.Service }
+
+func (a bazelAuth) AuthenticateToken(ctx context.Context, token string) (bazel.Principal, error) {
 	return a.svc.AuthenticateToken(ctx, token)
 }
 
