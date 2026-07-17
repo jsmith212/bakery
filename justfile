@@ -163,6 +163,32 @@ hashserv-conformance: generate
     fi; \
     echo "hashserv-conformance: bitbake own suite + the real bitbake-hashclient ran green" '
 
+# Drive the REAL Bazel REAPI (remote-apis-sdks) + real ccache + real sccache at the M4 backends (a skip FAILS)
+bazel-conformance: generate
+  # M4's gate, and it has THREE clients. Client 1 is the remote-apis-sdks Go client (a
+  # test-only dep) driving all eight cache RPCs over a real gRPC listener -- it needs no
+  # external binary, so it runs everywhere dbtest can reach a database. Clients 2 and 3 are
+  # the REAL ccache and sccache binaries against the /ac and sccache WebDAV mounts: the
+  # recorder proves ccache hit /ac and NEVER /cas, and that sccache did PROPFIND-then-PUT
+  # (the silently-read-only trap opendal falls into when the collection probe fails).
+  #
+  # Not in `just test-db` (which globs ./internal/...): the ccache/sccache halves legitimately
+  # skip on a laptop with no client installed. This recipe is their home, and CI installs
+  # ccache + sccache -- so a skip here means a real client did not run, which is a failure.
+  #
+  # bash + pipefail (not `sh`): with `sh` the exit status of `go test | tee` is TEE's, so a
+  # failing suite would report as a pass -- the same trap `test-db`, `conformance` and
+  # `hashserv-conformance` document.
+  mkdir -p build
+  bash -euo pipefail -c ' \
+    go test -v -count=1 -timeout 20m ./test/bazel/... 2>&1 | tee build/bazel-conformance.log; \
+    if grep -q -- "--- SKIP" build/bazel-conformance.log; then \
+      grep -- "--- SKIP" build/bazel-conformance.log; \
+      echo "FAIL: the bazel conformance suite SKIPPED -- a real client did not run. Ensure docker or TEST_DB_URL, ccache, sccache and a C compiler (cc)."; \
+      exit 1; \
+    fi; \
+    echo "bazel-conformance: remote-apis-sdks + the real ccache and sccache ran green" '
+
 # Run the race detector
 race: web generate
   go test -race ./...

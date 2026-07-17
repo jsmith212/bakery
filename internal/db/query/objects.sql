@@ -21,6 +21,26 @@ SELECT digest, size_bytes, updated_at
   FROM cache_objects
  WHERE backend_id = $1 AND namespace = $2 AND key = $3;
 
+-- The BATCH probe: REAPI FindMissingBlobs asks "which of these N digests do you
+-- have" in ONE RPC, and moon repeats a digest within a single request. This turns
+-- the whole question into ONE round-trip and ONE index scan on cache_objects_pkey
+-- (backend_id, namespace, key = ANY(...)) -- not N StatObject probes, which would
+-- put the FindMissingBlobs storm straight onto Postgres.
+--
+-- Returns ONLY the keys that exist. Every requested key ABSENT from the result is a
+-- miss, and blob.Service negative-caches it -- a cold moon build has every digest
+-- missing, so a positive-only fill re-queries every digest on every request.
+--
+-- key = ANY($3::text[]): text[] is a BUILTIN, so pgx encodes a plain []string with
+-- NO AfterConnect registration (unlike the enum arrays in internal/db/enums.go).
+--
+-- name: StatObjectsBatch :many
+SELECT key, digest, size_bytes, updated_at
+  FROM cache_objects
+ WHERE backend_id = $1
+   AND namespace  = $2
+   AND key = ANY(sqlc.arg(keys)::text[]);
+
 -- Step 1 of the blob.Service PUT transaction, and step 1 of the GC's physical
 -- delete. Both take the SAME lock, keyed on the DIGEST rather than on a row --
 -- which is the point, because the row is exactly what may not exist yet. Without

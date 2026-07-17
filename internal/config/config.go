@@ -312,6 +312,16 @@ type ServeCmd struct {
 	// Exposing it has to be an explicit act.
 	MetricsAddr string `default:"127.0.0.1:9090" env:"METRICS_ADDR" help:"Address for the private metrics listener."`
 
+	// A THIRD listener, for the M4 Bazel REAPI (gRPC): Bazel and moon speak
+	// Capabilities/ActionCache/CAS/ByteStream here, never on the public mux. It is its
+	// own listener on purpose, not a demux of the public port: grpc-go's ServeHTTP
+	// transport has no Drain, so GracefulStop panics on a shared port (and only under
+	// load), and a shared h2 port would put the hashserv WebSocket at the mercy of an
+	// ingress flipped to h2c -- see the invariant in server.Run. Empty disables the
+	// REAPI listener entirely, exactly as an empty MetricsAddr disables metrics.
+	// Loopback by default; set 0.0.0.0:PORT to accept remote Bazel/moon clients.
+	GRPCAddr string `default:"127.0.0.1:9092" env:"GRPC_ADDR" help:"Address for the Bazel REAPI gRPC listener. Empty disables it." name:"grpc-addr"`
+
 	// API + metrics, no SPA. For a deployment that fronts the console elsewhere, or
 	// does not want one.
 	Headless bool `env:"HEADLESS" help:"Serve the API and metrics but not the web console."`

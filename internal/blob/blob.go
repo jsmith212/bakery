@@ -233,9 +233,17 @@ type PutResult struct {
 // to assert "an LRU hit issues ZERO Postgres queries" -- the single most important
 // property in M1.
 //
-// *db.Store satisfies it.
+// *db.Store satisfies it -- it embeds *repository.Queries, so widening this
+// interface by a generated method costs the production type nothing.
 type Reader interface {
 	StatObject(ctx context.Context, arg repository.StatObjectParams) (repository.StatObjectRow, error)
+
+	// StatObjectsBatch is the ExistsBatch hot path: REAPI FindMissingBlobs asks
+	// about N keys in one RPC, and this answers them in ONE query. It returns only
+	// the keys that exist; a requested key absent from the result is a miss.
+	StatObjectsBatch(
+		ctx context.Context, arg repository.StatObjectsBatchParams,
+	) ([]repository.StatObjectsBatchRow, error)
 }
 
 // Txer is the WRITE half. It hands the closure a *repository.Queries REBOUND ONTO
@@ -282,6 +290,7 @@ type Service struct {
 	// Resolved once: WithLabelValues costs ~95 ns on the hot path, which is most of
 	// an LRU hit.
 	qStat       counter
+	qStatBatch  counter
 	qLock       counter
 	qGetWrite   counter
 	qRevive     counter
@@ -330,6 +339,7 @@ func New(cfg Config) (*Service, error) {
 		recs:        make(map[recKey]*metrics.Recorder),
 		lru:         newLRU(m, size),
 		qStat:       m.DBQueries.WithLabelValues("StatObject"),
+		qStatBatch:  m.DBQueries.WithLabelValues("StatObjectsBatch"),
 		qLock:       m.DBQueries.WithLabelValues("LockBlobDigest"),
 		qGetWrite:   m.DBQueries.WithLabelValues("GetBlobForWrite"),
 		qRevive:     m.DBQueries.WithLabelValues("CreateOrReviveBlob"),
@@ -525,6 +535,149 @@ func (s *Service) statDB(ctx context.Context, ref Ref, ck []byte) (Meta, error) 
 	s.lru.putIfUnchanged(ck, meta, seq)
 
 	return meta, nil
+}
+
+// ExistsBatch answers REAPI FindMissingBlobs: "which of these do you have?", asked
+// about N keys in ONE RPC. The result is POSITIONALLY ALIGNED with refs -- out[i] is
+// the answer for refs[i] -- because Bazel and moon repeat a digest WITHIN a single
+// request; the dedup happens INTERNALLY (on the query and the LRU fills), never in
+// the returned slice.
+//
+// It is the batch sibling of Exists and holds the same two properties: an LRU hit
+// issues zero queries, and every miss is negative-cached. The negative cache is not
+// optional here -- a cold moon build has EVERY digest missing, so a positive-only
+// fill would re-query all of them on every FindMissingBlobs.
+//
+// It deliberately does NOT use singleflight. Singleflight collapses N callers onto
+// ONE key; this is ONE caller with N keys, so per-key flights would serialize the
+// batch and buy nothing. Two concurrent batches with overlapping keys cost two
+// queries, not 2N, and both land through putIfUnchanged, so neither can corrupt the
+// other's fills.
+func (s *Service) ExistsBatch(ctx context.Context, refs []Ref) ([]bool, error) {
+	out := make([]bool, len(refs))
+	if len(refs) == 0 {
+		return out, nil
+	}
+
+	// One FindMissingBlobs = one instance_name = one backend_id + namespace, so every
+	// ref shares a Recorder; recKey is a comparable struct, so this memo probe
+	// allocates nothing even though we take it per RPC.
+	rec := s.recorder(refs[0])
+
+	// The residue is the set of LRU misses, grouped by (backend_id, namespace) -- in
+	// practice exactly one group -- and deduped within a group by key. Each pending
+	// remembers the out[] indices that asked for the key, and the shard write
+	// generation captured BEFORE the round trip.
+	type groupKey struct {
+		backendID int64
+		namespace string
+	}
+
+	type pending struct {
+		ck      []byte // a COPY: the scan reuses one stack buffer for appendCacheKey
+		seq     uint64
+		indices []int
+	}
+
+	groups := map[groupKey]map[string]*pending{}
+
+	var buf [512]byte
+
+	for i, ref := range refs {
+		ck := ref.appendCacheKey(buf[:0])
+
+		if meta, ok := s.lru.get(ck); ok {
+			out[i] = meta.Exists
+
+			continue
+		}
+
+		gk := groupKey{backendID: ref.BackendID, namespace: ref.Namespace}
+
+		byKey := groups[gk]
+		if byKey == nil {
+			byKey = map[string]*pending{}
+			groups[gk] = byKey
+		}
+
+		p := byKey[ref.Key]
+		if p == nil {
+			// CAPTURE seq PER KEY, BEFORE the query. Each key hashes to its own shard and
+			// each shard carries its own generation, so this is per key, never once for
+			// the batch. putIfUnchanged then drops the fill if an authoritative put/del
+			// bumped that shard while we were in flight -- so a stale batch read can never
+			// clobber a concurrent Put's positive entry (a permanent 404 from memory).
+			p = &pending{ck: append([]byte(nil), ck...), seq: s.lru.seq(ck)}
+			byKey[ref.Key] = p
+		}
+
+		p.indices = append(p.indices, i)
+	}
+
+	for gk, byKey := range groups {
+		keys := make([]string, 0, len(byKey))
+		for k := range byKey {
+			keys = append(keys, k)
+		}
+
+		// ONCE PER QUERY, not per key -- that is what keeps bakery_db_queries_total
+		// honest and makes the db/batch gate meaningful. In practice one group => one
+		// increment for the whole FindMissingBlobs.
+		s.qStatBatch.Inc()
+
+		rows, err := s.reader.StatObjectsBatch(ctx, repository.StatObjectsBatchParams{
+			BackendID: gk.backendID,
+			Namespace: gk.namespace,
+			Keys:      keys,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("stat objects batch: %w", err)
+		}
+
+		// The query returns ONLY the keys that exist. Fill those positive.
+		present := make(map[string]struct{}, len(rows))
+
+		for _, row := range rows {
+			present[row.Key] = struct{}{}
+
+			p := byKey[row.Key]
+			if p == nil {
+				continue // a key we did not ask about; ignore it defensively
+			}
+
+			d, err := storage.KeyFromBytes(row.Digest)
+			if err != nil {
+				return nil, fmt.Errorf("decode stored digest: %w", err)
+			}
+
+			meta := Meta{Exists: true, Digest: d, Size: row.SizeBytes, UpdatedAt: row.UpdatedAt.Time}
+			s.lru.putIfUnchanged(p.ck, meta, p.seq)
+
+			for _, i := range p.indices {
+				out[i] = true
+			}
+		}
+
+		// Every requested key ABSENT from the result is a MISS, and it MUST be
+		// negative-cached -- out[i] is already false, but the LRU must learn it or the
+		// next FindMissingBlobs re-queries every missing digest.
+		for k, p := range byKey {
+			if _, ok := present[k]; ok {
+				continue
+			}
+
+			meta := Meta{Exists: false, Digest: Digest{}, Size: 0, UpdatedAt: time.Time{}}
+			s.lru.putIfUnchanged(p.ck, meta, p.seq)
+		}
+	}
+
+	// Positionally observe hit/miss, mirroring Exists. out[] is fully resolved now, so
+	// duplicated refs are each counted -- the RPC really did ask about each position.
+	for i := range refs {
+		rec.Observe(metrics.OpExists, result(out[i]))
+	}
+
+	return out, nil
 }
 
 // --- reads ------------------------------------------------------------------

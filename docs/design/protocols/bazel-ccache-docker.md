@@ -33,9 +33,13 @@ remote:
 | Service | RPCs | Notes |
 |---|---|---|
 | `Capabilities` | `GetCapabilities` | **Called on connect. Hard requirement.** |
-| `ActionCache` | `GetActionResult`, `UpdateActionResult` | `digest_function: SHA256`, `inline_stdout/stderr = true` |
+| `ActionCache` | `GetActionResult`, `UpdateActionResult` | `digest_function: SHA256`, `inline_stdout/stderr = true` (⚠️ but see below) |
 | `ContentAddressableStorage` | `FindMissingBlobs`, `BatchReadBlobs`, `BatchUpdateBlobs` | **`GetTree` is never called** |
-| `google.bytestream.ByteStream` | `Read`, `Write` | **`QueryWriteStatus` is never called** |
+| `google.bytestream.ByteStream` | `Read`, `Write` | `QueryWriteStatus` (⚠️ Bazel DOES call it — see below) |
+
+**⚠️ CORRECTION — `QueryWriteStatus` "is never called" is true of moon, NOT of Bazel.** Bazel calls it on a **retried upload**. The conclusion (respond `Unimplemented`) survives — but for a **different reason** than the doc implies: `Unimplemented` is what Bazel *supports* as "no resumable upload", whereas the spec's own answer, `NOT_FOUND`, turns a resumable upload into a **failed** one. So do not "fix" it to `NOT_FOUND`. There is no resumable-upload primitive in `storage` and M4 must not invent one.
+
+**⚠️ CORRECTION — inline `stdout`/`stderr`/`OutputFile.contents` are HINTS; M4 does zero inlining and is conformant.** The server MAY ignore them and the client falls back to a CAS download (`RemoteExecutionService.java:1318-1341`). If a client *uploads* an `ActionResult` that already carries them, **store it verbatim** — never rewrite an ActionResult we did not author. (moon sets `inline_stdout/stderr = true` on every lookup and treats an oversized `Code::OutOfRange` response as a **silent miss**, so if you ever DO inline, cap it — unbounded inlining yields a cache that looks healthy and never hits.)
 
 Behavioral details that are load-bearing:
 
@@ -44,7 +48,7 @@ Behavioral details that are load-bearing:
 - moon partitions batches against our advertised `max_batch_total_size_bytes`.
 - `GetActionResult` → `NOT_FOUND` = miss. `OUT_OF_RANGE` also treated as a miss.
 - `BatchReadBlobs` per-blob `status`: `OK`/`NOT_FOUND` tolerated; anything else logs a warning and drops the blob.
-- **ByteStream upload chunk size = 1 MiB**; final chunk carries `finish_write: true`. moon validates `committed_size == digest.size` **or `-1`** for uncompressed writes.
+- **ByteStream upload chunk size = 1 MiB**; final chunk carries `finish_write: true`. moon validates `committed_size == digest.size` **or `-1`** for uncompressed writes. **⚠️ CORRECTION — `committed_size = -1` is COMPRESSED-ONLY for Bazel.** On an uncompressed write that ran to `finish_write`, Bazel accepts **only** `committed_size == the bytes it streamed` and otherwise throws `IOException("write incomplete")` (`ByteStreamUploader.java:262-295`). moon happens to also accept `-1`, so a moon-only test passes and Bazel breaks. On a normal uncompressed write return the exact size; `-1` is reserved for the duplicate-upload/compressed race, and even then only moon tolerates it.
 - zstd is negotiated separately per path: `supported_compressors` gates ByteStream `compressed-blobs`; `supported_batch_update_compressors` gates `BatchUpdateBlobs`. moon compresses at **zstd level 1**.
 
 ### 1.3 GetCapabilities — what a cache-only server must return
@@ -54,10 +58,10 @@ Behavioral details that are load-bearing:
   CacheCapabilities: &repb.CacheCapabilities{
     DigestFunctions:               []repb.DigestFunction_Value{repb.DigestFunction_SHA256},
     ActionCacheUpdateCapabilities: &repb.ActionCacheUpdateCapabilities{UpdateEnabled: true}, // REQUIRED
-    MaxBatchTotalSizeBytes:        4 << 20,  // 4 MiB — the de facto value (gRPC's default msg limit)
+    MaxBatchTotalSizeBytes:        4 << 20,  // 4 MiB — MUST be non-zero; NOT "just the default" (see ⚠️)
     SymlinkAbsolutePathStrategy:   repb.SymlinkAbsolutePathStrategy_ALLOWED,
-    SupportedCompressors:            []repb.Compressor_Value{repb.Compressor_IDENTITY, repb.Compressor_ZSTD},
-    SupportedBatchUpdateCompressors: []repb.Compressor_Value{repb.Compressor_IDENTITY, repb.Compressor_ZSTD},
+    SupportedCompressors:            []repb.Compressor_Value{repb.Compressor_IDENTITY}, // IDENTITY only (see ⚠️)
+    SupportedBatchUpdateCompressors: []repb.Compressor_Value{repb.Compressor_IDENTITY}, // IDENTITY only
   },
   ExecutionCapabilities: &repb.ExecutionCapabilities{
     DigestFunction: repb.DigestFunction_SHA256,
@@ -69,6 +73,12 @@ Behavioral details that are load-bearing:
 ```
 
 If `action_cache_update_capabilities.update_enabled` is not `true`, clients never call `UpdateActionResult` and the cache stays empty forever.
+
+**⚠️ CORRECTION — `MaxBatchTotalSizeBytes` is a CORRECTNESS switch, not "the de facto default".** It must be **non-zero and ≤ 64 MiB**. moon partitions every batch against the value **we** advertise; at `0` (which proto3 cannot distinguish from unset), moon's `create_batches` takes `chunk_into_batches`, which **never sets `stream: true`** and ignores blob size — a modest 504-blob task then goes out as a single ~48 MiB `BatchUpdateBlobs`, exceeding grpc-go's 4 MiB default and returning `RESOURCE_EXHAUSTED`, which moon **misreports to the user as "out of storage space"**. Advertise **4 MiB** and set grpc-go `MaxRecvMsgSize`/`MaxSendMsgSize` to 16 MiB (4× headroom). The 64 MiB ceiling is hard: moon builds its client with `max_decoding_message_size(64MB)`, so a larger `B` makes moon unable to decode its own `BatchReadBlobs` response. **[SRC]** moon `helpers.rs:173-183,275-280`; `grpc_remote_storage.rs:535-539`.
+
+**⚠️ CORRECTION — `SupportedCompressors` / `SupportedBatchUpdateCompressors` advertise `IDENTITY` ONLY; drop `ZSTD`.** Advertising a compressor **obliges us to serve it**, in two incompatible framings (ByteStream = one continuous frame split at arbitrary block boundaries because Bazel never sets `setCloseFrameOnFlush`; `BatchUpdateBlobs` = one one-shot frame per blob via `zstd::encode_all`), plus the compressed `write_offset` mongrel and the 9-byte empty-zstd-frame case — and a half-correct zstd path **corrupts blobs under a valid digest**, strictly worse than not offering it. Both clients default compression **off**; a moon user who sets `compression: 'zstd'` gets one warning and a working uncompressed cache, a Bazel user who sets `--remote_cache_compression` gets a loud, self-explaining connection error. Any `compressed-blobs/` resource name → `codes.Unimplemented`. zstd is its own milestone with its own test matrix. **[SRC]** `RemoteServerCapabilities.java:243-247`; moon `falls_back_to_identity_when_compression_unsupported`.
+
+**⚠️ CORRECTION — `ExecEnabled: false` is right, but the whole `ExecutionCapabilities` message is best omitted.** The proto's own guidance: *"CAS + Action Cache only endpoints should return `CacheCapabilities`"* (`remote_execution.proto:569-579`). Client behaviour is identical either way.
 
 ### 1.4 ByteStream resource_name — the parsing trap
 
@@ -174,9 +184,12 @@ CCACHE_REMOTE_STORAGE='http://bakery/cache/acme/proj|layout=bazel|read-only=true
 
 The URL path prefix is preserved verbatim (ccache appends `/` if absent — no trailing-slash requirement).
 
-### 2.4 sccache — free
+### 2.4 sccache
 
-`SCCACHE_WEBDAV_ENDPOINT` + `SCCACHE_WEBDAV_TOKEN`/`_USERNAME`/`_PASSWORD`. "WebDAV" in name only — it needs `PUT`, not `PROPFIND`. sccache's own docs list ccache's HTTP backend and Bazel Remote Caching as compatible backends.
+`SCCACHE_WEBDAV_ENDPOINT` + `SCCACHE_WEBDAV_KEY_PREFIX` (required) + `SCCACHE_WEBDAV_TOKEN`/`_USERNAME`/`_PASSWORD`.
+
+**⚠️ CORRECTION — sccache is NOT "plain GET/PUT", and it is NOT on the `/ac/` mount.** The earlier claim ("WebDAV in name only — it needs `PUT`, not `PROPFIND`") is **false and dangerous**. sccache v0.16.0's WebDAV mode is opendal 0.55 (`webdav.rs` is 45 lines wrapping `services::Webdav`), whose `write()` calls `webdav_mkcol(get_parent(path))` **before every write** — and `webdav_mkcol` is a `PROPFIND` loop (`opendal backend.rs:250-258`, `core.rs:301-331`). So **every sccache write is PROPFIND(s) → MKCOL(s) → PUT.** A 405/400 on the PROPFIND maps to `ErrorKind::Unexpected` (`error.rs:29-41`), which sccache's `check()` swallows into `can_write = false` → `CacheMode::ReadOnly` for the **whole process** (`cache.rs:283-297`, `server.rs:471-493`): reads work perfectly, writes never happen, the cache never populates, one stderr line. This is M4's hashserv-401 trap.
+Nor does it use `/ac/`: `normalize_key` shards **every** key — `format!("{}/{}/{}/{}", &key[0..1], &key[1..2], &key[2..3], &key)` (`sccache/src/cache/utils.rs:20-22`) — so the real path is `{endpoint}/{key_prefix}/a/b/c/<64-hex>`. It needs its OWN route (`/cache/{org}/{proj}/sccache/{path...}`, literal `sccache` segment) answering **PROPFIND** and **MKCOL**, in its own namespace. **`SCCACHE_WEBDAV_KEY_PREFIX` is required** and was omitted from the config in `client-config.md`. sccache's own docs list ccache's HTTP backend and Bazel Remote Caching as compatible backends.
 
 ### 2.5 ⇒ The design consequence
 

@@ -257,6 +257,75 @@ jobs:
           name: hashserv-conformance-log
           path: build/hashserv-conformance.log
 
+  # M4's gate. Three clients: the remote-apis-sdks Go client driving all eight REAPI cache
+  # RPCs over a real gRPC listener (no external binary -- runs everywhere dbtest reaches a
+  # database), and the REAL ccache and sccache binaries against the /ac and sccache WebDAV
+  # mounts. The recorder proves ccache hit /ac and never /cas, and that sccache did
+  # PROPFIND-then-PUT (the silently-read-only trap).
+  #
+  # A SEPARATE job from `build`, like `conformance` and `hashserv-conformance`: it needs
+  # ccache + sccache + a C compiler that `build` has no use for. It runs through
+  # `just bazel-conformance`, where a skip FAILS -- a gate that skips itself and reports
+  # green is the one outcome worse than having no gate.
+  bazel-conformance:
+    runs-on: ubuntu-latest
+
+    # Same postgres service as the other jobs: dbtest uses TEST_DB_URL and never touches
+    # Docker, so the ephemeral database the backends boot against is this service.
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --health-start-period 10s
+
+    env:
+      TEST_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - uses: extractions/setup-just@v3
+
+      # ccache from apt; sccache from its release binary (apt has no reliable sccache). No
+      # setup action for sccache -- mozilla-actions/sccache-action exports SCCACHE_GHA_*
+      # into the environment, which the suite's own sccache server would inherit and prefer
+      # over the WebDAV backend under test. A bare binary on PATH leaves the env clean.
+      # ubuntu-latest already ships gcc/cc, so the compiler the wrappers invoke is present.
+      - name: Install ccache and sccache
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache
+          sccache_version=v0.8.2
+          curl -fsSL "https://github.com/mozilla/sccache/releases/download/${sccache_version}/sccache-${sccache_version}-x86_64-unknown-linux-musl.tar.gz" | tar -xz
+          sudo install "sccache-${sccache_version}-x86_64-unknown-linux-musl/sccache" /usr/local/bin/sccache
+          ccache --version
+          sccache --version
+
+      - name: Bazel conformance (remote-apis-sdks + the real ccache and sccache; a skip fails the job)
+        run: just bazel-conformance
+
+      - name: Upload the bazel conformance log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bazel-conformance-log
+          path: build/bazel-conformance.log
+
   commit:
     runs-on: ubuntu-latest
     steps:
@@ -272,7 +341,7 @@ jobs:
 
     # hashserv-conformance is in this list, and that is the point of having written it: a
     # gate that runs, goes red, and still lets the image push to ghcr.io gates nothing.
-    needs: [build, check, commit, conformance, hashserv-conformance]
+    needs: [build, check, commit, conformance, hashserv-conformance, bazel-conformance]
 
     permissions:
       contents: read

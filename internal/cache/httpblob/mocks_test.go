@@ -45,6 +45,31 @@ func (f *fakeReader) StatObject(
 	return row, nil
 }
 
+// StatObjectsBatch widens fakeReader to blob.Reader (which grew this method for the
+// REAPI ExistsBatch path). This backend does not exercise it, so it just answers
+// honestly from the same map -- returning only the keys that exist.
+func (f *fakeReader) StatObjectsBatch(
+	_ context.Context, arg repository.StatObjectsBatchParams,
+) ([]repository.StatObjectsBatchRow, error) {
+	out := make([]repository.StatObjectsBatchRow, 0, len(arg.Keys))
+
+	for _, k := range arg.Keys {
+		row, ok := f.rows[k]
+		if !ok {
+			continue
+		}
+
+		out = append(out, repository.StatObjectsBatchRow{
+			Key:       k,
+			Digest:    row.Digest,
+			SizeBytes: row.SizeBytes,
+			UpdatedAt: row.UpdatedAt,
+		})
+	}
+
+	return out, nil
+}
+
 func (f *fakeReader) add(key string, digest storage.Key, size int64) {
 	f.rows[key] = repository.StatObjectRow{
 		Digest:    digest.Bytes(),

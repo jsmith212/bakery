@@ -144,7 +144,7 @@ func TestDualListenerLifecycle(t *testing.T) {
 		MetricsAddr: "127.0.0.1:0",
 		Dist:        testDist(),
 		Metrics:     m,
-		Ready: func(public, metricsAddr net.Addr) {
+		Ready: func(public, _, metricsAddr net.Addr) {
 			ready <- [2]string{public.String(), metricsAddr.String()}
 		},
 	})

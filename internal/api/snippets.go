@@ -48,7 +48,32 @@ type SnippetRequest struct {
 // SnippetTool is the set of tools the generator can target. It is a closed set so an
 // unknown tool is a 422 at request time, not an empty snippet a user pastes and
 // wonders why nothing is cached.
-const SnippetToolYocto = "yocto"
+//
+// yocto is the M2 default (sstate + downloads share one local.conf); moon, ccache,
+// sccache and bazel arrive with M4. Every M4 client writes to the cache itself, so
+// none of them carries a push -- PushCommands is empty for all four.
+const (
+	SnippetToolYocto   = "yocto"
+	SnippetToolMoon    = "moon"
+	SnippetToolCcache  = "ccache"
+	SnippetToolSccache = "sccache"
+	SnippetToolBazel   = "bazel"
+)
+
+// snippetTools is the closed set, in the order the 422 message lists them.
+var snippetTools = []string{
+	SnippetToolYocto, SnippetToolMoon, SnippetToolCcache, SnippetToolSccache, SnippetToolBazel,
+}
+
+func knownSnippetTool(tool string) bool {
+	for _, t := range snippetTools {
+		if t == tool {
+			return true
+		}
+	}
+
+	return false
+}
 
 // SnippetResponse is the generated snippet plus the key it embeds.
 //
@@ -80,11 +105,38 @@ type SnippetResponse struct {
 
 	// PushCommands are the `bakery sstate push` / `bakery downloads push` invocations
 	// that populate the mirror after a build -- bitbake has no upload path, so this is
-	// the write path.
+	// the write path. YOCTO-ONLY: every M4 client writes to the cache itself, so this
+	// is empty for moon/ccache/sccache/bazel.
 	PushCommands []string `json:"push_commands"`
+
+	// Files are the config FILES an M4 tool needs written to disk (moon's
+	// .moon/workspace.yml, ccache's ccache.conf, bazel's .bazelrc). omitempty so the
+	// yocto response -- which uses LocalConf instead -- is byte-identical to M2's.
+	Files []SnippetFile `json:"files,omitempty"`
+
+	// Env are the environment variables an M4 tool needs exported (moon's
+	// BAKERY_TOKEN, sccache's SCCACHE_WEBDAV_* trio). THIS is where the secret lives
+	// for the tools that carry it out-of-band; putting the token in the file where its
+	// NAME belongs silently disables moon's cache. omitempty for the same reason.
+	Env []SnippetEnvVar `json:"env,omitempty"`
 
 	// APIKey is the freshly-minted key, INCLUDING the plaintext token exactly once.
 	APIKey CreatedAPIKey `json:"api_key"`
+}
+
+// SnippetFile is a config file the UI renders in a mono block with a copy button and
+// a "write this to <path>" caption. Language is a syntax hint for the highlighter.
+type SnippetFile struct {
+	Path     string `json:"path"`
+	Language string `json:"language"`
+	Content  string `json:"content"`
+}
+
+// SnippetEnvVar is a single `export NAME=value`. The UI renders these as a shell
+// block; for moon and sccache the credential lives here, not in the file.
+type SnippetEnvVar struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
 // handleGenerateSnippet mints a project-scoped key and returns a ready-to-paste client
@@ -111,8 +163,9 @@ func (a *API) handleGenerateSnippet(w http.ResponseWriter, r *http.Request) erro
 		tool = SnippetToolYocto
 	}
 
-	if tool != SnippetToolYocto {
-		return errValidation("tool", `tool must be "yocto"`)
+	if !knownSnippetTool(tool) {
+		return errValidation("tool",
+			`tool must be one of "yocto", "moon", "ccache", "sccache", "bazel"`)
 	}
 
 	scopeStr := req.Scope
@@ -160,6 +213,8 @@ func (a *API) handleGenerateSnippet(w http.ResponseWriter, r *http.Request) erro
 	scheme, host := externalOrigin(r)
 	baseURL := fmt.Sprintf("%s://%s/cache/%s/%s", scheme, host, s.OrgSlug, s.ProjectSlug)
 
+	content := buildSnippet(tool, scheme, host, baseURL, s.OrgSlug, s.ProjectSlug, key.Token, keyScope)
+
 	created := CreatedAPIKey{
 		APIKey: APIKey{
 			ID: uuidString(row.ID), Name: row.Name, ProjectID: uuidString(row.ProjectID),
@@ -175,13 +230,169 @@ func (a *API) handleGenerateSnippet(w http.ResponseWriter, r *http.Request) erro
 		Tool:         tool,
 		Host:         hostOnly(host),
 		BaseURL:      baseURL,
-		LocalConf:    yoctoLocalConf(baseURL),
-		Netrc:        netrcLine(hostOnly(host), key.Token),
-		PushCommands: yoctoPushCommands(s.OrgSlug, s.ProjectSlug, key.Token),
+		LocalConf:    content.localConf,
+		Netrc:        content.netrc,
+		PushCommands: content.pushCommands,
+		Files:        content.files,
+		Env:          content.env,
 		APIKey:       created,
 	})
 
 	return nil
+}
+
+// snippetContent is the tool-specific half of a SnippetResponse. yocto populates the
+// localConf/netrc/pushCommands trio; the M4 tools populate files/env. Exactly one
+// shape is filled -- the two are mutually exclusive by tool.
+type snippetContent struct {
+	localConf    string
+	netrc        string
+	pushCommands []string
+	files        []SnippetFile
+	env          []SnippetEnvVar
+}
+
+// buildSnippet routes to the per-tool builder. tool is already validated against the
+// closed set, so the default is unreachable; it returns an empty content rather than
+// panicking. scheme/host are the resolved external origin (host MAY carry a port);
+// baseURL is scheme://host/cache/{org}/{project}; scope gates ccache's read-only line.
+func buildSnippet(tool, scheme, host, baseURL, org, project, token string, scope auth.Scope) snippetContent {
+	switch tool {
+	case SnippetToolMoon:
+		return moonSnippet(scheme, host, org, project, token)
+	case SnippetToolCcache:
+		return ccacheSnippet(host, org, project, token, scope)
+	case SnippetToolSccache:
+		return sccacheSnippet(baseURL, token)
+	case SnippetToolBazel:
+		return bazelSnippet(scheme, host, org, project, token)
+	default: // yocto
+		return snippetContent{
+			localConf:    yoctoLocalConf(baseURL),
+			netrc:        netrcLine(hostOnly(host), token),
+			pushCommands: yoctoPushCommands(org, project, token),
+		}
+	}
+}
+
+// grpcEndpoint builds a gRPC endpoint URL with an EXPLICIT port, for moon's
+// remote.host and bazel's --remote_cache. tonic (moon) and Bazel both require the
+// authority to carry a port, so hostOnly -- which strips it -- is the wrong helper
+// here: when the request host has no port we supply the scheme default (443 for TLS,
+// 80 otherwise). https maps to grpcs, http to grpc.
+//
+// ASSUMPTION, and a known limitation: this derives the gRPC authority from the HTTP
+// request's external origin, i.e. it assumes gRPC is reachable at the SAME host:port
+// as the console (a single TLS-terminating ingress that muxes both). But M4 serves
+// REAPI on a DEDICATED listener (--grpc-addr, default 127.0.0.1:9092), so an operator
+// who exposes gRPC on a distinct port or host gets a snippet pointing at the wrong
+// place -- and moon silently disables its cache rather than erroring. This is
+// tolerable ONLY because the SPA snippet screen is still mock-data (SPA wiring is
+// out of M4 scope): nothing live calls this yet. The SPA-wiring milestone that turns
+// this on MUST resolve the external gRPC endpoint (a PUBLIC_GRPC_ENDPOINT override,
+// or a documented single-ingress contract) before shipping the snippet UI.
+func grpcEndpoint(scheme, host string) string {
+	grpcScheme, defaultPort := "grpc", "80"
+	if scheme == "https" {
+		grpcScheme, defaultPort = "grpcs", "443"
+	}
+
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		host = net.JoinHostPort(host, defaultPort)
+	}
+
+	return grpcScheme + "://" + host
+}
+
+// moonSnippet builds .moon/workspace.yml + the BAKERY_TOKEN export.
+//
+// TWO traps, both silent: (1) auth.token is the NAME of an env var, never the token
+// -- moon reads the named variable and, if it is empty, disables the remote cache
+// with no error; putting the token where the name goes is that same silent failure.
+// So the token is ABSENT from the yaml and lives only in Env. (2) the host needs a
+// scheme AND a port (grpc/grpcs is HTTP/2-only and tonic demands the port). We
+// advertise IDENTITY only, so compression is 'none' -- 'zstd' would earn a fallback
+// warning against a cache that cannot serve it.
+func moonSnippet(scheme, host, org, project, token string) snippetContent {
+	yaml := strings.Join([]string{
+		"remote:",
+		"  api: 'grpc'",
+		fmt.Sprintf("  host: '%s'", grpcEndpoint(scheme, host)),
+		"  auth:",
+		"    token: 'BAKERY_TOKEN'   # the NAME of an env var, NOT the token itself",
+		"  cache:",
+		fmt.Sprintf("    instanceName: '%s/%s'   # the project selector for gRPC", org, project),
+		"    compression: 'none'",
+	}, "\n") + "\n"
+
+	return snippetContent{
+		files: []SnippetFile{{Path: ".moon/workspace.yml", Language: "yaml", Content: yaml}},
+		env:   []SnippetEnvVar{{Name: "BAKERY_TOKEN", Value: token}},
+	}
+}
+
+// ccacheSnippet builds ~/.config/ccache/ccache.conf.
+//
+// Four traps: (1) @layout=bazel is MANDATORY -- the default subdirs layout writes to
+// /<ab>/<cdef...>, a path Bakery does not route, so every GET 404s and the first PUT
+// 404 latches the whole backend (reads included) off for that translation unit.
+// (2) http:// ONLY -- ccache's built-in HTTP backend has no https scheme and refuses
+// the URL before it opens a connection; TLS termination in front does not help.
+// (3) the userinfo MUST carry a colon: ccache's URL ctor throws on a bare user with
+// no password, so the token is the username and the password is empty
+// (`bkry_...:`) -- and AuthenticateCache's password-then-username fallback is what
+// makes that authenticate. (4) @connect-timeout=1000 -- the default is 100ms, too
+// tight for a real network. For a read-scoped key we add read-only=true so ccache
+// never issues the PUT that a 403 would latch the backend on.
+func ccacheSnippet(host, org, project, token string, scope auth.Scope) snippetContent {
+	line := fmt.Sprintf("remote_storage = http://%s:@%s/cache/%s/%s @layout=bazel @connect-timeout=1000",
+		token, host, org, project)
+
+	if scope == auth.ScopeRead {
+		line += " @read-only=true"
+	}
+
+	content := "# ccache cannot speak https: this backend is plaintext HTTP only.\n" + line + "\n"
+
+	return snippetContent{
+		files: []SnippetFile{{Path: "~/.config/ccache/ccache.conf", Language: "ini", Content: content}},
+	}
+}
+
+// sccacheSnippet builds sccache's WebDAV environment.
+//
+// SCCACHE_WEBDAV_KEY_PREFIX is REQUIRED (sccache shards under it; without it the keys
+// land at a prefix Bakery does not serve). SCCACHE_WEBDAV_TOKEN becomes an
+// `Authorization: Bearer` header, which AuthenticateCache already accepts by
+// delegating to the Bearer arm of Authenticate -- no new server code. The endpoint is
+// https: sccache, unlike ccache, speaks TLS.
+func sccacheSnippet(baseURL, token string) snippetContent {
+	return snippetContent{
+		env: []SnippetEnvVar{
+			{Name: "SCCACHE_WEBDAV_ENDPOINT", Value: baseURL},
+			{Name: "SCCACHE_WEBDAV_KEY_PREFIX", Value: "sccache"},
+			{Name: "SCCACHE_WEBDAV_TOKEN", Value: token},
+		},
+	}
+}
+
+// bazelSnippet builds a .bazelrc block.
+//
+// The project rides in --remote_instance_name (gRPC cannot carry a URL path); the
+// credential rides in a --remote_header as `authorization: Bearer <token>`. There is
+// deliberately NO --remote_cache_compression: we advertise IDENTITY only, and Bazel
+// HARD-FAILS the connection (not degrades) if compression is set and zstd is not
+// advertised. host carries an explicit port for the same reason moon's does.
+func bazelSnippet(scheme, host, org, project, token string) snippetContent {
+	rc := strings.Join([]string{
+		fmt.Sprintf("build --remote_cache=%s", grpcEndpoint(scheme, host)),
+		fmt.Sprintf("build --remote_instance_name=%s/%s", org, project),
+		fmt.Sprintf("build --remote_header=authorization=Bearer %s", token),
+	}, "\n") + "\n"
+
+	return snippetContent{
+		files: []SnippetFile{{Path: ".bazelrc", Language: "bazelrc", Content: rc}},
+	}
 }
 
 // decodeSnippetRequest decodes an OPTIONAL body. An empty body is the common case --

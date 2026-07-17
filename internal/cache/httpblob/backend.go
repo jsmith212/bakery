@@ -6,12 +6,21 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/jsmith212/bakery/internal/blob"
 	"github.com/jsmith212/bakery/internal/cache"
 	"github.com/jsmith212/bakery/internal/db/repository"
+	"github.com/jsmith212/bakery/internal/metrics"
+)
+
+// WebDAV verbs are not in net/http's method constant set. sccache's opendal backend
+// speaks them; PROPFIND is gated as a read, MKCOL as a write.
+const (
+	methodPropfind = "PROPFIND"
+	methodMkcol    = "MKCOL"
 )
 
 // Principal is the NARROW capability surface the read/write handler needs. It is a
@@ -45,12 +54,19 @@ type RouteResolver interface {
 // by kind + Policy + the route shape (path... vs basename).
 type Backend struct {
 	kind   repository.BackendKind
-	seg    string // "sstate" | "downloads": the LITERAL 4th path segment
-	tail   string // "path" | "basename": the PathValue name of the key
+	seg    string // "sstate" | "downloads" | "ac" | "cas" | "sccache": the LITERAL 4th segment
+	tail   string // "path" | "basename" | "key": the PathValue name of the key
 	policy Policy
 	deps   cache.Deps
 	routes RouteResolver
 	authn  Authenticator
+
+	// recs memoizes the headline Recorder for THIS backend's one (org, project, backend,
+	// kind) tuple. Only the /cas skip-ingest no-op emits metrics from here (every other
+	// path routes through blob.Service, which owns the series); memoizing keeps that off
+	// WithLabelValues on the redundant-PUT storm. It may be nil on a hand-built Backend --
+	// recorder() falls back to Metrics.Recorder, so the skip path never nil-panics.
+	recs *metrics.RecorderCache
 }
 
 // NewSstate builds the sstate backend. Its key has slashes, so the route tail is
@@ -64,6 +80,7 @@ func NewSstate(deps cache.Deps, routes RouteResolver, authn Authenticator) *Back
 		deps:   deps,
 		routes: routes,
 		authn:  authn,
+		recs:   metrics.NewRecorderCache(deps.Metrics),
 	}
 }
 
@@ -78,19 +95,77 @@ func NewDownloads(deps cache.Deps, routes RouteResolver, authn Authenticator) *B
 		deps:   deps,
 		routes: routes,
 		authn:  authn,
+		recs:   metrics.NewRecorderCache(deps.Metrics),
+	}
+}
+
+// NewAC builds the bazel /ac action-cache backend: an OPAQUE, mutable byte store. ccache
+// @layout=bazel, moon api=http and Bazel --remote_cache=http:// all write here under a
+// single 64-hex segment, so the route tail is {key}. Kind is bazel; /ac, /cas and sccache
+// share ONE cache_backends row (one (org, project, bazel) route), which is also what lets
+// an /ac HTTP probe warm the gRPC route for free.
+func NewAC(deps cache.Deps, routes RouteResolver, authn Authenticator) *Backend {
+	return &Backend{
+		kind:   repository.BackendKindBazel,
+		seg:    "ac",
+		tail:   "key",
+		policy: ACPolicy,
+		deps:   deps,
+		routes: routes,
+		authn:  authn,
+		recs:   metrics.NewRecorderCache(deps.Metrics),
+	}
+}
+
+// NewCAS builds the bazel /cas content-addressed backend: key == sha256(body), verified
+// per request. Its key is a single 64-hex segment, so the tail is {key}.
+func NewCAS(deps cache.Deps, routes RouteResolver, authn Authenticator) *Backend {
+	return &Backend{
+		kind:   repository.BackendKindBazel,
+		seg:    "cas",
+		tail:   "key",
+		policy: CASPolicy,
+		deps:   deps,
+		routes: routes,
+		authn:  authn,
+		recs:   metrics.NewRecorderCache(deps.Metrics),
+	}
+}
+
+// NewSccache builds the sccache WebDAV backend. sccache shards its key into a/b/c/<hex>
+// subdirectories, so the route tail is {path...} (multi-segment) -- NOT a single {key},
+// and NOT the /ac mount three shipped docs claimed. Kind is bazel.
+func NewSccache(deps cache.Deps, routes RouteResolver, authn Authenticator) *Backend {
+	return &Backend{
+		kind:   repository.BackendKindBazel,
+		seg:    "sccache",
+		tail:   "path",
+		policy: SccachePolicy,
+		deps:   deps,
+		routes: routes,
+		authn:  authn,
+		recs:   metrics.NewRecorderCache(deps.Metrics),
 	}
 }
 
 // Kind reports the DB enum this backend serves. One backend per kind per project.
 func (b *Backend) Kind() repository.BackendKind { return b.kind }
 
-// Register mounts GET, HEAD and PUT on the shared mux.
+// Register mounts the backend's verbs on the shared mux, policy-driven: GET/HEAD/PUT
+// always, DELETE iff AllowDelete, PROPFIND/MKCOL iff WebDAV.
 //
-// The 4th segment ("sstate"/"downloads") is a LITERAL, which is the whole reason the
-// two backends coexist: a wildcard {kind} there alongside sstate's {path...} panics at
-// registration ("neither is more specific"). sstate's tail is {path...} because the
-// key contains slashes; downloads' is a single {basename}. Proven not to panic beside
-// GET /healthz, GET /readyz, the methodless /api/v1/ and the methodless SPA /.
+// The 4th segment ("sstate"/"downloads"/"ac"/"cas"/"sccache") is a LITERAL, which is the
+// whole reason the backends coexist: a wildcard {kind} there alongside sstate's {path...}
+// panics at registration ("neither is more specific"). A tail of {path...} is used for
+// slash-bearing keys (sstate, sccache's a/b/c/<hex>); ac/cas/downloads are a single
+// segment. Proven not to panic beside GET /healthz, GET /readyz, the methodless /api/v1/
+// and the methodless SPA /.
+//
+// The optional verbs are not optional to the clients that need them: an UNregistered
+// DELETE returns 405, and ccache treats that as a hard failure that latches its whole
+// backend off (reads included); an unregistered PROPFIND/MKCOL 405s opendal, and sccache
+// then goes silently read-only. Registering them is what keeps those failures
+// unrepresentable.
 func (b *Backend) Register(mux *http.ServeMux) {
 	pat := "/cache/{org}/{project}/" + b.seg + "/{" + b.tail + "}"
 	if b.tail == "path" {
@@ -100,6 +175,15 @@ func (b *Backend) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET "+pat, b.serve)
 	mux.HandleFunc("HEAD "+pat, b.serve)
 	mux.HandleFunc("PUT "+pat, b.serve)
+
+	if b.policy.AllowDelete {
+		mux.HandleFunc("DELETE "+pat, b.serve)
+	}
+
+	if b.policy.WebDAV {
+		mux.HandleFunc("PROPFIND "+pat, b.serve)
+		mux.HandleFunc("MKCOL "+pat, b.serve)
+	}
 }
 
 // serve is the whole handler. r.PathValue returns the DECODED key (sstate%3A... arrives
@@ -127,7 +211,10 @@ func (b *Backend) serve(w http.ResponseWriter, r *http.Request) {
 	ref := route.Ref(b.policy.Namespace, kind, key) // the ONLY sanctioned Ref constructor
 
 	switch r.Method {
-	case http.MethodHead, http.MethodGet:
+	case http.MethodHead, http.MethodGet, methodPropfind:
+		// PROPFIND is a READ: opendal probes the parent collection before every sccache
+		// write, and it must clear the same read gate as GET/HEAD so an auth-required
+		// mount challenges it identically.
 		if route.ReadAuthRequired {
 			// Reads collapse unauthenticated AND valid-but-unauthorized to 401 -- NEVER
 			// 403. BitBake retries a 403 as a full-body GET (turning the HEAD storm into
@@ -142,12 +229,19 @@ func (b *Backend) serve(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		if r.Method == methodPropfind {
+			b.servePropfind(w, r)
+
+			return
+		}
+
 		b.serveObject(w, r, ref)
 
-	case http.MethodPut:
+	case http.MethodPut, http.MethodDelete, methodMkcol:
 		// Writes ALWAYS require a key, regardless of ReadAuthRequired: an
 		// unauthenticated write path is a cache-poisoning vector, so even an open-read
-		// backend rejects an anonymous PUT.
+		// backend rejects an anonymous PUT. MKCOL and DELETE are writes too and share
+		// this gate.
 		//
 		// Auth/authz/grammar all run BEFORE the first read of r.Body (Classify above,
 		// authenticate+authorize here). Go's server emits 100-continue and starts
@@ -174,7 +268,14 @@ func (b *Backend) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		b.servePut(w, r, ref)
+		switch r.Method {
+		case http.MethodDelete:
+			b.serveDelete(w, r, ref)
+		case methodMkcol:
+			b.serveMkcol(w, r)
+		default:
+			b.servePut(w, r, ref)
+		}
 	}
 }
 
@@ -188,9 +289,69 @@ func (b *Backend) serve(w http.ResponseWriter, r *http.Request) {
 // MaxBytesReader ceiling here -- sstate objects are multi-GB; any cap must be a config
 // knob, not a hard-coded small limit.
 func (b *Backend) servePut(w http.ResponseWriter, r *http.Request, ref blob.Ref) {
+	verify := b.policy.Verify
+
+	if b.policy.VerifyFromKey != nil {
+		// /cas derives the body policy from THIS request's key: the digest the body must
+		// hash to. A malformed key is a client error -> 400, never a 500 -- and it runs
+		// before the body is read, so the client aborts its upload rather than the server
+		// swallowing a multi-GB body it will reject.
+		v, err := b.policy.VerifyFromKey(ref.Key)
+		if err != nil {
+			http.Error(w, "bad object key", http.StatusBadRequest) // 400
+
+			return
+		}
+
+		verify = v
+
+		// httpblob hashes the WIRE bytes. A Content-Encoding other than identity (a zstd
+		// body -- bazel-remote's extension) would hash the COMPRESSED bytes and fail
+		// VerifyDigest on legitimate traffic, surfacing as a misleading "digest mismatch".
+		// Reject it explicitly, and ONLY on the verifying path: /ac is opaque and stores
+		// whatever encoding the client sent, verbatim.
+		if enc := r.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
+			http.Error(w, "unsupported Content-Encoding on a verified upload", http.StatusBadRequest) // 400
+
+			return
+		}
+	}
+
+	if b.policy.SkipIngestIfPresent {
+		// /cas ONLY. An existing key provably names byte-identical content (Overwrite=no +
+		// digest-verified), so a redundant PUT is a semantic no-op. Probe Stat (LRU-backed,
+		// zero queries warm) and skip the staged write + fsync + sha256 + the whole PG
+		// transaction + the blobs-row rewrite + the self-eviction the full path would pay
+		// on the redundant-PUT storm.
+		meta, err := b.deps.Blobs.Stat(r.Context(), ref)
+		if err == nil && meta.Exists {
+			// KEEP THE DRAIN. An early 200 without draining turns a naive client's
+			// in-flight upload into an EPIPE: the spike proved the client then holds BOTH a
+			// 200 and a write error and may retry, bringing the storm back with extra steps.
+			// Skip the drain ONLY when the client asked to be told first
+			// (Expect: 100-continue), where Go answers with the final status and the body
+			// is never sent.
+			if !expects100Continue(r) {
+				_, _ = io.Copy(io.Discard, r.Body)
+			}
+
+			// This path never enters blob.Service.Put, so it must emit the dedup outcome
+			// itself -- otherwise the put/hit series and the bytes counter silently vanish
+			// for exactly the redundant-PUT storm they exist to measure. Identical labels
+			// to the full path (blob.Service also records put/hit on a dedup).
+			rec := b.recorder(ref)
+			rec.Observe(metrics.OpPut, metrics.ResultHit)
+			rec.AddBytes(metrics.OpPut, meta.Size)
+
+			w.WriteHeader(http.StatusOK) // idempotent no-op, identical to the full path's 200
+
+			return
+		}
+	}
+
 	res, err := b.deps.Blobs.Put(r.Context(), ref, r.Body, blob.PutOptions{
 		Overwrite: b.policy.Overwrite,
-		Verify:    b.policy.Verify,
+		Verify:    verify,
 	})
 
 	switch {
@@ -213,6 +374,24 @@ func (b *Backend) servePut(w http.ResponseWriter, r *http.Request, ref blob.Ref)
 		// HEAD/PUT race where another pusher won.
 		w.WriteHeader(http.StatusOK) // 200
 	}
+}
+
+// recorder returns the memoized headline Recorder for this backend's tuple. It is used
+// ONLY by the /cas skip-ingest no-op; the nil guard keeps a hand-built Backend (whose
+// recs is nil, and which never hits the skip path) from panicking.
+func (b *Backend) recorder(ref blob.Ref) *metrics.Recorder {
+	if b.recs == nil {
+		return b.deps.Metrics.Recorder(ref.Org, ref.Project, ref.Backend, ref.Kind)
+	}
+
+	return b.recs.Get(ref.Org, ref.Project, ref.Backend, ref.Kind)
+}
+
+// expects100Continue reports whether the client asked to be told the final status before
+// sending the body. Go answers a 100-continue expectation with the final status, so on
+// that path the body is never sent and there is nothing to drain.
+func expects100Continue(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Expect"), "100-continue")
 }
 
 // serveObject answers GET and HEAD for one resolved object.
