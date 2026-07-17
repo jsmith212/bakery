@@ -133,6 +133,18 @@ func NewHandler(cfg Config) http.Handler {
 		backend.Register(mux)
 	}
 
+	// Unrouted /cache/ and /v2/ paths are 404 in BOTH modes. Without this the methodless
+	// SPA "/" below swallows them and answers 200 + index.html -- a POISONED cache HIT for
+	// any HTTP cache client (ccache, sccache, moon, Bazel), and 200 + an EMPTY body on HEAD,
+	// which the sstate hot path forbids outright. Every backend pattern matches a strict
+	// subset of these prefixes, so registration does not panic and the real routes still win
+	// where they apply. Registered UNCONDITIONALLY: the bug IS the divergence between console
+	// and headless (headless already 404s via the mux default), so making them identical is
+	// the fix. r.Pattern here is the CONSTANT "/cache/" or "/v2/", so the Prometheus-label
+	// invariant (label on the pattern, never the URL) holds.
+	mux.Handle("/cache/", http.NotFoundHandler())
+	mux.Handle("/v2/", http.NotFoundHandler())
+
 	if !cfg.Headless {
 		// Registered WITHOUT a method verb. `GET /` alongside the methodless
 		// `/api/v1/` leaves ServeMux with two patterns where neither is more

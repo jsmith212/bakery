@@ -147,6 +147,100 @@ func TestCacheBackendsMountBesideEverything(t *testing.T) {
 	}
 }
 
+// TestUnroutedCachePathsAre404 pins the catch-all that keeps the methodless SPA `/` from
+// swallowing an unrouted /cache/... or /v2/... path.
+//
+// Without it, `mux.Handle("/", spaRoutes(...))` matches every path no backend claimed, so a
+// GET to a /cache/ key that no backend routes returns 200 + index.html -- a POISONED cache
+// HIT: ccache/sccache/moon read the console shell as a cache object and feed HTML into their
+// entry parser. Worse, a HEAD on such a path returns 200 with an EMPTY body, the exact thing
+// the shipped sstate invariant forbids ("misses return 404 ... never a 200 with an empty
+// body"), on the exact verb it was written for. The hole is invisible to every existing
+// cache test because they all assert on ROUTED paths, and headless mode 404s cleanly -- so
+// the bug lives only in the default (console) mode.
+//
+// The fix is `/cache/` and `/v2/` NotFoundHandlers, registered UNCONDITIONALLY (the bug IS
+// the divergence between console and headless; making them identical is the point). Every
+// backend pattern matches a strict subset of `/cache/`, so ServeMux does not panic and the
+// real routes still win where they apply -- proven by TestCacheBackendsMountBesideEverything
+// and the routed controls below.
+//
+// The assertions are on the BODY and the Content-Type, never the status alone: the SPA
+// answers 200 for everything, so a status-only check would go green for the wrong reason the
+// day someone "simplifies" the handler.
+func TestUnroutedCachePathsAre404(t *testing.T) {
+	backends := []cache.Backend{
+		stubBackend{kind: repository.BackendKindSstate, seg: "sstate", tail: "path"},
+		stubBackend{kind: repository.BackendKindDownloads, seg: "downloads", tail: "basename"},
+		stubBackend{kind: repository.BackendKindHashserv, seg: "hashserv", tail: ""},
+	}
+
+	// Every target's 4th segment is deliberately NOT a real backend kind (sstate, downloads,
+	// hashserv, and the future ac/cas/sccache), and the /v2/ ones are the OCI shape M5 has
+	// not landed -- so all of these stay unrouted across the milestones this test outlives.
+	cases := []struct {
+		name          string
+		method        string
+		target        string
+		routedControl bool // a real backend route: must 404 via its OWN pattern, not the catch-all
+	}{
+		{name: "ccache subdirs layout", method: http.MethodGet, target: "/cache/acme/widget/ab/cdef0123"},
+		{name: "ccache subdirs HEAD (the 200+empty-body case)", method: http.MethodHead, target: "/cache/acme/widget/ab/cdef0123"},
+		{name: "moon http-mode /status probe", method: http.MethodGet, target: "/cache/status"},
+		{name: "garbage kind segment", method: http.MethodGet, target: "/cache/acme/widget/nope/x"},
+		{name: "bare cache prefix", method: http.MethodGet, target: "/cache/acme"},
+		{name: "oci manifest (BuildKit shape, pre-M5)", method: http.MethodGet, target: "/v2/acme/widget/manifests/latest"},
+		{name: "oci blob (pre-M5)", method: http.MethodHead, target: "/v2/acme/widget/blobs/sha256:deadbeef"},
+
+		// Controls: a routed-but-unconfigured path must still 404, and it must reach the
+		// backend's own pattern (here the stub answers 418) -- proving the catch-all did not
+		// shadow the real routes.
+		{name: "routed sstate still reaches its backend", method: http.MethodGet, target: "/cache/acme/widget/sstate/x", routedControl: true},
+	}
+
+	for _, headless := range []bool{false, true} {
+		handler := NewHandler(Config{
+			Dist:          testDist(),
+			Headless:      headless,
+			API:           http.NotFoundHandler(),
+			CacheBackends: backends,
+		})
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.target, nil))
+
+				if tc.routedControl {
+					// The stub answers 418 on GET/HEAD/PUT; the point is it reached the
+					// backend, not the SPA and not the catch-all.
+					if rec.Code != http.StatusTeapot {
+						t.Errorf("headless=%v: %s %s = %d, want 418 (routed to backend)",
+							headless, tc.method, tc.target, rec.Code)
+					}
+
+					return
+				}
+
+				if rec.Code != http.StatusNotFound {
+					t.Errorf("headless=%v: %s %s = %d, want 404",
+						headless, tc.method, tc.target, rec.Code)
+				}
+
+				if body := rec.Body.String(); strings.Contains(body, "<title>bakery</title>") {
+					t.Errorf("headless=%v: %s %s returned the console shell -- a poisoned hit",
+						headless, tc.method, tc.target)
+				}
+
+				if ct := rec.Header().Get("Content-Type"); strings.HasPrefix(ct, "text/html") {
+					t.Errorf("headless=%v: %s %s served Content-Type %q -- a cache client would "+
+						"ingest HTML as a cache object", headless, tc.method, tc.target, ct)
+				}
+			})
+		}
+	}
+}
+
 // stubRoutes is a hashserv.RouteResolver. ok=false is "there is no cache_backends row for
 // this project and kind" -- the unconfigured backend.
 type stubRoutes struct {
