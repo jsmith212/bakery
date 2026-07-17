@@ -201,6 +201,35 @@ func (b *Backend) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The WebDAV verbs dispatch BEFORE Classify, because they name a COLLECTION, never
+	// an object key -- and the parent of a TOP-LEVEL key is the mount ROOT, an EMPTY
+	// {path...}. opendal PROPFINDs get_parent(path) before every write (sccache's own
+	// startup probe writes ".sccache_check" at the root), so the root path is ordinary
+	// wire traffic, not grammar abuse. Classify would 400 it -- and a non-2xx here does
+	// not fail loudly: opendal's check() swallows it into can_write=false and sccache
+	// runs the whole process silently read-only. The live-sccache gate caught exactly
+	// this. Neither handler builds a Ref; there is no object to name. The auth gates
+	// are the same ones GET and PUT clear.
+	switch r.Method {
+	case methodPropfind:
+		if !b.authorizeRead(w, r, route) {
+			return
+		}
+
+		b.servePropfind(w, r)
+
+		return
+
+	case methodMkcol:
+		if !b.authorizeWrite(w, r, route) {
+			return
+		}
+
+		b.serveMkcol(w, r)
+
+		return
+	}
+
 	kind, key, err := b.policy.Classify(decoded)
 	if err != nil {
 		http.Error(w, "bad object key", http.StatusBadRequest) // 400 -- traversal/bad grammar
@@ -211,72 +240,79 @@ func (b *Backend) serve(w http.ResponseWriter, r *http.Request) {
 	ref := route.Ref(b.policy.Namespace, kind, key) // the ONLY sanctioned Ref constructor
 
 	switch r.Method {
-	case http.MethodHead, http.MethodGet, methodPropfind:
-		// PROPFIND is a READ: opendal probes the parent collection before every sccache
-		// write, and it must clear the same read gate as GET/HEAD so an auth-required
-		// mount challenges it identically.
-		if route.ReadAuthRequired {
-			// Reads collapse unauthenticated AND valid-but-unauthorized to 401 -- NEVER
-			// 403. BitBake retries a 403 as a full-body GET (turning the HEAD storm into
-			// a GET storm), and 403 is a project-existence oracle. The short-circuit is
-			// load-bearing: on err != nil, p is nil and must not be dereferenced.
-			p, aerr := b.authn.AuthenticateCache(r.Context(), r)
-			if aerr != nil || !p.CanReadProject(route.OrgID, route.ProjectID) {
-				w.Header().Set("WWW-Authenticate", `Basic realm="bakery"`)
-				http.Error(w, "unauthorized", http.StatusUnauthorized) // 401
-
-				return
-			}
-		}
-
-		if r.Method == methodPropfind {
-			b.servePropfind(w, r)
-
+	case http.MethodHead, http.MethodGet:
+		if !b.authorizeRead(w, r, route) {
 			return
 		}
 
 		b.serveObject(w, r, ref)
 
-	case http.MethodPut, http.MethodDelete, methodMkcol:
-		// Writes ALWAYS require a key, regardless of ReadAuthRequired: an
-		// unauthenticated write path is a cache-poisoning vector, so even an open-read
-		// backend rejects an anonymous PUT. MKCOL and DELETE are writes too and share
-		// this gate.
-		//
+	case http.MethodPut, http.MethodDelete:
 		// Auth/authz/grammar all run BEFORE the first read of r.Body (Classify above,
 		// authenticate+authorize here). Go's server emits 100-continue and starts
 		// draining the body only on that first read, so an early 401/403/400 makes a
 		// well-behaved client abort a multi-GB upload instead of the server swallowing
 		// it.
-		p, aerr := b.authn.AuthenticateCache(r.Context(), r)
-		if aerr != nil {
-			// No/invalid credential -> 401. Same challenge the read path sends, so a
-			// client that netrc-authenticates a read authenticates a write identically.
-			w.Header().Set("WWW-Authenticate", `Basic realm="bakery"`)
-			http.Error(w, "unauthorized", http.StatusUnauthorized) // 401
-
+		if !b.authorizeWrite(w, r, route) {
 			return
 		}
 
-		if !p.CanWriteProject(route.OrgID, route.ProjectID) {
-			// Authenticated but not write-authorized (a read-scoped key, a reader role).
-			// 403 is CORRECT here and safe: the writer is the CLI, which never falls
-			// back to a GET on a 403, the caller named its own project (no oracle), and
-			// BitBake never issues a PUT at all.
-			http.Error(w, "forbidden", http.StatusForbidden) // 403
-
-			return
-		}
-
-		switch r.Method {
-		case http.MethodDelete:
+		if r.Method == http.MethodDelete {
 			b.serveDelete(w, r, ref)
-		case methodMkcol:
-			b.serveMkcol(w, r)
-		default:
-			b.servePut(w, r, ref)
+
+			return
 		}
+
+		b.servePut(w, r, ref)
 	}
+}
+
+// authorizeRead clears the READ gate, writing the response and returning false on a
+// denial. Reads are gated only when the backend row demands it -- and they collapse
+// unauthenticated AND valid-but-unauthorized to 401, NEVER 403: BitBake retries a 403
+// as a full-body GET (turning the HEAD storm into a GET storm), and 403 is a
+// project-existence oracle. The short-circuit is load-bearing: on err != nil, p is nil
+// and must not be dereferenced.
+func (b *Backend) authorizeRead(w http.ResponseWriter, r *http.Request, route cache.Route) bool {
+	if !route.ReadAuthRequired {
+		return true
+	}
+
+	p, err := b.authn.AuthenticateCache(r.Context(), r)
+	if err != nil || !p.CanReadProject(route.OrgID, route.ProjectID) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="bakery"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized) // 401
+
+		return false
+	}
+
+	return true
+}
+
+// authorizeWrite clears the WRITE gate, writing the response and returning false on a
+// denial. Writes ALWAYS require a write-scoped key, regardless of ReadAuthRequired: an
+// unauthenticated write path is a cache-poisoning vector, so even an open-read backend
+// rejects an anonymous PUT -- and MKCOL and DELETE are writes too. No/invalid
+// credential is 401 with the same challenge the read path sends (so a client that
+// netrc-authenticates a read authenticates a write identically); authenticated but not
+// write-authorized is 403, which is safe here: the writer never falls back to a GET on
+// a 403, the caller named its own project (no oracle), and BitBake never issues a PUT.
+func (b *Backend) authorizeWrite(w http.ResponseWriter, r *http.Request, route cache.Route) bool {
+	p, err := b.authn.AuthenticateCache(r.Context(), r)
+	if err != nil {
+		w.Header().Set("WWW-Authenticate", `Basic realm="bakery"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized) // 401
+
+		return false
+	}
+
+	if !p.CanWriteProject(route.OrgID, route.ProjectID) {
+		http.Error(w, "forbidden", http.StatusForbidden) // 403
+
+		return false
+	}
+
+	return true
 }
 
 // servePut streams the request body through blob.Service.Put. Dedup, refcount and the

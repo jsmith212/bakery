@@ -511,3 +511,43 @@ func between(s, openTag, closeTag string) string {
 
 	return s[i : i+j]
 }
+
+// TestWebDAVMountRootIsACollection is the regression fence for the bug the live sccache
+// run caught: opendal PROPFINDs get_parent(path) before EVERY write, and the parent of a
+// TOP-LEVEL key (sccache's own startup probe writes ".sccache_check" at the root) is the
+// MOUNT ROOT -- an EMPTY {path...}. Classify() validates object keys and 400s the empty
+// path, and a non-2xx there does not fail loudly: opendal's check() swallows it into
+// can_write=false and sccache runs the WHOLE process silently read-only. Reads keep
+// working, the cache never populates, and every dashboard looks healthy.
+//
+// So the WebDAV verbs must dispatch BEFORE Classify: they name a collection, never an
+// object, and every path -- including the root -- is an existing collection.
+func TestWebDAVMountRootIsACollection(t *testing.T) {
+	t.Parallel()
+
+	blobs := newTestBlobs(t)
+	authn := &fakeAuthenticator{principal: fakePrincipal{canWrite: true}}
+
+	mux := http.NewServeMux()
+	NewSccache(blobs.deps(), fakeResolver{route: bazelRoute(), found: true}, authn).Register(mux)
+
+	// The exact shape from the live failure: PROPFIND on the bare mount root.
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(methodPropfind, "/cache/acme/widget/sccache/", nil))
+
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("PROPFIND on the mount root = %d, want 207 (a 400 latches sccache read-only)", rec.Code)
+	}
+
+	if body := rec.Body.String(); !strings.Contains(body, "<D:collection/>") {
+		t.Errorf("root PROPFIND body missing the collection resourcetype:\n%s", body)
+	}
+
+	// MKCOL on the root must 201 for the same reason: any non-2xx is a failed write.
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(methodMkcol, "/cache/acme/widget/sccache/", nil))
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("MKCOL on the mount root = %d, want 201", rec.Code)
+	}
+}
