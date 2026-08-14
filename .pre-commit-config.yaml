@@ -4,8 +4,12 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0
     hooks:
+      # The OCI testdata is captured wire bytes whose sha256 is asserted verbatim
+      # (see testIndexDigest); a "fixed" trailing newline changes the digest.
       - id: trailing-whitespace
+        exclude: ^(internal/cache/oci|test/oci)/testdata/
       - id: end-of-file-fixer
+        exclude: ^(internal/cache/oci|test/oci)/testdata/
       - id: check-added-large-files
       - id: detect-private-key
 
