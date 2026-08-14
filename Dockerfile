@@ -11,7 +11,12 @@ COPY web/ ./
 RUN npm run build
 
 
-FROM golang:1.26.1-bookworm AS build
+# Minor-pinned, not patch-pinned: go.mod's `go` directive moves with toolchain
+# patch releases, and the golang image sets GOTOOLCHAIN=local, so a patch-pinned
+# tag here strands the image build the first time go.mod gets ahead of it (it
+# did: go.mod 1.26.3 vs golang:1.26.1 broke the very first image job that ran).
+# A real minor bump still fails loudly here, which is the right moment to notice.
+FROM golang:1.26-bookworm AS build
 
 WORKDIR /src
 
