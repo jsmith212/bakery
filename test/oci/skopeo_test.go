@@ -80,6 +80,42 @@ func TestSkopeoInspect(t *testing.T) {
 	}
 }
 
+// TestSkopeoListTags pins the tags/list CONTENT with the real binary. The plain
+// `skopeo inspect` in TestSkopeoInspect already hard-requires the endpoint to exist
+// (containers/image lists tags on every inspect and fatals on a 404 -- the failure
+// that broke CI the first time skopeo actually ran); this test additionally asserts
+// WHAT it lists: exactly the tags this cache holds for the repository, scoped so a
+// sibling repository's tags do not leak in.
+func TestSkopeoListTags(t *testing.T) {
+	skopeo := requireBinary(t, "skopeo")
+
+	e := newEnv(t)
+	key := e.key(projOpen)
+
+	// Warm two repositories through the cache, so the listing has content AND an
+	// adjacent repo whose tags must not appear.
+	runSkopeo(t, skopeo, key,
+		"docker://"+e.host()+"/"+e.repo2(projOpen, repoProbe)+":"+tagProbe, "inspect", "--raw")
+	runSkopeo(t, skopeo, key,
+		"docker://"+e.host()+"/"+e.repo2(projOpen, repoIndex)+":"+tagIndex, "inspect", "--raw")
+
+	out := runSkopeo(t, skopeo, key,
+		"docker://"+e.host()+"/"+e.repo2(projOpen, repoProbe), "list-tags")
+
+	var listed struct {
+		Tags []string
+	}
+
+	if err := json.Unmarshal(out, &listed); err != nil {
+		t.Fatalf("decode skopeo list-tags: %v (output %s)", err, out)
+	}
+
+	if len(listed.Tags) != 1 || listed.Tags[0] != tagProbe {
+		t.Errorf("skopeo list-tags = %v, want exactly [%s]: the listing is the cached tags "+
+			"of THIS repository, not its neighbours'", listed.Tags, tagProbe)
+	}
+}
+
 // runSkopeo executes skopeo against a cleartext loopback registry.
 //
 // --tls-verify=false is not laziness: containers/image pings https FIRST and only falls

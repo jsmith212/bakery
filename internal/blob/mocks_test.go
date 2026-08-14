@@ -2,6 +2,8 @@ package blob
 
 import (
 	"context"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -139,6 +141,53 @@ func (f *fakeReader) StatObjectsBatch(
 	}
 
 	return out, nil
+}
+
+// ListObjectKeysByPrefix mirrors the SQL: sorted keys under a LIKE prefix pattern.
+// It counts as one query. The pattern is unescaped back to a literal prefix here;
+// real LIKE semantics (the escaping this fake undoes) are asserted against Postgres
+// in TestListKeysByPrefix_DB.
+func (f *fakeReader) ListObjectKeysByPrefix(
+	_ context.Context, arg repository.ListObjectKeysByPrefixParams,
+) ([]string, error) {
+	f.queries.Add(1)
+
+	if f.err != nil {
+		return nil, f.err
+	}
+
+	prefix := unLikePattern(arg.Prefix)
+
+	var out []string
+
+	for k := range f.rows {
+		if strings.HasPrefix(k, prefix) {
+			out = append(out, k)
+		}
+	}
+
+	sort.Strings(out)
+
+	return out, nil
+}
+
+// unLikePattern turns the Service's escaped LIKE pattern back into the literal
+// prefix it encodes: strip the trailing %, undo the metacharacter escapes. A single
+// left-to-right pass, because `\\` followed by `\%` must not collapse into `\%`.
+func unLikePattern(pattern string) string {
+	prefix := strings.TrimSuffix(pattern, "%")
+
+	var b strings.Builder
+
+	for i := 0; i < len(prefix); i++ {
+		if prefix[i] == '\\' && i+1 < len(prefix) {
+			i++
+		}
+
+		b.WriteByte(prefix[i])
+	}
+
+	return b.String()
 }
 
 // add seeds one object.

@@ -44,6 +44,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -261,6 +262,12 @@ type Reader interface {
 	StatObjectsBatch(
 		ctx context.Context, arg repository.StatObjectsBatchParams,
 	) ([]repository.StatObjectsBatchRow, error)
+
+	// ListObjectKeysByPrefix is ListKeysByPrefix's one query: the OCI tags/list
+	// answer. Cold path, no LRU involvement, sorted by key.
+	ListObjectKeysByPrefix(
+		ctx context.Context, arg repository.ListObjectKeysByPrefixParams,
+	) ([]string, error)
 }
 
 // Txer is the WRITE half. It hands the closure a *repository.Queries REBOUND ONTO
@@ -308,6 +315,7 @@ type Service struct {
 	// an LRU hit.
 	qStat       counter
 	qStatBatch  counter
+	qList       counter
 	qLock       counter
 	qGetWrite   counter
 	qRevive     counter
@@ -358,6 +366,7 @@ func New(cfg Config) (*Service, error) {
 		lru:         newLRU(m, size),
 		qStat:       m.DBQueries.WithLabelValues("StatObject"),
 		qStatBatch:  m.DBQueries.WithLabelValues("StatObjectsBatch"),
+		qList:       m.DBQueries.WithLabelValues("ListObjectKeysByPrefix"),
 		qLock:       m.DBQueries.WithLabelValues("LockBlobDigest"),
 		qGetWrite:   m.DBQueries.WithLabelValues("GetBlobForWrite"),
 		qRevive:     m.DBQueries.WithLabelValues("CreateOrReviveBlob"),
@@ -483,6 +492,46 @@ func (s *Service) StatUncached(ctx context.Context, ref Ref) (Meta, error) {
 
 	return meta, nil
 }
+
+// ListKeysByPrefix returns every key in ref's namespace that starts with ref.Key,
+// sorted, full keys included -- the caller strips the prefix it asked with.
+//
+// IT EXISTS FOR EXACTLY ONE CALLER: the OCI backend's tags/list answer, where the
+// cached tags of one repository are precisely the `tags`-namespace keys under
+// "<upstream>/<name>:". Like StatUncached -- and for the same reason -- it never
+// touches the LRU in either direction: the tags namespace is the one mutable,
+// freshness-bearing key space, and a per-process cache of a LISTING of it would be
+// wrong twice over. It is a cold path (`skopeo inspect`, not a pull) and one query.
+//
+// ref.Key is the RAW prefix. LIKE's metacharacters (%, _, and the default escape \)
+// are escaped here, not by the caller: a repository name legally contains
+// underscores, and an unescaped `_` silently matches any character -- a tag listing
+// that includes a sibling repository's tags, found only by a customer with both.
+func (s *Service) ListKeysByPrefix(ctx context.Context, ref Ref) ([]string, error) {
+	if err := ref.validate(); err != nil {
+		return nil, err
+	}
+
+	s.qList.Inc()
+
+	pattern := likeEscaper.Replace(ref.Key) + "%"
+
+	keys, err := s.reader.ListObjectKeysByPrefix(ctx, repository.ListObjectKeysByPrefixParams{
+		BackendID: ref.BackendID, Namespace: ref.Namespace, Prefix: pattern,
+	})
+	if err != nil {
+		s.recorder(ref).Observe(metrics.OpHead, metrics.ResultError)
+
+		return nil, fmt.Errorf("list keys: %w", err)
+	}
+
+	return keys, nil
+}
+
+// likeEscaper neutralizes LIKE metacharacters so a prefix is matched literally.
+// Backslash first is load-bearing: it is both a legal key byte and LIKE's default
+// escape character.
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
 // Touch bumps an existing object's updated_at and NOTHING else, returning false when
 // the row is gone.

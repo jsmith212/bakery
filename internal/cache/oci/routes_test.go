@@ -71,7 +71,12 @@ func TestSplitRef(t *testing.T) {
 		},
 		{name: "push api", rest: "alpine/blobs/uploads/", wantErr: errPushPath},
 		{name: "push api with a uuid", rest: "alpine/blobs/uploads/abc-123", wantErr: errPushPath},
-		{name: "tags list is not served", rest: "alpine/tags/list", wantErr: errBadRef},
+		{
+			// tags/list is dispatched by splitTagsList BEFORE splitRef ever sees it
+			// (see TestSplitTagsList); to splitRef alone it is just a marker-less tail.
+			name: "tags list is not a manifests or blobs ref", rest: "alpine/tags/list",
+			wantErr: errBadRef,
+		},
 	}
 
 	for _, tt := range tests {
@@ -95,6 +100,54 @@ func TestSplitRef(t *testing.T) {
 			if name != tt.wantName || kind != tt.wantKind || ref != tt.wantRef {
 				t.Errorf("splitRef(%q) = (%q, %q, %q), want (%q, %q, %q)",
 					tt.rest, name, kind, ref, tt.wantName, tt.wantKind, tt.wantRef)
+			}
+		})
+	}
+}
+
+// TestSplitTagsList is the suffix-check gate, and the ordering case is the one that
+// earns it: a repository legally named `acme/manifests` has a tags URL that splitRef's
+// marker scan would mis-carve, so serve() must ask splitTagsList FIRST.
+func TestSplitTagsList(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		rest     string
+		wantName string
+		ok       bool
+	}{
+		{name: "simple", rest: "alpine/tags/list", wantName: "alpine", ok: true},
+		{name: "namespaced", rest: "library/alpine/tags/list", wantName: "library/alpine", ok: true},
+		{name: "leading slash is tolerated", rest: "/alpine/tags/list", wantName: "alpine", ok: true},
+		{
+			// The ordering case: a repo whose name contains a marker word. splitRef
+			// would carve this into name "acme", ref "tags/list" and refuse it.
+			name: "repository literally named x/manifests", rest: "acme/manifests/tags/list",
+			wantName: "acme/manifests", ok: true,
+		},
+		{
+			// A repository literally named "tags" listing its tags.
+			name: "repository named tags", rest: "tags/tags/list", wantName: "tags", ok: true,
+		},
+		{name: "manifest pull is not a listing", rest: "alpine/manifests/latest", ok: false},
+		{
+			// `<repo>/manifests/list` is a TAG named "list", not a listing.
+			name: "tag literally named list", rest: "alpine/manifests/list", ok: false,
+		},
+		{name: "bare tags/list has no repository", rest: "tags/list", ok: false},
+		{name: "empty", rest: "", ok: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			name, ok := splitTagsList(tt.rest)
+
+			if ok != tt.ok || name != tt.wantName {
+				t.Errorf("splitTagsList(%q) = (%q, %v), want (%q, %v)",
+					tt.rest, name, ok, tt.wantName, tt.ok)
 			}
 		})
 	}

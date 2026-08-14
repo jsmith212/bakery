@@ -857,3 +857,85 @@ func TestGet_DanglingMetadataIsAnError(t *testing.T) {
 		t.Error("dangling metadata was reported as a cache MISS -- it must be a 500, not a 404")
 	}
 }
+
+// TestListKeysByPrefix_DB runs the tags/list query against REAL Postgres, because its
+// one interesting property -- the LIKE escaping -- is exactly what every fake in this
+// repo undoes rather than interprets. A repository name legally contains underscores,
+// and LIKE's unescaped `_` matches any single character: without the escaping, listing
+// `my_app`'s tags would return `myxapp`'s too, found only by a customer holding both.
+func TestListKeysByPrefix_DB(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t)
+
+	tagRef := func(key string) Ref {
+		r := f.ref(key)
+		r.Namespace = "tags"
+
+		return r
+	}
+
+	seed := func(ns, key string) {
+		t.Helper()
+
+		r := f.ref(key)
+		r.Namespace = ns
+
+		if _, err := f.svc.Put(t.Context(), r, bytes.NewReader([]byte(key)), PutOptions{
+			Overwrite: false, Verify: NoVerify(),
+		}); err != nil {
+			t.Fatalf("seed Put(%s, %q): %v", ns, key, err)
+		}
+	}
+
+	// Sorted output is asserted, so seed out of order.
+	seed("tags", "docker.io/my_app:v2")
+	seed("tags", "docker.io/my_app:v1")
+
+	// The three adjacency traps: `_` as a LIKE wildcard, a literal `%` in a key, and a
+	// prefix-sharing sibling repository.
+	seed("tags", "docker.io/myxapp:v1")
+	seed("tags", "docker.io/my%app:v1")
+	seed("tags", "docker.io/my_app2:v9")
+
+	// Same key bytes in a DIFFERENT namespace: the listing is namespace-scoped.
+	seed("cas", "docker.io/my_app:foreign")
+
+	tests := []struct {
+		name   string
+		prefix string
+		want   []string
+	}{
+		{
+			name:   "underscore is literal",
+			prefix: "docker.io/my_app:",
+			want:   []string{"docker.io/my_app:v1", "docker.io/my_app:v2"},
+		},
+		{
+			name:   "percent is literal",
+			prefix: "docker.io/my%app:",
+			want:   []string{"docker.io/my%app:v1"},
+		},
+		{name: "no matches is empty, not an error", prefix: "docker.io/other:", want: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := f.svc.ListKeysByPrefix(t.Context(), tagRef(tt.prefix))
+			if err != nil {
+				t.Fatalf("ListKeysByPrefix(%q) error = %v", tt.prefix, err)
+			}
+
+			if len(got) != len(tt.want) {
+				t.Fatalf("ListKeysByPrefix(%q) = %v, want %v", tt.prefix, got, tt.want)
+			}
+
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Fatalf("ListKeysByPrefix(%q) = %v, want %v (sorted, escaped, namespace-scoped)",
+						tt.prefix, got, tt.want)
+				}
+			}
+		})
+	}
+}

@@ -3,9 +3,11 @@ package oci
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jsmith212/bakery/internal/blob"
@@ -87,6 +89,81 @@ func (b *Backend) serveTag(w http.ResponseWriter, r *http.Request, req request) 
 	}
 
 	b.serveTagHit(w, r, req, meta)
+}
+
+// tagsResponse is the spec's tag-listing envelope: {"name": ..., "tags": [...]}.
+type tagsResponse struct {
+	Name string   `json:"name"`
+	Tags []string `json:"tags"`
+}
+
+// serveTagsList answers `GET <name>/tags/list` with the tags THIS CACHE HOLDS for the
+// repository -- the `tags`-namespace keys under "<upstream>/<name>:" -- and never
+// contacts the upstream.
+//
+// IT EXISTS BECAUSE `skopeo inspect` HARD-REQUIRES IT. containers/image lists a
+// repository's tags on every plain inspect (only --no-tags suppresses it) and turns
+// a 404 here into a fatal error -- discovered in CI, where the real skopeo binary
+// runs; every PULL path in all four clients gets by without this endpoint, which is
+// why M5 first shipped without it.
+//
+// CACHED TAGS ONLY, BY THE SAME PRODUCT DECISION AS EVERY OTHER MISS. A mirror that
+// proxied this listing upstream would spend the operator's rate limit answering an
+// enumeration question no build needs answered, and would need the principal gate and
+// pagination plumbing to do it. Serving what we hold is honest for a cache: it is the
+// same answer `registry:2`'s filesystem tag store gives, at local speed. The listing
+// is one uncached query (the tags namespace bypasses the LRU in both directions; see
+// serveTag) and the SQL's ORDER BY key within one fixed prefix IS lexical tag order,
+// which is the ordering the spec requires.
+//
+// AN EMPTY LISTING IS A 404 (NAME_UNKNOWN), matching distribution, whose tag store
+// answers ErrRepositoryUnknown when the tags path holds nothing. For a pull-through
+// cache "no cached tags" and "no such repository" are the same fact, and 404 is the
+// answer that sends the client to a registry that knows more.
+//
+// ?n=/?last= PAGINATION IS DELIBERATELY IGNORED: everything is returned in one page
+// with no Link header, which every paginating client (crane sends n=1000,
+// containers/image follows Link until absent) reads as "that was the whole list". A
+// cached tag set is one row per tag ever pulled through -- small by construction --
+// and truncating honestly would need the Link plumbing for a case that cannot get
+// large.
+func (b *Backend) serveTagsList(w http.ResponseWriter, r *http.Request, req request) {
+	prefix := tagKey(req.upstream, req.name, "")
+
+	keys, err := b.deps.Blobs.ListKeysByPrefix(r.Context(), req.objectRef(nsTags, kindTag, prefix))
+	if err != nil {
+		b.internal(r.Context(), "list tags", err)
+		notFound(w, codeNameUnknown)
+
+		return
+	}
+
+	if len(keys) == 0 {
+		notFound(w, codeNameUnknown)
+
+		return
+	}
+
+	tags := make([]string, 0, len(keys))
+	for _, k := range keys {
+		tags = append(tags, strings.TrimPrefix(k, prefix))
+	}
+
+	body, err := json.Marshal(tagsResponse{Name: req.name, Tags: tags})
+	if err != nil {
+		b.internal(r.Context(), "encode tags", err)
+		notFound(w, codeNameUnknown)
+
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(body)
+	}
 }
 
 // serveTagMiss handles a tag we hold nothing for.

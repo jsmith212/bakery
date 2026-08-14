@@ -256,8 +256,9 @@ func (q request) upstreamRef() UpstreamRef {
 //  0. An EMPTY tail is the tenant ping, not a resource. See serveTenantPing.
 //  1. Resolve the route. An unknown or disabled backend is 404 to everyone, before any
 //     authentication happens -- otherwise a 401 tells a scanner which projects exist.
-//  2. Parse the reference. A tail that is not <name>/manifests|blobs/<ref> is 404, not
-//     400: to a client the two are the same event.
+//  2. Parse the reference. A tail that is not <name>/tags/list or
+//     <name>/manifests|blobs/<ref> is 404, not 400: to a client the two are the same
+//     event.
 //  3. Resolve ?ns= against the allowlist. THIS IS THE SSRF GATE and it runs before any
 //     credential is even looked at, so an unlisted host costs nothing and reveals
 //     nothing.
@@ -277,19 +278,31 @@ func (b *Backend) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	name, kind, ref, err := splitRef(r.PathValue("rest"))
-	if err != nil {
-		if errors.Is(err, errPushPath) {
-			// Honest rather than confusing: there is no push API, and a client that
-			// tried one should be told so rather than shown a miss it will retry.
-			writeError(w, http.StatusNotFound, codeUnsupported, "this registry is pull-through only")
+	// The tag-listing endpoint is recognized before the manifests/blobs parse; the
+	// ordering argument lives on splitTagsList. It flows through the SAME policy,
+	// upstream and auth steps below -- the upstream matters even though the listing
+	// never dials one, because the upstream host is part of every tag's cache key.
+	name, isList := splitTagsList(r.PathValue("rest"))
+
+	var kind, ref string
+
+	if !isList {
+		var err error
+
+		name, kind, ref, err = splitRef(r.PathValue("rest"))
+		if err != nil {
+			if errors.Is(err, errPushPath) {
+				// Honest rather than confusing: there is no push API, and a client that
+				// tried one should be told so rather than shown a miss it will retry.
+				writeError(w, http.StatusNotFound, codeUnsupported, "this registry is pull-through only")
+
+				return
+			}
+
+			notFound(w, codeNameUnknown)
 
 			return
 		}
-
-		notFound(w, codeNameUnknown)
-
-		return
 	}
 
 	pol, perr := parsePolicy(route.Config)
@@ -320,13 +333,14 @@ func (b *Backend) serve(w http.ResponseWriter, r *http.Request) {
 		upstream: upstream, principal: principal,
 	}
 
-	if kind == kindBlobs {
+	switch {
+	case isList:
+		b.serveTagsList(w, r, req)
+	case kind == kindBlobs:
 		b.serveBlob(w, r, req)
-
-		return
+	default:
+		b.serveManifest(w, r, req)
 	}
-
-	b.serveManifest(w, r, req)
 }
 
 // ref builds the blob.Ref for one object on this request's route.

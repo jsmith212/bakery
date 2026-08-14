@@ -681,3 +681,127 @@ func TestOpenBackendDowngradesAForeignPrincipalToAnonymous(t *testing.T) {
 			r+m+sb+bg)
 	}
 }
+
+// TestTagsList drives the spec's tag-listing endpoint, which exists because a stock
+// `skopeo inspect` (no --no-tags) lists a repository's tags on every inspect and
+// treats a 404 as fatal -- the failure that broke CI the first time the real binary
+// ran against this backend.
+//
+// The listing is CACHED TAGS ONLY: it is answered from the `tags` namespace with no
+// upstream contact, anonymously on an open backend, and its scope assertions are the
+// interesting half -- a sibling repository and the same repository at a DIFFERENT
+// upstream both share the tags namespace and must not leak in.
+func TestTagsList(t *testing.T) {
+	t.Parallel()
+
+	for _, fam := range bothFamilies() {
+		t.Run(fam.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newFixture(t)
+			raw := testIndex(t)
+
+			// Seeded out of order; the listing must come back sorted.
+			f.seedTag(t, "docker.io", "library/alpine", "edge", raw)
+			f.seedTag(t, "docker.io", "library/alpine", "3.20", raw)
+			f.seedTag(t, "docker.io", "library/alpine", "3.19", raw)
+
+			// The two adjacency traps: a sibling repo sharing the name as a prefix,
+			// and the same repo mirrored from a different upstream host.
+			f.seedTag(t, "docker.io", "library/alpine2", "9.9", raw)
+			f.seedTag(t, "ghcr.io", "library/alpine", "foreign", raw)
+
+			w := f.do(http.MethodGet, fam.prefix+"library/alpine/tags/list", nil)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("tags/list = %d, want 200 (body %s)", w.Code, w.Body.String())
+			}
+
+			if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+				t.Errorf("Content-Type = %q, want application/json", ct)
+			}
+
+			var got struct {
+				Name string   `json:"name"`
+				Tags []string `json:"tags"`
+			}
+
+			if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+				t.Fatalf("decode tags/list body: %v (body %s)", err, w.Body.String())
+			}
+
+			if got.Name != "library/alpine" {
+				t.Errorf("name = %q, want library/alpine", got.Name)
+			}
+
+			want := []string{"3.19", "3.20", "edge"}
+			if len(got.Tags) != len(want) {
+				t.Fatalf("tags = %v, want %v", got.Tags, want)
+			}
+
+			for i, tag := range want {
+				if got.Tags[i] != tag {
+					t.Fatalf("tags = %v, want %v (sorted, scoped to repo AND upstream)", got.Tags, want)
+				}
+			}
+
+			if r, m, sb, bg := f.upstream.counts(); r+m+sb+bg != 0 {
+				t.Errorf("tags/list made %d upstream call(s), want 0 -- the listing is cache-only", r+m+sb+bg)
+			}
+		})
+	}
+}
+
+// TestTagsListHead: the GET pattern also matches HEAD, and a HEAD must answer headers
+// only -- httptest's recorder would happily show us a body that net/http would strip,
+// so the assertion is on our own write path.
+func TestTagsListHead(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t)
+	f.seedTag(t, "docker.io", "library/alpine", "3.20", testIndex(t))
+
+	w := f.do(http.MethodHead, tenantPrefix+"library/alpine/tags/list", nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("HEAD tags/list = %d, want 200", w.Code)
+	}
+
+	if w.Body.Len() != 0 {
+		t.Errorf("HEAD tags/list wrote a %d-byte body, want none", w.Body.Len())
+	}
+
+	if cl := w.Header().Get("Content-Length"); cl == "" || cl == "0" {
+		t.Errorf("HEAD tags/list Content-Length = %q, want the GET body's length", cl)
+	}
+}
+
+// TestTagsListEmptyIs404 pins the miss shape: a repository with no cached tags answers
+// NAME_UNKNOWN, exactly as distribution's own tag store does, so the client falls back
+// to a registry that knows more rather than being handed an empty list that reads as
+// "this repository has no tags anywhere".
+func TestTagsListEmptyIs404(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t)
+
+	w := f.do(http.MethodGet, tenantPrefix+"library/alpine/tags/list", nil)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("empty tags/list = %d, want 404", w.Code)
+	}
+
+	var body struct {
+		Errors []struct {
+			Code string `json:"code"`
+		} `json:"errors"`
+	}
+
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+
+	if len(body.Errors) != 1 || body.Errors[0].Code != codeNameUnknown {
+		t.Errorf("error body = %s, want one NAME_UNKNOWN", w.Body.String())
+	}
+}

@@ -2,6 +2,7 @@ package httpblob
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -68,6 +69,12 @@ func (f *fakeReader) StatObjectsBatch(
 	}
 
 	return out, nil
+}
+
+func (f *fakeReader) ListObjectKeysByPrefix(
+	_ context.Context, _ repository.ListObjectKeysByPrefixParams,
+) ([]string, error) {
+	return nil, errors.New("httpblob does not list keys")
 }
 
 func (f *fakeReader) add(key string, digest storage.Key, size int64) {

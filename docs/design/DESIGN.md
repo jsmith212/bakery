@@ -476,7 +476,15 @@ upstream seeded with **vendored real multi-arch index bytes** — with the anti-
 second pull sees **zero** upstream requests), because every registry client masks a broken mirror by
 silently falling back to the real registry, so only a served-by-Bakery proof means anything.
 
-**What M5 did NOT build:** the registry push API / catalog / tags-list / referrers (pull-through
+**Post-M5 fix (first real CI run):** `GET <name>/tags/list` **is served after all** — stock
+`skopeo inspect` (no `--no-tags`) lists a repository's tags on every inspect and treats a 404 as
+fatal, so "tags-list not built" broke the conformance job the first time the real binary ran. It
+answers with the **cached** tags only (`tags`-namespace keys under `<upstream>/<name>:`, one
+uncached prefix query, LIKE-escaped), never contacts the upstream, ignores `?n=`/`?last=` (one
+page, no `Link` — verified terminal for containers/image and crane), and an empty listing is 404
+`NAME_UNKNOWN`, matching distribution's own tag store.
+
+**What M5 did NOT build:** the registry push API / catalog / referrers (pull-through
 only; 404/405 is the verified-safe answer), non-sha256 digests (clean 404), schema1 (2.x rejects it;
 1.7 tolerates a proxied upstream serving it — nothing for Bakery to do), tee-streamed first pulls and
 upstream Range resume (perf, revisit with S3), per-tenant upstream credentials and envelope

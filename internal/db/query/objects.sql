@@ -148,6 +148,29 @@ UPDATE cache_objects
  WHERE backend_id = $1 AND namespace = $2 AND key = $3
 RETURNING updated_at;
 
+-- THE OCI tags/list ANSWER: every cached tag of one repository, which is the key
+-- range "<upstream>/<name>:%" in the `tags` namespace. The caller (blob.Service)
+-- escapes LIKE metacharacters in the prefix; Postgres's default ESCAPE is already
+-- backslash, so no ESCAPE clause is spelled here.
+--
+-- This walks the (backend_id, namespace) slice of cache_objects_pkey and filters --
+-- a prefix LIKE only uses the btree under the C collation, which the key column
+-- does not have. That is fine ON PURPOSE: tags/list is `skopeo inspect`'s cold
+-- path, never a pull's, and the tags namespace holds one row per (upstream, repo,
+-- tag) ever pulled through -- small by construction. If this ever shows up in a
+-- profile the fix is a text_pattern_ops index, not a schema change.
+--
+-- ORDER BY key sorts by the full "<upstream>/<name>:<tag>" string, which within one
+-- constant prefix IS tag order -- the spec's lexical-ordering requirement for free.
+--
+-- name: ListObjectKeysByPrefix :many
+SELECT key
+  FROM cache_objects
+ WHERE backend_id = $1
+   AND namespace  = $2
+   AND key LIKE sqlc.arg(prefix)::text
+ ORDER BY key;
+
 -- Deleting the object metadata IS the refcount decrement -- the trigger does it.
 -- [METADATA FIRST.] The bytes are never touched here: ONLY the GC deletes bytes,
 -- and cache_objects_blob_fk (ON DELETE RESTRICT) guarantees the blob row, and

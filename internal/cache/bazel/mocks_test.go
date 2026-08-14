@@ -3,6 +3,7 @@ package bazel
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -115,6 +116,12 @@ func (f *fakeReader) StatObjectsBatch(
 	}
 
 	return out, nil
+}
+
+func (f *fakeReader) ListObjectKeysByPrefix(
+	_ context.Context, _ repository.ListObjectKeysByPrefixParams,
+) ([]string, error) {
+	return nil, errors.New("bazel does not list keys")
 }
 
 func (f *fakeReader) add(key string, digest []byte, size int64) {

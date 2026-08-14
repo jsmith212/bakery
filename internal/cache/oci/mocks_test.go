@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -89,6 +90,48 @@ func (f *fakeReader) StatObjectsBatch(
 	_ context.Context, _ repository.StatObjectsBatchParams,
 ) ([]repository.StatObjectsBatchRow, error) {
 	return nil, errors.New("oci does not use ExistsBatch")
+}
+
+// ListObjectKeysByPrefix mirrors the SQL: sorted keys under a LIKE prefix pattern,
+// within one namespace. The pattern is unescaped back to a literal prefix here; the
+// escaping itself is asserted against real Postgres in internal/blob.
+func (f *fakeReader) ListObjectKeysByPrefix(
+	_ context.Context, arg repository.ListObjectKeysByPrefixParams,
+) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	prefix := arg.Namespace + "\x00" + unLikePattern(arg.Prefix)
+
+	var out []string
+
+	for k := range f.rows {
+		if strings.HasPrefix(k, prefix) {
+			out = append(out, strings.TrimPrefix(k, arg.Namespace+"\x00"))
+		}
+	}
+
+	sort.Strings(out)
+
+	return out, nil
+}
+
+// unLikePattern strips the trailing % and undoes the LIKE metacharacter escapes, in
+// one left-to-right pass.
+func unLikePattern(pattern string) string {
+	prefix := strings.TrimSuffix(pattern, "%")
+
+	var b strings.Builder
+
+	for i := 0; i < len(prefix); i++ {
+		if prefix[i] == '\\' && i+1 < len(prefix) {
+			i++
+		}
+
+		b.WriteByte(prefix[i])
+	}
+
+	return b.String()
 }
 
 func (f *fakeReader) add(namespace, key string, digest storage.Key, size int64, ct string, updated time.Time) {

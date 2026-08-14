@@ -5,10 +5,15 @@ import (
 	"strings"
 )
 
-// The two things the {rest...} tail of a registry route can name.
+// The three things the {rest...} tail of a registry route can name.
 const (
 	kindManifests = "manifests"
 	kindBlobs     = "blobs"
+	kindTags      = "tags"
+
+	// refList is the fixed final segment of the tag-listing endpoint: the spec
+	// spells it `<name>/tags/list`, with no other reference ever legal there.
+	refList = "list"
 )
 
 // errBadRef is what splitRef returns for a tail that is not a legal
@@ -81,6 +86,25 @@ func splitRef(rest string) (name, kind, ref string, err error) {
 	}
 
 	return name, mark, ref, nil
+}
+
+// splitTagsList reports whether a registry path tail is the spec's tag-listing
+// endpoint, `<name>/tags/list`, and returns the repository name.
+//
+// IT IS CHECKED BEFORE splitRef, AND THE ORDER IS CORRECTNESS, NOT TASTE. No legal
+// manifests or blobs URL can end in "/tags/list" -- the reference occupies the final
+// path segment and may not contain a slash -- so the suffix check can never steal a
+// manifest or blob request. The reverse is not true: a repository legally named
+// `acme/manifests` (every component of a repo name is unrestricted) has a tags URL of
+// `acme/manifests/tags/list`, which splitRef's marker scan would carve into repository
+// "acme" with reference "tags/list" and reject. Suffix first parses both correctly.
+func splitTagsList(rest string) (string, bool) {
+	name, ok := strings.CutSuffix(strings.TrimPrefix(rest, "/"), "/"+kindTags+"/"+refList)
+	if !ok || name == "" {
+		return "", false
+	}
+
+	return name, true
 }
 
 // digestHex validates a `sha256:<64 lowercase hex>` reference and returns the bare hex,
