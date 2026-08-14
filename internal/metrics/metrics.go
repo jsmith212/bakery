@@ -183,6 +183,12 @@ type Metrics struct {
 	// and AC bytes through blob.Service and so gets the headline series for free;
 	// these are the ones blob.Service cannot know about. See bazel.go.
 	bazel bazelCollectors
+
+	// oci. UNEXPORTED, reached through Metrics.OCI. The pull-through proxy routes
+	// every manifest, blob and tag through blob.Service and so gets the headline
+	// series for free; these describe the UPSTREAM leg, which has no local analogue.
+	// See oci.go.
+	oci ociCollectors
 }
 
 // httpBuckets start at 100us. prometheus' DefBuckets start at 5ms, which would
@@ -299,6 +305,7 @@ func New() *Metrics {
 
 		hashserv: newHashservCollectors(f),
 		bazel:    newBazelCollectors(f),
+		oci:      newOCICollectors(f),
 	}
 }
 

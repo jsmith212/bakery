@@ -3,6 +3,7 @@ package api
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -52,17 +53,28 @@ type SnippetRequest struct {
 // yocto is the M2 default (sstate + downloads share one local.conf); moon, ccache,
 // sccache and bazel arrive with M4. Every M4 client writes to the cache itself, so
 // none of them carries a push -- PushCommands is empty for all four.
+//
+// containerd, buildkit, podman and docker arrive with M5, and none of them carries a
+// push either -- the OCI backend is pull-through only, there is no registry push API,
+// so PushCommands stays empty for these too. All four target the SAME per-project OCI
+// backend through one of two route families (see cache/oci.Backend.Register); the
+// client picks the family, the snippet just emits the right shape for it.
 const (
-	SnippetToolYocto   = "yocto"
-	SnippetToolMoon    = "moon"
-	SnippetToolCcache  = "ccache"
-	SnippetToolSccache = "sccache"
-	SnippetToolBazel   = "bazel"
+	SnippetToolYocto      = "yocto"
+	SnippetToolMoon       = "moon"
+	SnippetToolCcache     = "ccache"
+	SnippetToolSccache    = "sccache"
+	SnippetToolBazel      = "bazel"
+	SnippetToolContainerd = "containerd"
+	SnippetToolBuildkit   = "buildkit"
+	SnippetToolPodman     = "podman"
+	SnippetToolDocker     = "docker"
 )
 
 // snippetTools is the closed set, in the order the 422 message lists them.
 var snippetTools = []string{
 	SnippetToolYocto, SnippetToolMoon, SnippetToolCcache, SnippetToolSccache, SnippetToolBazel,
+	SnippetToolContainerd, SnippetToolBuildkit, SnippetToolPodman, SnippetToolDocker,
 }
 
 func knownSnippetTool(tool string) bool {
@@ -122,6 +134,14 @@ type SnippetResponse struct {
 
 	// APIKey is the freshly-minted key, INCLUDING the plaintext token exactly once.
 	APIKey CreatedAPIKey `json:"api_key"`
+
+	// Warnings are operator-facing cautions the UI MUST render loudly, not bury in a
+	// tooltip. It exists for the docker tool: Docker Engine forwards the user's real
+	// Docker Hub credentials to whatever registry-mirrors names, unscoped, on every
+	// pull -- and daemon.json is strict JSON with no comment syntax, so the warning
+	// cannot live inside the emitted file the way ccache's or containerd's can.
+	// omitempty because every other tool has nothing to say here.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // SnippetFile is a config file the UI renders in a mono block with a copy button and
@@ -165,7 +185,8 @@ func (a *API) handleGenerateSnippet(w http.ResponseWriter, r *http.Request) erro
 
 	if !knownSnippetTool(tool) {
 		return errValidation("tool",
-			`tool must be one of "yocto", "moon", "ccache", "sccache", "bazel"`)
+			`tool must be one of "yocto", "moon", "ccache", "sccache", "bazel", `+
+				`"containerd", "buildkit", "podman", "docker"`)
 	}
 
 	scopeStr := req.Scope
@@ -236,6 +257,7 @@ func (a *API) handleGenerateSnippet(w http.ResponseWriter, r *http.Request) erro
 		Files:        content.files,
 		Env:          content.env,
 		APIKey:       created,
+		Warnings:     content.warnings,
 	})
 
 	return nil
@@ -250,6 +272,7 @@ type snippetContent struct {
 	pushCommands []string
 	files        []SnippetFile
 	env          []SnippetEnvVar
+	warnings     []string
 }
 
 // buildSnippet routes to the per-tool builder. tool is already validated against the
@@ -266,6 +289,14 @@ func buildSnippet(tool, scheme, host, baseURL, org, project, token string, scope
 		return sccacheSnippet(baseURL, token)
 	case SnippetToolBazel:
 		return bazelSnippet(scheme, host, org, project, token)
+	case SnippetToolContainerd:
+		return containerdSnippet(scheme, host, org, project, token)
+	case SnippetToolBuildkit:
+		return buildkitSnippet(scheme, host, org, project, token)
+	case SnippetToolPodman:
+		return podmanSnippet(host, org, project, token)
+	case SnippetToolDocker:
+		return dockerSnippet(scheme, host, org, project)
 	default: // yocto
 		return snippetContent{
 			localConf:    yoctoLocalConf(baseURL),
@@ -392,6 +423,176 @@ func bazelSnippet(scheme, host, org, project, token string) snippetContent {
 
 	return snippetContent{
 		files: []SnippetFile{{Path: ".bazelrc", Language: "bazelrc", Content: rc}},
+	}
+}
+
+// dockerMirrorURL is the docker/v2 mount: containerd and Docker Engine both land
+// here. containerd APPENDS /v2 to whatever host it is given (unless it already ends
+// in one), and Docker Engine's ValidateMirror accepts a path -- contrary to the
+// widely-repeated "mirror URLs must be domain roots" claim, which is true only of
+// registry:2's own `remoteurl`. So the configured value carries NO trailing /v2 and
+// DOES carry the tenant path.
+func dockerMirrorURL(scheme, host, org, project string) string {
+	return fmt.Sprintf("%s://%s/cache/%s/%s/docker", scheme, host, org, project)
+}
+
+// v2MirrorPath is the bare, schemeless tenant path BuildKit and podman both mirror
+// onto -- Bakery's second route family, /v2/{org}/{project}/{rest...}. Neither tool
+// takes a scheme in its mirror value; BuildKit has a separate `http` boolean and
+// podman infers TLS from its own `insecure` setting.
+func v2MirrorPath(host, org, project string) string {
+	return fmt.Sprintf("%s/%s/%s", host, org, project)
+}
+
+// containerdSnippet builds one hosts.toml, with BOTH working auth paths -- because
+// they trade off differently, and picking one for the user would hide the choice.
+//
+// DEFAULT (the block as shown): no credential configured on the host at all.
+// containerd's authorizer follows the WWW-Authenticate: Bearer challenge Bakery's
+// ping AND every 401 already carry, fetches a token from the advertised realm, and
+// retries with it -- zero config beyond this file, and it is enough on its own
+// against an open (ReadAuthRequired=false) backend.
+//
+// ALTERNATIVE (commented out below): skip the challenge round trip entirely with a
+// static per-request header. `[host."...".header]` is unconditional -- it is applied
+// to every request with no negotiation -- and AuthenticateToken accepts a bare Bearer
+// bkry_ token exactly the same whether it arrived this way or via the challenge flow.
+// This is also the ONLY of the two paths that works before Bakery answers a single
+// request: there is no discovery round trip to get wrong.
+//
+// containerd APPENDS /v2 to the host URL itself unless it already ends in one (or
+// override_path=true is set), so the configured host below carries NO trailing /v2.
+func containerdSnippet(scheme, host, org, project, token string) snippetContent {
+	mount := dockerMirrorURL(scheme, host, org, project)
+
+	toml := strings.Join([]string{
+		`server = "https://registry-1.docker.io"   # one file per upstream namespace; same [host] block in each`,
+		"",
+		fmt.Sprintf(`[host.%q]`, mount),
+		`  capabilities = ["pull", "resolve"]`,
+		"",
+		"  # DEFAULT: no credential here -- containerd follows Bakery's Bearer challenge",
+		"  # automatically. Sufficient on its own against an open (unauthenticated-read) backend.",
+		"",
+		"  # ALTERNATIVE: pin the token as a static header and skip the challenge round trip",
+		"  # entirely. Mutually exclusive with the default above -- uncomment to use it:",
+		fmt.Sprintf(`  # [host.%q.header]`, mount),
+		fmt.Sprintf(`  #   Authorization = "Bearer %s"`, token),
+	}, "\n") + "\n"
+
+	return snippetContent{
+		files: []SnippetFile{{
+			Path: "/etc/containerd/certs.d/docker.io/hosts.toml", Language: "toml", Content: toml,
+		}},
+	}
+}
+
+// buildkitSnippet builds buildkitd.toml's mirrors block.
+//
+// BuildKit puts the mirror prefix AFTER /v2 (path.Join("/v2", mirrorPath)) -- the
+// OPPOSITE of containerd -- so the value here is the BARE tenant path, no /cache and
+// no /docker segment: Bakery's second route family exists for exactly this shape.
+//
+// ⚠️ BuildKit's Basic-auth path only installs a handler when BOTH username AND secret
+// are non-empty. A docker config.json entry for this host with an empty password does
+// not error -- it silently skips the mirror for that host. Configure BOTH fields with
+// the token (one opaque bkry_ token, no id:secret split -- see the package doc), or
+// configure neither and let the Bearer/anonymous flow serve an open backend.
+func buildkitSnippet(scheme, host, org, project, token string) snippetContent {
+	mirror := v2MirrorPath(host, org, project)
+
+	toml := strings.Join([]string{
+		`[registry."docker.io"]`,
+		fmt.Sprintf(`  mirrors = [%q]`, mirror),
+		fmt.Sprintf("  http = %t", scheme == "http"),
+		"",
+		"# Credentials (only needed if this backend requires authenticated reads -- BOTH",
+		"# fields or BuildKit silently skips the mirror):",
+		fmt.Sprintf("#   docker login %s -u %s -p %s", host, token, token),
+	}, "\n") + "\n"
+
+	return snippetContent{
+		files: []SnippetFile{{Path: "/etc/buildkit/buildkitd.toml", Language: "toml", Content: toml}},
+	}
+}
+
+// podmanSnippet builds registries.conf's mirror block.
+//
+// containers/image NEVER sends ?ns= -- podman, skopeo and CRI-O all go through it --
+// so this project's OCI backend MUST have default_upstream set server-side; there is
+// no way for Bakery to learn the upstream from the request the way it does for
+// containerd/BuildKit.
+//
+// ⚠️ containers/image STRIPS the upstream registry's credentials whenever the mirror
+// domain differs from the image's own domain (verified in docker_image_src.go), so a
+// docker.io login does NOT reach Bakery -- there is no inherited-credential path here
+// at all, unlike Docker Engine. Authenticate to the mirror host directly.
+func podmanSnippet(host, org, project, token string) snippetContent {
+	mirror := v2MirrorPath(host, org, project)
+
+	toml := strings.Join([]string{
+		`[[registry]]`,
+		`  location = "docker.io"`,
+		"",
+		`  [[registry.mirror]]`,
+		fmt.Sprintf(`    location = %q`, mirror),
+		`    # no ?ns= is ever sent here -- the backend's default_upstream must be docker.io`,
+		"",
+		"# Credentials (only needed if this backend requires authenticated reads) do NOT",
+		"# inherit from a docker.io login -- podman strips cross-domain credentials.",
+		"# Authenticate to the mirror host directly:",
+		fmt.Sprintf("#   podman login %s -u %s -p %s", host, token, token),
+	}, "\n") + "\n"
+
+	return snippetContent{
+		files: []SnippetFile{{Path: "/etc/containers/registries.conf", Language: "toml", Content: toml}},
+	}
+}
+
+// dockerSnippet builds daemon.json's registry-mirrors block for plain Docker Engine
+// (dockerd) -- the fourth, officially-supported client. Product decision: support it,
+// with a loud warning attached (see below), rather than leave it undocumented while
+// operators point it at Bakery anyway.
+//
+// HUB-ONLY, and that is dockerd's limit, not Bakery's: registry-mirrors only ever
+// mirrors Docker Hub, so this always targets the SAME docker/v2 mount containerd
+// uses -- no separate route exists or is needed.
+//
+// A PATH PREFIX IS VALID. Docker Engine v28+'s ValidateMirror rejects only a query
+// string, a fragment, or embedded userinfo -- NOT a path -- contrary to older docs
+// (and this doc's own §3.1, corrected alongside this change) claiming mirror URLs
+// must be domain roots. That claim is true only of registry:2's own `remoteurl`.
+//
+// NO TOKEN IN THIS FILE, and that is not an oversight: Docker Engine forwards the
+// user's OWN Docker Hub credentials to whatever registry-mirrors names, unscoped, on
+// every pull -- there is no per-mirror credential slot to put a Bakery token in.
+// Consequently a forwarded Hub credential is never bkry_-shaped, so it is always
+// treated as anonymous; Docker Engine therefore only works against an OCI backend
+// with ReadAuthRequired=false. daemon.json is also strict JSON with no comment
+// syntax, so the credential-transit warning cannot live inside the file the way
+// containerd's or ccache's can -- it ships as SnippetResponse.Warnings instead, which
+// the UI MUST render loudly.
+func dockerSnippet(scheme, host, org, project string) snippetContent {
+	mirror := dockerMirrorURL(scheme, host, org, project)
+
+	body := struct {
+		RegistryMirrors []string `json:"registry-mirrors"`
+	}{RegistryMirrors: []string{mirror}}
+
+	raw, err := json.MarshalIndent(body, "", "  ")
+	if err != nil {
+		// Unreachable: body is a fixed shape with no cyclic or unmarshalable field.
+		raw = []byte("{}")
+	}
+
+	return snippetContent{
+		files: []SnippetFile{{Path: "/etc/docker/daemon.json", Language: "json", Content: string(raw) + "\n"}},
+		warnings: []string{
+			"Docker Engine forwards your real Docker Hub login to this mirror on every " +
+				"pull, unscoped -- only enable this if you accept that credential transit. " +
+				"It is never logged. Works only against an OCI backend with authenticated " +
+				"reads turned off: Docker Engine cannot present a Bakery key.",
+		},
 	}
 }
 

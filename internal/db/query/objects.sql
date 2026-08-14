@@ -17,7 +17,7 @@
 -- never a 200 with an empty body: BitBake retries a 403 as a full-body GET.
 --
 -- name: StatObject :one
-SELECT digest, size_bytes, updated_at
+SELECT digest, size_bytes, updated_at, content_type
   FROM cache_objects
  WHERE backend_id = $1 AND namespace = $2 AND key = $3;
 
@@ -35,7 +35,7 @@ SELECT digest, size_bytes, updated_at
 -- NO AfterConnect registration (unlike the enum arrays in internal/db/enums.go).
 --
 -- name: StatObjectsBatch :many
-SELECT key, digest, size_bytes, updated_at
+SELECT key, digest, size_bytes, updated_at, content_type
   FROM cache_objects
  WHERE backend_id = $1
    AND namespace  = $2
@@ -95,8 +95,8 @@ ON CONFLICT (digest) DO UPDATE
 -- :execrows tells the caller whether it won the race.
 --
 -- name: PutObjectImmutable :execrows
-INSERT INTO cache_objects (backend_id, namespace, key, digest, size_bytes)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO cache_objects (backend_id, namespace, key, digest, size_bytes, content_type)
+VALUES ($1, $2, $3, $4, $5, sqlc.narg(content_type))
 ON CONFLICT (backend_id, namespace, key) DO NOTHING;
 
 -- The /ac/ OVERWRITE: the ONLY mutable namespace (ccache, sccache,
@@ -106,14 +106,47 @@ ON CONFLICT (backend_id, namespace, key) DO NOTHING;
 -- re-PUT of identical content is a no-op and does not disturb the count.
 --
 -- name: PutObjectOverwritable :execrows
-INSERT INTO cache_objects (backend_id, namespace, key, digest, size_bytes)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO cache_objects (backend_id, namespace, key, digest, size_bytes, content_type)
+VALUES ($1, $2, $3, $4, $5, sqlc.narg(content_type))
 ON CONFLICT (backend_id, namespace, key) DO UPDATE
-   SET digest     = EXCLUDED.digest,
-       size_bytes = EXCLUDED.size_bytes,
-       created_at = now(),
-       live_xid   = pg_current_xact_id()::text::bigint,
-       updated_at = now();
+   SET digest       = EXCLUDED.digest,
+       size_bytes   = EXCLUDED.size_bytes,
+       content_type = EXCLUDED.content_type,
+       created_at   = now(),
+       live_xid     = pg_current_xact_id()::text::bigint,
+       updated_at   = now();
+
+-- THE OCI TAG FRESHNESS TOUCH, and it exists because without it every tag in the
+-- system is permanently stale after its first TTL.
+--
+-- Tag staleness is DERIVED: `now > updated_at + tag_ttl`. The stale-while-revalidate
+-- refresh does an upstream HEAD and, on the overwhelmingly common answer -- the tag
+-- still names the same digest -- writes NOTHING. PutObjectOverwritable never runs, so
+-- updated_at never moves, so the tag is stale again on the very next request: a
+-- ResultStale on every response forever, one upstream HEAD per singleflight window
+-- forever, and "we are serving stale because the upstream is down" made
+-- indistinguishable from steady state. This query is the missing half of the
+-- revalidation.
+--
+-- IT DELIBERATELY DOES NOT TOUCH created_at OR live_xid. Those two ARE the GC write
+-- barrier, and the barrier marks ROW CREATION -- "this row was made after the sweep
+-- took its snapshot, so spare it". A revalidation that confirmed nothing changed
+-- CREATED nothing: the same bytes, under the same digest, named by the same row that
+-- was already there. Resetting the barrier here would make an unchanged, ancient,
+-- never-pulled tag immortal simply because something revalidated it, which is the
+-- exact opposite of what an age sweep is for. Freshness (updated_at) and sweepability
+-- (created_at / live_xid) are different questions and this query answers only the
+-- first.
+--
+-- :one so a caller learns the new timestamp AND learns (pgx.ErrNoRows) that the row
+-- vanished underneath it -- a tag deleted mid-refresh must not be silently recreated
+-- as a freshness fact with no bytes behind it.
+--
+-- name: TouchObject :one
+UPDATE cache_objects
+   SET updated_at = now()
+ WHERE backend_id = $1 AND namespace = $2 AND key = $3
+RETURNING updated_at;
 
 -- Deleting the object metadata IS the refcount decrement -- the trigger does it.
 -- [METADATA FIRST.] The bytes are never touched here: ONLY the GC deletes bytes,

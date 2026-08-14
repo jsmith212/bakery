@@ -211,7 +211,7 @@ Redis backend: **skip it.** Separate protocol surface (RESP), zero incremental v
 ### 3.1 Why not `registry:2`
 
 - *"It's currently possible to mirror only one upstream registry at a time."* One `remoteurl` per instance.
-- Mirror URLs must be **domain roots** — no path, fragment, or query.
+- Mirror URLs must be **domain roots** — no path, fragment, or query. **⚠️ CORRECTION — this is true only of registry:2's own `remoteurl`, NOT of Docker Engine.** Docker Engine v28.5.2's `ValidateMirror` rejects only a query string, a fragment, or embedded userinfo in a `registry-mirrors` entry — a path is a passing test case (`config.go` + `config_test.go:67-72`, verified). That is exactly what makes Docker Engine supportable as a fourth client (§3.5): `registry-mirrors: ["https://bakery.corp/cache/{org}/{proj}/docker"]`, Hub-only, same path shape containerd uses.
 - Docker daemon's `registry-mirrors` **only supports mirrors of Docker Hub**.
 - Any private image the configured upstream user can access becomes available via the mirror. Auth in front is mandatory.
 
@@ -228,6 +228,10 @@ GET    /v2/<name>/blobs/<digest>         -> 200 (Range -> 206 + Content-Range)
 
 Everything else can 404/405. `Docker-Content-Digest` on manifest responses is load-bearing — clients use it to pin.
 
+**⚠️ CORRECTION — the HEAD digest fast path needs a HEADER PAIR, not one header.** containerd's resolver only takes the fast path when `Docker-Content-Digest` is present **AND** `Content-Length != -1` **on the same response** (`resolver.go:382`, verified: `if dgstHeader != "" && size != -1`). Missing either forces a full GET-and-hash — correct, but it burns the whole body transfer the HEAD was supposed to avoid. `Content-Type` is trusted verbatim as `desc.MediaType`, so it must be the STORED media type, never a guess.
+
+**⚠️ CORRECTION — podman/CRI-O ping the HOST ROOT, not the mirror path.** containers/image's `GET /v2/` probe hits the bare upstream host — `https://bakery.corp/v2/`, outside any `/cache/{org}/{proj}/...` prefix — and hard-errors on anything but 200 or 401. containerd never issues this call during a pull; it is podman-and-friends-only, and it is **required**, not optional, for that family. `Docker-Distribution-API-Version: registry/2.0` is not enforced by any of the four clients — worth sending because a human curling the endpoint looks for it, not because a client checks it.
+
 ### 3.3 The token flow (both directions)
 
 1. Client hits `/v2/…` unauthenticated → **401** + `WWW-Authenticate: Bearer realm="…",service="…",scope="repository:<name>:pull"`
@@ -238,6 +242,10 @@ Everything else can 404/405. `Docker-Content-Digest` on manifest responses is lo
 We perform this dance **upstream** (per-repository, caching tokens until `expires_in`), and we must **also issue our own downstream 401 challenge** — otherwise we are an open relay for whatever upstream credentials we hold.
 
 Upstream realms: Docker Hub `https://auth.docker.io/token` (service `registry.docker.io`), ghcr `https://ghcr.io/token`, quay `https://quay.io/v2/auth`.
+
+**⚠️ ADDITION — containerd's hosts.toml has a static, zero-round-trip alternative to the whole dance.** A `[host."...".header]` table sets unconditional per-request headers — including `Authorization = "Bearer <token>"` — applied to every request with no challenge, no `/v2/token` fetch, and no negotiation. It is the recommended default for a token that is itself the credential (as ours is): the challenge flow exists for clients that must discover a realm at runtime, not for one that already knows exactly what to send. `client-config.md` documents both paths side by side.
+
+**⚠️ ADDITION — the Basic-vs-Bearer asymmetry across clients is load-bearing.** BuildKit's Basic-auth code path only installs a per-host handler when **both** `username` and `secret` are non-empty (`authorizer.go`) — a credential-less BuildKit, or one with an empty password configured for a host, silently **skips the mirror entirely** rather than trying it unauthenticated. Bearer has no such gap: every one of the four clients falls through to an anonymous token request when no credential is configured. This is why the downstream challenge in §3.3 is **Bearer, never bare Basic** — a bare-Basic 401 would defeat BuildKit outright, and Bearer is the one scheme all four clients handle gracefully with no credential at all.
 
 `google/go-containerregistry` (`pkg/v1/remote` + `pkg/authn`) implements the full client side of this. Use it for upstream; write our own storage + downstream handler.
 
@@ -258,17 +266,20 @@ func (r *request) addNamespace(ns string) error {
 
 **⚠️ `?ns=` is a containerd convention, not in the OCI spec.** Docker Engine and podman never send it. ⇒ the backend config **must** carry a `default_upstream` used when `?ns=` is absent.
 
-### 3.5 Path prefixes — three clients, two shapes
+### 3.5 Path prefixes — four clients, two shapes
 
 | Client | Config | Resulting request |
 |---|---|---|
 | **containerd** | `server = "https://bakery/cache/acme/proj/docker"` | `GET /cache/acme/proj/docker/v2/library/alpine/manifests/latest?ns=docker.io` |
-| **BuildKit** | `mirrors = ["bakery/cache/acme/proj/docker"]` | `GET /v2/cache/acme/proj/docker/library/alpine/manifests/latest?ns=docker.io` |
-| **podman/CRI-O** | `location = "bakery/cache/acme/proj"` | `GET /v2/cache/acme/proj/library/alpine/manifests/latest` — **no `ns=`** |
+| **Docker Engine** ⚠️ (M5 addition) | `registry-mirrors: ["https://bakery/cache/acme/proj/docker"]` | `GET /cache/acme/proj/docker/v2/library/alpine/manifests/latest` — **no `ns=`**, Hub-only |
+| **BuildKit** | `mirrors = ["bakery/acme/proj"]` | `GET /v2/acme/proj/library/alpine/manifests/latest?ns=docker.io` |
+| **podman/CRI-O** | `location = "bakery/acme/proj"` | `GET /v2/acme/proj/library/alpine/manifests/latest` — **no `ns=`** |
 
-containerd **appends `/v2` itself** (and won't double-append if you write it). BuildKit puts the prefix **after** `/v2` — the opposite. So we serve both shapes.
+containerd **appends `/v2` itself** (and won't double-append if you write it). Docker Engine's `registry-mirrors` uses the SAME shape as containerd's `server=` — a path prefix before an implicit `/v2` — because `ValidateMirror` normalizes the configured URL to end in `/` before Go's URL-joining logic resolves the request path against it (`urls.go`'s `clonedRoute.URL`); an un-normalized path would silently drop the final segment. BuildKit puts the prefix **after** `/v2` — the opposite of both — and podman rewrites the reference the same way, so Bakery serves BuildKit and podman/CRI-O off ONE route family (`/v2/{org}/{project}/...`) and containerd/Docker Engine off the other (`/cache/{org}/{project}/docker/v2/...`).
 
-`override_path = true` on containerd means "use the path as-is, don't append `/v2`" — which can be used to **normalize containerd onto BuildKit's shape** if we'd rather have one route.
+**⚠️ ADDITION — podman/CRI-O also ping the bare host root**, outside any tenant prefix (`GET https://bakery/v2/`), and hard-error on anything but 200/401 — see the §3.2 correction above. This is a THIRD, tenant-less endpoint, distinct from both path shapes in the table.
+
+`override_path = true` on containerd means "use the path as-is, don't append `/v2`" — which can be used to **normalize containerd onto BuildKit's shape** if we'd rather have one route. We do not: Docker Engine cannot be normalized this way (its mirror URL always gets an implicit `/v2`, with no `override_path` equivalent), so two shapes are unavoidable regardless of what we do with containerd.
 
 ### 3.6 containerd config — the migration note
 
@@ -286,27 +297,35 @@ One file per upstream namespace, **all pointing at the same Bakery endpoint**. N
 
 **Store and serve manifest bytes verbatim.** A single `json.Marshal` round-trip reorders keys, changes whitespace, and breaks `Docker-Content-Digest`. It will **only** reproduce on multi-arch index manifests — i.e. not in your unit test, and yes in production.
 
-Add a boot-time self-test that round-trips a known multi-arch manifest through the full storage path and asserts the digest.
+⚠️ **As landed (M5), the guarantee is STRUCTURAL rather than a boot-time self-test.** An earlier revision of this doc called for a self-test at boot; that would require writing through a tenant `cache_backends` row before any tenant exists — the wrong layer. What ships instead is stronger: the storage key for every manifest **is** the sha256 Bakery computes over the bytes it actually received (`storage.KeyOf`), verified on ingest by `blob.VerifyDigest` — so re-serialized bytes *cannot be stored under the digest we advertise* — and the `oci-conformance` gate round-trips **vendored real multi-arch index bytes** through the full storage path and asserts the digest on every CI run. Nothing in `internal/cache/oci` parses manifest bytes at all.
+
+⚠️ **containerd 1.7 LTS: verified compatible (v1.7.34, 2026-08-14).** Every claim this section family makes about containerd was re-verified against 1.7.34 (the most-deployed LTS on Kubernetes nodes), not just 2.x: `?ns=` behavior, the hosts.toml `/v2` append + `override_path`, the HEAD fast-path header pair, mirrors-before-`server=` ordering with silent fallback, and the POST-first token dance (verbatim-identical `authorizer.go`) all **hold**. One difference: 1.7 still *parses* Docker schema1 manifests if an upstream serves one, where 2.x hard-rejects them. Bakery never emits schema1, so this matters only if a proxied upstream still serves it — in which case a 1.7 client will accept what a 2.x client refuses; nothing for Bakery to do.
 
 ### 3.8 Manifest TTL and stale-while-revalidate
 
 - Digest-pinned manifests: **immutable**, never expire, never revalidate.
-- Tags: `expires_at = now() + manifest_ttl` (default ~10 min).
-- **On an expired tag, serve the cached manifest immediately and refresh in the background.** Zero added latency, Docker Hub rate limits stop mattering, and an upstream outage becomes a non-event. Also serve stale (not 5xx) when the upstream fetch fails.
+- Tags: freshness is **derived** (`now > updated_at + tag_ttl`, default ~10 min), not a stored `expires_at` — no column can drift out of sync with the row it describes, and re-tuning the TTL takes effect on every already-cached tag instantly, with no migration.
+- **On a stale tag, serve the cached manifest immediately and refresh in the background.** Zero added latency, Docker Hub rate limits stop mattering, and an upstream outage becomes a non-event. Also serve stale (not 5xx) when the upstream fetch fails, indefinitely.
+
+**⚠️ CORRECTION — this is a DELIBERATE IMPROVEMENT over the ecosystem reference, not parity with it, and the doc previously implied the opposite.** `distribution`'s own `registry:2` pull-through proxy does **synchronous remote-first tag resolution on every single pull** — the remote is tried unconditionally and local is only a fallback on failure (`proxytagservice.go:22-39`, verified) — so every cached-image pull still pays a full upstream round trip. Its "TTL" is a **7-day content-eviction timer**, not a freshness horizon: nothing in the reference implementation ever serves a tag without asking upstream first. There is also no normative spec to be consistent with here — the OCI distribution spec's own content-negotiation document is still a TODO in upstream's repo. So "stale-while-revalidate" is not this design lagging behind, or matching, some spec; it is choosing NOT to put the upstream on the hot path of a cache hit, which is the entire point of running a mirror. Cite `distribution`'s source when explaining this to someone who expects registry:2 parity, not a spec section — there isn't one.
 
 A build cache that fails closed when Docker Hub is down is a build cache that isn't doing its job.
 
-### 3.9 Docker Hub rate limits (verified July 2026)
+### 3.9 Docker Hub rate limits
 
-| Tier | Limit | Window |
+**⚠️ CORRECTION — the window is SERVER-SUPPLIED, never hardcode it.** The table below (originally "verified July 2026", citing a 6-hour window) is **already stale**: a live `curl` against `registry-1.docker.io` on 2026-08-14 returned `ratelimit-limit: 100;w=3600` — a **1-hour** window, not 6. Docker's own docs and the live header disagree, and the header is the one that is true at request time. Bakery MUST parse `w=` out of the `ratelimit-limit`/`ratelimit-remaining` response headers on every upstream request and publish it as `bakery_oci_upstream_ratelimit_remaining{upstream}` — never bake in a number from any doc, including this one. Treat the table as an illustration of the SHAPE of the limit, not its current value.
+
+| Tier | Limit | Window (illustrative — read `w=` from the live header) |
 |---|---|---|
-| Unauthenticated | **100 pulls per IPv4 / IPv6 /64** | per 6 hours |
-| Personal (authenticated, free) | 200 pulls | per 6 hours |
+| Unauthenticated | **100 pulls per IPv4 / IPv6 /64** | server-supplied |
+| Personal (authenticated, free) | 200 pulls | server-supplied |
 | Pro / Team / Business | Unlimited | — |
 
 The widely-cited "10/hour unauthenticated" figures from the 2025 announcements are **superseded**.
 
 A "pull" = a manifest version check **plus** any resulting download. Multi-arch images count **once per architecture**.
+
+**⚠️ ADDITION — HEAD is free.** A `HEAD` manifest request (the digest fast path, §3.2) does not decrement the rate-limit counter (verified live). This matters directly for the stale-while-revalidate design in §3.8: a background revalidation that only needs to confirm a tag has not moved should HEAD, not GET, and costs nothing against the budget while doing it.
 
 ⇒ An authenticated pull-through cache moves the whole org from the shared-IP unauthenticated bucket (catastrophic behind NAT'd CI) into an authenticated one, and collapses N runners into one upstream pull per digest.
 

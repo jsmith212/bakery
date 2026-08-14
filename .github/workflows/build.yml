@@ -326,6 +326,73 @@ jobs:
           name: bazel-conformance-log
           path: build/bazel-conformance.log
 
+  # M5's gate. Four clients against a FAKE UPSTREAM registry on loopback, so the job needs
+  # no network egress and no container runtime: containerd's own resolver and
+  # go-containerregistry (both Go libraries, no binary), the REAL skopeo binary (the
+  # containers/image stack, the only one that hard-requires the bare-root GET /v2/ ping),
+  # and Docker Engine BY SHAPE -- moby's own mirror-URL construction replicated, because
+  # the daemon cannot run here and its failure mode is the most silent of the four.
+  #
+  # Every success assertion is paired with an upstream request count: all four clients fall
+  # back to the real registry on ANY mirror failure, so a broken Bakery otherwise produces
+  # green builds, no complaints and a hit rate of zero.
+  #
+  # A SEPARATE job, like the three gates above: it needs skopeo, which `build` has no use
+  # for. It runs through `just oci-conformance`, where a skip FAILS.
+  oci-conformance:
+    runs-on: ubuntu-latest
+
+    # Same postgres service as the other jobs: dbtest uses TEST_DB_URL and never touches
+    # Docker, so the ephemeral database the backends boot against is this service.
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --health-start-period 10s
+
+    env:
+      TEST_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - uses: extractions/setup-just@v3
+
+      # skopeo from apt. ubuntu-latest carries it in universe, and the version there is
+      # new enough to speak the whole pull API this gate uses. No registry login and no
+      # policy file are needed: the suite passes --insecure-policy and talks only to its
+      # own loopback servers.
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+          skopeo --version
+
+      - name: OCI conformance (containerd + crane + skopeo + the Docker Engine URL shape; a skip fails the job)
+        run: just oci-conformance
+
+      - name: Upload the oci conformance log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-conformance-log
+          path: build/oci-conformance.log
+
   commit:
     runs-on: ubuntu-latest
     steps:
@@ -341,7 +408,7 @@ jobs:
 
     # hashserv-conformance is in this list, and that is the point of having written it: a
     # gate that runs, goes red, and still lets the image push to ghcr.io gates nothing.
-    needs: [build, check, commit, conformance, hashserv-conformance, bazel-conformance]
+    needs: [build, check, commit, conformance, hashserv-conformance, bazel-conformance, oci-conformance]
 
     permissions:
       contents: read

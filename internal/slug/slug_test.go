@@ -45,6 +45,9 @@ var cases = []struct {
 	{Name: "reserved v2", Slug: "v2", Valid: false},
 	{Name: "reserved api", Slug: "api", Valid: false},
 	{Name: "reserved cache", Slug: "cache", Valid: false},
+	// M5: /v2/token is the Docker Bearer token endpoint, and it shares a path space
+	// with /v2/{org}/{project}/...
+	{Name: "reserved token", Slug: "token", Valid: false},
 
 	// The camelCase spelling in the spec is unrepresentable under the grammar,
 	// which is exactly why the lowercase form has to be on the denylist.

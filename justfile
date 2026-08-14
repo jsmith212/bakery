@@ -189,6 +189,42 @@ bazel-conformance: generate
     fi; \
     echo "bazel-conformance: remote-apis-sdks + the real ccache and sccache ran green" '
 
+# Drive the REAL containerd resolver + crane + skopeo at the M5 OCI mirror (a skip FAILS)
+oci-conformance: generate
+  # M5's gate, and it has FOUR clients against a FAKE UPSTREAM registry on loopback -- so
+  # it needs no network and no daemon. Client 1 is containerd's own resolver (a test-only
+  # dep): it is the only one that exercises ?ns=, the HEAD digest fast path and the OAuth2
+  # POST token endpoint an identitytoken credential forces. Client 2 is
+  # go-containerregistry (crane's engine), pulling by tag AND by digest through BOTH route
+  # families and validating a whole image, layers included. Client 3 is the REAL skopeo
+  # binary -- containers/image is the only stack that hard-requires the bare-root GET /v2/
+  # ping and harvests its auth challenges from that response alone. Client 4 is Docker
+  # Engine BY SHAPE: the daemon cannot run in CI, so moby's own URL construction
+  # (ValidateMirror's trailing slash, then ResolveReference) is replicated and driven at
+  # Bakery directly -- drop that slash and every pull silently goes to Docker Hub instead.
+  #
+  # EVERY SUCCESS ASSERTION IS PAIRED WITH AN UPSTREAM REQUEST COUNT. All four clients
+  # fall back to the real registry on ANY mirror failure, so "the pull worked" proves
+  # nothing on its own; "the pull worked and the upstream saw zero requests" proves Bakery
+  # served it.
+  #
+  # Not in `just test-db` (which globs ./internal/...): the skopeo half legitimately skips
+  # on a laptop with no client installed. This recipe is its home, and CI installs skopeo
+  # -- so a skip here means a real client did not run, which is a failure.
+  #
+  # bash + pipefail (not `sh`): with `sh` the exit status of `go test | tee` is TEE's, so a
+  # failing suite would report as a pass -- the same trap `test-db`, `conformance`,
+  # `hashserv-conformance` and `bazel-conformance` document.
+  mkdir -p build
+  bash -euo pipefail -c ' \
+    go test -v -count=1 -timeout 20m ./test/oci/... 2>&1 | tee build/oci-conformance.log; \
+    if grep -q -- "--- SKIP" build/oci-conformance.log; then \
+      grep -- "--- SKIP" build/oci-conformance.log; \
+      echo "FAIL: the oci conformance suite SKIPPED -- a real client did not run. Ensure docker or TEST_DB_URL and skopeo."; \
+      exit 1; \
+    fi; \
+    echo "oci-conformance: containerd + crane + skopeo + the Docker Engine URL shape ran green" '
+
 # Run the race detector
 race: web generate
   go test -race ./...

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"github.com/jsmith212/bakery/internal/cache/bazel"
 	"github.com/jsmith212/bakery/internal/cache/hashserv"
 	"github.com/jsmith212/bakery/internal/cache/httpblob"
+	"github.com/jsmith212/bakery/internal/cache/oci"
 	"github.com/jsmith212/bakery/internal/config"
 	"github.com/jsmith212/bakery/internal/db"
 	"github.com/jsmith212/bakery/internal/metrics"
@@ -233,6 +235,42 @@ func Boot(ctx context.Context, p BootParams) error {
 			"upstream is ignored")
 	}
 
+	// M5: the OCI pull-through proxy. Credentials for the upstream registries are
+	// SERVER-LEVEL config (--oci-upstream-auth / BAKERY_OCI_UPSTREAM_AUTH), never the
+	// database -- see oci.Credential's doc for why. A malformed entry is a boot
+	// failure: a typo'd credential flag silently fetching anonymously (or, worse,
+	// silently failing to parse and fetching with an EMPTY credential) is exactly the
+	// kind of thing that must be loud at startup, not discovered in a build log.
+	ociUpstreamAuth, err := oci.ParseUpstreamAuth(cmd.OCIUpstreamAuth)
+	if err != nil {
+		return fmt.Errorf("parse --oci-upstream-auth: %w", err)
+	}
+
+	ociCfg := oci.Config{ExternalURL: cmd.ExternalURL, UpstreamAuth: ociUpstreamAuth}
+
+	// --oci-disable-upstream is BAKERY_OCI_DISABLE_UPSTREAM's kill switch, the exact
+	// shape as HashservDisableUpstream above and for the same reason: it does not take
+	// the mirror down, it stops Bakery dialing anything NEW. ociUpstreamDisabled is a
+	// Fetcher that answers every call with a clean upstream miss (or ErrNoPrincipal for
+	// a nil caller, so the disabled path cannot be distinguished from the live one by
+	// probing the Principal contract) -- every already-cached manifest, tag and blob
+	// keeps serving from cache alone.
+	var ociUp oci.Fetcher
+
+	if cmd.OCIDisableUpstream {
+		log.Warn("oci upstream chaining is disabled server-wide: every OCI backend serves only " +
+			"what is already cached")
+
+		ociUp = ociUpstreamDisabled{}
+	} else {
+		reg, regErr := oci.NewRegistry(ociCfg, m)
+		if regErr != nil {
+			return fmt.Errorf("build oci upstream client: %w", regErr)
+		}
+
+		ociUp = reg
+	}
+
 	// M4: the Bazel REAPI. bazel.New OWNS the /ac and /cas httpblob mounts (it constructs
 	// them internally); sccache is a sibling httpblob backend on its own WebDAV route and
 	// namespace. Both are cache.Backends and mount in headless mode too -- "no console" is
@@ -252,6 +290,14 @@ func Boot(ctx context.Context, p BootParams) error {
 		hashserv.New(cacheDeps, routes, hashservAuth{svc: authSvc}, store, upstreams),
 		bazel.New(cacheDeps, routes, authn, bazelAuth{svc: authSvc}),
 		httpblob.NewSccache(cacheDeps, routes, authn),
+
+		// M5: the OCI pull-through proxy. It shares cacheDeps and the route resolver
+		// with every other backend, and it mounts a SEPARATE global route family
+		// (/v2/... and /cache/{org}/{project}/docker/v2/...) rather than a segment
+		// under /cache/{org}/{project}/ -- see oci.Backend.Register. No new listener:
+		// it is plain HTTP on the public mux, headless included, exactly like sstate
+		// and downloads.
+		oci.New(cacheDeps, routes, ociAuth{svc: authSvc}, ociUp, ociCfg),
 	}
 
 	// Any backend that speaks gRPC registers its services here. Today only bazel does; the
@@ -339,6 +385,69 @@ type bazelAuth struct{ svc *auth.Service }
 
 func (a bazelAuth) AuthenticateToken(ctx context.Context, token string) (bazel.Principal, error) {
 	return a.svc.AuthenticateToken(ctx, token)
+}
+
+// ociAuth adapts *auth.Service to oci.Authenticator. Same pure type-widening delegate
+// as bazelAuth and hashservAuth: oci.Backend deliberately takes a bare TOKEN rather
+// than an *http.Request (see oci.Authenticator's doc -- Docker Engine forwards a
+// user's real Docker Hub credentials to its mirror on every pull, and those must
+// never reach auth.AuthenticateCache's database probe), so AuthenticateToken is the
+// right shape here too.
+type ociAuth struct{ svc *auth.Service }
+
+func (a ociAuth) AuthenticateToken(ctx context.Context, token string) (oci.Principal, error) {
+	return a.svc.AuthenticateToken(ctx, token)
+}
+
+// ociUpstreamDisabled is the Fetcher behind --oci-disable-upstream: it dials nothing
+// and answers every call with a clean upstream miss, so a backend under it serves
+// only what is already cached. It still enforces the Principal contract (nil ->
+// ErrNoPrincipal) rather than always returning the same error, so the disabled state
+// cannot be told apart from a live one by a caller that skips the Principal check --
+// the invariant is "every Fetcher rejects a nil Principal", not "every Fetcher except
+// this one".
+type ociUpstreamDisabled struct{}
+
+var _ oci.Fetcher = ociUpstreamDisabled{}
+
+func (ociUpstreamDisabled) Resolve(
+	_ context.Context, p oci.Principal, _ oci.UpstreamRef, _ string,
+) (oci.Manifest, error) {
+	if p == nil {
+		return oci.Manifest{}, oci.ErrNoPrincipal
+	}
+
+	return oci.Manifest{}, oci.ErrUpstreamNotFound
+}
+
+func (ociUpstreamDisabled) Manifest(
+	_ context.Context, p oci.Principal, _ oci.UpstreamRef, _ string,
+) (oci.Manifest, error) {
+	if p == nil {
+		return oci.Manifest{}, oci.ErrNoPrincipal
+	}
+
+	return oci.Manifest{}, oci.ErrUpstreamNotFound
+}
+
+func (ociUpstreamDisabled) StatBlob(
+	_ context.Context, p oci.Principal, _ oci.UpstreamRef, _ string,
+) (int64, error) {
+	if p == nil {
+		return 0, oci.ErrNoPrincipal
+	}
+
+	return 0, oci.ErrUpstreamNotFound
+}
+
+func (ociUpstreamDisabled) Blob(
+	_ context.Context, p oci.Principal, _ oci.UpstreamRef, _ string,
+) (io.ReadCloser, int64, error) {
+	if p == nil {
+		return nil, 0, oci.ErrNoPrincipal
+	}
+
+	return nil, 0, oci.ErrUpstreamNotFound
 }
 
 // buildAuth assembles the auth service: the pgxpool-backed session store, the
