@@ -214,6 +214,11 @@ type fakeStore struct {
 	projectMembers map[pgtype.UUID][]repository.ListProjectMembersRow
 	siteAdmins     []repository.ListSiteAdminsRow
 
+	// gcRuns is newest-first, matching ListGCRuns' own ORDER BY id DESC -- so the
+	// fake's paging logic can be the same simple prefix-slice a real keyset scan
+	// produces.
+	gcRuns []repository.ListGCRunsRow
+
 	// calls records mutating calls, so a test can assert a denied request wrote
 	// NOTHING -- a 403 that still performed the write is the failure mode a
 	// status-code-only assertion cannot see.
@@ -696,6 +701,55 @@ func (s *fakeStore) DeleteBackend(_ context.Context, id int64) (int64, error) {
 	}
 
 	return 0, nil
+}
+
+func (s *fakeStore) ListGCRuns(
+	_ context.Context, arg repository.ListGCRunsParams,
+) ([]repository.ListGCRunsRow, error) {
+	s.note("ListGCRuns")
+
+	if s.desiredErr != nil {
+		return nil, s.desiredErr
+	}
+
+	out := make([]repository.ListGCRunsRow, 0, len(s.gcRuns))
+
+	for _, run := range s.gcRuns {
+		if arg.Status.Valid && run.Status != arg.Status.GcRunStatus {
+			continue
+		}
+
+		if arg.BeforeID.Valid && run.ID >= arg.BeforeID.Int64 {
+			continue
+		}
+
+		out = append(out, run)
+
+		if int32(len(out)) == arg.PageLimit {
+			break
+		}
+	}
+
+	return out, nil
+}
+
+func (s *fakeStore) GetGCRun(_ context.Context, id int64) (repository.GetGCRunRow, error) {
+	s.note("GetGCRun")
+
+	if s.desiredErr != nil {
+		return repository.GetGCRunRow{}, s.desiredErr
+	}
+
+	for _, run := range s.gcRuns {
+		if run.ID == id {
+			// ListGCRunsRow and GetGCRunRow are the same columns in the same order
+			// (query/gc.sql keeps them textually identical on purpose), so this is a
+			// straight conversion, not a field-by-field copy that could drift.
+			return repository.GetGCRunRow(run), nil
+		}
+	}
+
+	return repository.GetGCRunRow{}, pgx.ErrNoRows
 }
 
 // Tx cannot rebind a *repository.Queries onto a fake -- Queries is a concrete

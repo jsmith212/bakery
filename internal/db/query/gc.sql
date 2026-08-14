@@ -5,27 +5,39 @@
 
 -- INSERT and COMMIT this BEFORE any scanning begins: started_at and snapshot are
 -- frozen as of this transaction, and every sweep statement afterwards filters
--- against them. gc_runs_single_active_idx makes a second concurrent run a unique
--- violation rather than a race.
+-- against them. gc_runs_single_active_idx makes a second concurrent REAL
+-- (dry_run = false) run a unique violation rather than a race; dry runs share no
+-- such slot (000012: `WHERE status = 'running' AND NOT dry_run`) and may overlap
+-- each other and a real run freely, because a dry run never writes.
 --
 -- Never select `snapshot` back into Go. It is referenced only inside SQL
 -- predicates, where it is cast back to pg_snapshot.
 --
 -- name: StartGCRun :one
-INSERT INTO gc_runs (grace_period)
-VALUES ($1)
+INSERT INTO gc_runs (grace_period, trigger, dry_run)
+VALUES ($1, $2, $3)
 RETURNING id, started_at;
 
--- name: FinishGCRun :exec
+-- Gains `AND status = 'running'` (finding 4): a stale finisher -- the boot reaper
+-- racing the process's own shutdown finisher, or a shutdown finisher racing a run
+-- that already finished on its own -- can now never move a run OUT of a terminal
+-- state. Without the predicate, a delayed FinishGCRun(failed, "shutdown") landing
+-- after the run had already legitimately succeeded would silently overwrite
+-- objects_deleted/blobs_marked/etc back toward zero on a row every metric and every
+-- audit view treats as done. :execrows is the caller's signal: 0 means this call
+-- lost the race and touched nothing, not that the update was a no-op success.
+--
+-- name: FinishGCRun :execrows
 UPDATE gc_runs
-   SET status          = $2,
-       error           = $3,
-       finished_at     = now(),
-       objects_deleted = $4,
-       blobs_marked    = $5,
-       blobs_deleted   = $6,
-       bytes_reclaimed = $7
- WHERE id = $1;
+   SET status                = $2,
+       error                 = $3,
+       finished_at           = now(),
+       objects_deleted       = $4,
+       blobs_marked          = $5,
+       blobs_deleted         = $6,
+       bytes_reclaimed       = $7,
+       hashserv_rows_deleted = $8
+ WHERE id = $1 AND status = 'running';
 
 -- THE MARK. The write barrier lives here, and BOTH forms of it are ANDed.
 --
@@ -108,3 +120,453 @@ SELECT digest, size_bytes
  WHERE state = 'pending_delete'
  ORDER BY delete_started_at
  LIMIT $1;
+
+-- Boot-time reaper (spec §9.3), and it runs IFF this process actually holds the
+-- boot advisory lock -- gated by the CALLER on the lock, not on a flag, because
+-- under --allow-multi-instance a booting instance must never mark ANOTHER
+-- instance's live sweep failed. gc_runs_single_active_idx caps the real-run slot
+-- at one row, but a crashed DRY run can also be left 'running' (dry runs hold no
+-- slot), so the predicate is deliberately just `status = 'running'` and catches
+-- both.
+--
+-- name: MarkOrphanedGCRunsFailed :execrows
+UPDATE gc_runs
+   SET status      = 'failed',
+       error       = 'orphaned: process restarted mid-run',
+       finished_at = now()
+ WHERE status = 'running';
+
+-- ===========================================================================
+-- Layer A, per-backend enumeration (spec §3, §9.1: the in-process GC loop reads
+-- this list once per pass and iterates every kind's stage over it).
+-- ===========================================================================
+
+-- Every cache_backends row, joined out to the slugs GC's metrics label on
+-- (CLAUDE.md: Prometheus labels are slugs, never keys or digests -- and never a
+-- bigint id). `enabled` is returned, NEVER filtered on: disabled backends are
+-- swept too, and HARDER (spec §3, finding 10) -- disabled is a stronger retention
+-- signal, not an exemption, so the caller computes an effective window of
+-- least(configured, 30d) rather than skipping the row. retention_window and
+-- quota_bytes ride along NULL exactly when a backend is unmanaged by GC (spec §8,
+-- finding 7a: NULL window + NULL quota means "skip this backend's retention scan
+-- entirely" -- inert config costs nothing).
+--
+-- name: ListBackendsForGC :many
+SELECT cb.id, cb.kind, cb.enabled, cb.retention_window, cb.quota_bytes,
+       cb.project_id, p.slug AS project_slug, p.org_id, o.slug AS org_slug
+  FROM cache_backends cb
+  JOIN projects p ON p.id = cb.project_id
+  JOIN organizations o ON o.id = p.org_id
+ ORDER BY cb.id;
+
+-- ===========================================================================
+-- Layer A, cache_objects: the write-barrier-filtered scan + the keyed batch
+-- delete (spec §3, §9.2).
+-- ===========================================================================
+--
+-- ScanObjectsForGC applies ONLY the universal write barrier (spec §3's first two
+-- of three ANDed predicates) -- NOT a stage's own retention/reachability rule.
+-- That third predicate needs cross-table unihash lookups (sstate, §5),
+-- tag-vs-manifest anti-joins (OCI, §3 stage 8) or a quota histogram (§8): none of
+-- those belong in a generic per-backend cursor, so the caller decides eligibility
+-- in Go over the rows this returns and deletes the losers via DeleteObjectsByKeys.
+--
+-- KEYSET, not OFFSET, over cache_objects_pkey's own column order
+-- (backend_id, namespace, key): a single backend's slice is a contiguous range of
+-- that btree, and the tuple comparison `(namespace, key) > (after_namespace,
+-- after_key)` resumes exactly where the previous batch's LAST row left off. Pass
+-- ('', '') to start from the beginning -- key has a CHECK (octet_length BETWEEN 1
+-- AND 1024), so no real row's key is ever '', and namespace legitimately IS '' for
+-- sstate/downloads, which is why the comparison is on the PAIR and not on key
+-- alone.
+--
+-- run_id, not started_at/snapshot passed from Go: CLAUDE.md's rule for gc_runs
+-- ("never select snapshot back into Go") holds here exactly as it holds in
+-- MarkBlobsPendingDelete -- the frozen values are looked up FROM the row, in SQL,
+-- by id.
+--
+-- name: ScanObjectsForGC :many
+WITH run AS (
+    SELECT started_at, snapshot FROM gc_runs WHERE id = sqlc.arg(run_id)
+)
+SELECT o.namespace, o.key, o.digest, o.size_bytes,
+       o.created_at, o.accessed_at, o.updated_at, o.content_type
+  FROM cache_objects o, run g
+ WHERE o.backend_id = sqlc.arg(backend_id)
+   AND (o.namespace, o.key) > (sqlc.arg(after_namespace)::text, sqlc.arg(after_key)::text)
+   AND o.created_at < g.started_at
+   AND pg_visible_in_snapshot(o.live_xid::text::xid8, g.snapshot::pg_snapshot)
+ ORDER BY o.namespace, o.key
+ LIMIT sqlc.arg(scan_limit);
+
+-- THE GC's ONLY batch delete of cache_objects (spec §9.2; blob.Service.DeleteBatch
+-- is the only caller). Scoped to ONE (backend_id, namespace) -- every GC stage
+-- already operates one namespace at a time -- with the doomed set's keys and
+-- digests passed as parallel arrays.
+--
+-- DIGEST-ORDERED, not caller-ordered (finding 3): the refcount trigger's /ac/
+-- overwrite branch takes its paired blob locks in ascending digest order
+-- SPECIFICALLY to avoid an ABBA deadlock against a concurrent overwrite touching
+-- the same two digests in the opposite order (see cache_objects_refcount() in
+-- 000006). A batch delete that processed rows in an arbitrary order would
+-- reintroduce that same ABBA a thousand digests wide: this transaction locking
+-- blobs.digest = A then B while a concurrent /ac/ PUT locks B then A. Sorting the
+-- driving set by digest BEFORE the DELETE touches a single row -- mirroring
+-- DeleteObjectsChunk's existing subquery-then-DELETE shape -- makes every writer
+-- that deletes in digest order (this query) or locks in digest order (the
+-- trigger) acquire blobs row locks in the SAME global order, so the cycle cannot
+-- form. The caller retries bounded on 40P01 regardless, for the residual case of
+-- two batches racing each other.
+--
+-- name: DeleteObjectsByKeys :execrows
+DELETE FROM cache_objects o
+ USING (
+     SELECT k.key, d.digest
+       FROM unnest(sqlc.arg(keys)::text[])    WITH ORDINALITY AS k(key, ord)
+       JOIN unnest(sqlc.arg(digests)::bytea[]) WITH ORDINALITY AS d(digest, ord)
+         ON k.ord = d.ord
+      ORDER BY d.digest
+ ) doomed
+ WHERE o.backend_id = sqlc.arg(backend_id)
+   AND o.namespace   = sqlc.arg(namespace)
+   AND o.key         = doomed.key;
+
+-- Batched, staleness-guarded write of accessed_at = now() (spec §6.1): the
+-- toucher flusher's ONLY write. `touchKeysSQL` shape -- ONE UPDATE per flush tick
+-- per backend, not one per key, is what makes "N reads in T => one UPDATE"
+-- (TestToucherFlushIsCoalesced) hold.
+--
+-- THE STALENESS GUARD (accessed_at IS NULL OR accessed_at < now() - staleness) is
+-- not an optimisation, it is what keeps this a HOT update under a hot key: without
+-- it, a key read every few seconds writes accessed_at every few seconds forever,
+-- against a column that is (correctly) in no index but still costs a tuple copy
+-- per write. Guarding on T (--gc-touch-staleness) bounds the write rate to at most
+-- one per key per T regardless of read rate.
+--
+-- DOES NOT TOUCH created_at OR live_xid, on purpose (mirrors TouchObject's
+-- comment in objects.sql): those two ARE the write barrier, which marks ROW
+-- CREATION, and a touch that confirmed a row is still read created nothing.
+--
+-- name: TouchObjectsAccessed :execrows
+UPDATE cache_objects
+   SET accessed_at = now()
+ WHERE backend_id = sqlc.arg(backend_id)
+   AND namespace   = sqlc.arg(namespace)
+   AND key = ANY(sqlc.arg(keys)::text[])
+   AND (accessed_at IS NULL OR accessed_at < now() - sqlc.arg(staleness)::interval);
+
+-- The hashserv_unihashes twin of TouchObjectsAccessed, keyed on the table's real
+-- primary key (backend_id, method, taskhash) rather than a single key column, so
+-- method and taskhash travel as parallel arrays through the same unnest-then-join
+-- shape DeleteObjectsByKeys uses. Same staleness guard, same "does not touch
+-- created_at / live_xid" rule, for the same reason.
+--
+-- name: TouchUnihashesAccessed :execrows
+UPDATE hashserv_unihashes u
+   SET accessed_at = now()
+  FROM (
+      SELECT m.method, t.taskhash
+        FROM unnest(sqlc.arg(methods)::text[])    WITH ORDINALITY AS m(method, ord)
+        JOIN unnest(sqlc.arg(taskhashes)::text[]) WITH ORDINALITY AS t(taskhash, ord)
+          ON m.ord = t.ord
+  ) pair
+ WHERE u.backend_id = sqlc.arg(backend_id)
+   AND u.method     = pair.method
+   AND u.taskhash   = pair.taskhash
+   AND (u.accessed_at IS NULL OR u.accessed_at < now() - sqlc.arg(staleness)::interval);
+
+-- ===========================================================================
+-- Layer A, hashserv (spec §3 stages 1-2). hashserv_unihashes is the GC ROOT: an
+-- sstate object is reachable only FROM a unihash row, so this sweep runs BEFORE
+-- sstate's (CLAUDE.md, query/hashserv.sql's file header).
+-- ===========================================================================
+--
+-- THE LIVENESS RULE, VERBATIM (spec §3): coalesce(accessed_at, created_at) <
+-- now() - window. NOT a bare `accessed_at < ...` -- that makes every pre-upgrade
+-- row (every accessed_at is NULL on day one) immortal, and makes quota eviction
+-- non-terminating (finding 1, TestNullAccessedAtRowsAreSweepable). created_at is
+-- used ONLY when there is no read record at all, which is genuinely cold; this is
+-- not the same trap as trusting a CAS blob's created_at alone (CLAUDE.md's GC/M4
+-- note), because coalesce here still prefers the read timestamp when one exists.
+--
+-- Both write-barrier halves, exactly as MarkBlobsPendingDelete carries them, via
+-- the same run_id-scoped CTE.
+--
+-- name: SweepUnihashes :execrows
+WITH run AS (
+    SELECT started_at, snapshot FROM gc_runs WHERE id = sqlc.arg(run_id)
+)
+DELETE FROM hashserv_unihashes u
+ USING run g
+ WHERE u.backend_id = sqlc.arg(backend_id)
+   AND u.created_at < g.started_at
+   AND pg_visible_in_snapshot(u.live_xid::text::xid8, g.snapshot::pg_snapshot)
+   AND coalesce(u.accessed_at, u.created_at) < now() - sqlc.arg(retention_window)::interval;
+
+-- Dry-run mirror of SweepUnihashes: identical predicate, COUNT instead of DELETE.
+-- Every destructive sweep query in this file has one of these; a dry run's gc_runs
+-- row (dry_run = true) is genuinely read-only and performs no delete anywhere.
+--
+-- name: DryRunSweepUnihashes :one
+WITH run AS (
+    SELECT started_at, snapshot FROM gc_runs WHERE id = sqlc.arg(run_id)
+)
+SELECT count(*)::bigint AS would_delete
+  FROM hashserv_unihashes u, run g
+ WHERE u.backend_id = sqlc.arg(backend_id)
+   AND u.created_at < g.started_at
+   AND pg_visible_in_snapshot(u.live_xid::text::xid8, g.snapshot::pg_snapshot)
+   AND coalesce(u.accessed_at, u.created_at) < now() - sqlc.arg(retention_window)::interval;
+
+-- Batch existence probe for the sstate unihash-root derivation (spec §5 step 4):
+-- given every unihash a scan batch of sstate keys derived, which ones still have a
+-- surviving row on the PAIRED hashserv backend. Rides hashserv_unihashes_unihash
+-- (backend_id, unihash) exactly as UnihashExists (query/hashserv.sql) does for the
+-- single-value form; this is that query's StatObjectsBatch-shaped sibling so a
+-- scan batch costs one round trip instead of one per key.
+--
+-- Returns ONLY the unihashes that exist -- same "absence is the answer" contract
+-- as StatObjectsBatch (query/objects.sql). An unparseable or absent unihash is
+-- legal (spec §5 step 5: do_populate_lic swspecs, or a deployment with zero
+-- hashserv coverage) and is NOT an error; it is what makes the caller treat the
+-- sstate key as unreachable.
+--
+-- name: UnihashesExistBatch :many
+SELECT unihash
+  FROM hashserv_unihashes
+ WHERE backend_id = sqlc.arg(backend_id)
+   AND unihash = ANY(sqlc.arg(unihashes)::text[]);
+
+-- THE OTHER HALF OF THE sstate COVERAGE GUARD (spec §5, finding 12). Coverage on
+-- its own cannot tell two situations apart, and they demand opposite behaviour:
+--
+--   no hashserv data at all (an rsync'd mirror, BB_HASHSERVE=auto, no hashserv
+--   backend) -- collapsing sstate retention to age-only is CORRECT there;
+--   the derivation broke -- age-only retention would delete a live cache.
+--
+-- Both read as "zero unihashes resolved". This query is what separates them: the
+-- engine refuses to sweep an sstate backend that resolved ZERO unihashes while its
+-- PAIRED hashserv backend holds rows.
+--
+-- EXISTS, not count(*): the answer is a boolean, so the plan stops at the first
+-- matching row of the (backend_id, ...) index prefix. The guard costs one index
+-- probe per sstate backend per run rather than a full count of a table that holds
+-- one row per task per build.
+--
+-- name: HashservBackendHasUnihashes :one
+SELECT EXISTS (
+    SELECT 1 FROM hashserv_unihashes WHERE backend_id = sqlc.arg(backend_id)
+)::boolean AS has_rows;
+
+-- Orphaned outhash rows (spec §3 stage 2): space reclamation, not correctness
+-- (finding 9) -- the equivalence queries in query/hashserv.sql (GetEquivalentForOuthash,
+-- GetOuthashWithUnihash) already JOIN hashserv_unihashes, so an orphan is filtered
+-- out of every answer, never served as one. Deleting it just stops it from taking
+-- up space.
+--
+-- NO accessed_at ON THIS TABLE (spec §7: only cache_objects and
+-- hashserv_unihashes get the column -- hashserv_outhashes is read exclusively by
+-- get-outhash/get(all=true), never on a build's hot path, so there is nothing
+-- worth tracking reads for). The liveness rule therefore degenerates to plain
+-- created_at < now() - window rather than a coalesce: there is no second timestamp
+-- to prefer.
+--
+-- name: SweepOrphanedOuthashes :execrows
+WITH run AS (
+    SELECT started_at, snapshot FROM gc_runs WHERE id = sqlc.arg(run_id)
+)
+DELETE FROM hashserv_outhashes o
+ USING run g
+ WHERE o.backend_id = sqlc.arg(backend_id)
+   AND o.created_at < g.started_at
+   AND pg_visible_in_snapshot(o.live_xid::text::xid8, g.snapshot::pg_snapshot)
+   AND o.created_at < now() - sqlc.arg(retention_window)::interval
+   AND NOT EXISTS (
+       SELECT 1 FROM hashserv_unihashes u
+        WHERE u.backend_id = o.backend_id
+          AND u.method     = o.method
+          AND u.taskhash   = o.taskhash
+   );
+
+-- name: DryRunSweepOrphanedOuthashes :one
+WITH run AS (
+    SELECT started_at, snapshot FROM gc_runs WHERE id = sqlc.arg(run_id)
+)
+SELECT count(*)::bigint AS would_delete
+  FROM hashserv_outhashes o, run g
+ WHERE o.backend_id = sqlc.arg(backend_id)
+   AND o.created_at < g.started_at
+   AND pg_visible_in_snapshot(o.live_xid::text::xid8, g.snapshot::pg_snapshot)
+   AND o.created_at < now() - sqlc.arg(retention_window)::interval
+   AND NOT EXISTS (
+       SELECT 1 FROM hashserv_unihashes u
+        WHERE u.backend_id = o.backend_id
+          AND u.method     = o.method
+          AND u.taskhash   = o.taskhash
+   );
+
+-- outhash_siginfo is set NULL on ANY outhash row PAST W_siginfo = 4 x W -- orphaned
+-- or not (spec §3 stage 2, finding 19): siginfo is ~128 KiB of TOASTed text
+-- (000010's comment on hashserv_outhashes.outhash_siginfo), read only by
+-- get-outhash/get(all=true) RPCs that are not on any build's path, so it is purely
+-- a space-reclamation UPDATE. The write barrier is still carried for the same
+-- reason every Layer-A stage carries it: a still-in-flight report's row must not
+-- be mutated out from under it, even though the 4x window makes the practical risk
+-- small. A row whose siginfo is already NULL is excluded so a re-run never issues
+-- a write for a row it already cleared (cheap, and keeps this idempotent at the
+-- statement level as well as the data level).
+--
+-- name: NullOrphanSiginfo :execrows
+WITH run AS (
+    SELECT started_at, snapshot FROM gc_runs WHERE id = sqlc.arg(run_id)
+)
+UPDATE hashserv_outhashes o
+   SET outhash_siginfo = NULL
+  FROM run g
+ WHERE o.backend_id = sqlc.arg(backend_id)
+   AND o.outhash_siginfo IS NOT NULL
+   AND o.created_at < g.started_at
+   AND pg_visible_in_snapshot(o.live_xid::text::xid8, g.snapshot::pg_snapshot)
+   AND o.created_at < now() - sqlc.arg(retention_window)::interval;
+
+-- name: DryRunNullOrphanSiginfo :one
+WITH run AS (
+    SELECT started_at, snapshot FROM gc_runs WHERE id = sqlc.arg(run_id)
+)
+SELECT count(*)::bigint AS would_null
+  FROM hashserv_outhashes o, run g
+ WHERE o.backend_id = sqlc.arg(backend_id)
+   AND o.outhash_siginfo IS NOT NULL
+   AND o.created_at < g.started_at
+   AND pg_visible_in_snapshot(o.live_xid::text::xid8, g.snapshot::pg_snapshot)
+   AND o.created_at < now() - sqlc.arg(retention_window)::interval;
+
+-- ===========================================================================
+-- Layer A, OCI manifests (spec §3 stage 8). CLAUDE.md's "sweep tags before
+-- manifests before the blobs table" resolves here to: this query runs after the
+-- tags-namespace sweep (stage 7, an ordinary window-only DeleteObjectsByKeys pass
+-- Go drives over ScanObjectsForGC -- no dedicated query, a tag has no fan-in to
+-- anti-join against) and before the OCI blobs-namespace sweep (stage 9, same
+-- ordinary shape).
+-- ===========================================================================
+--
+-- TAG -> MANIFEST ANTI-JOIN, backend-scoped. cache_objects_digest_idx is on
+-- digest ALONE (000006), so the backend_id match on the inner NOT EXISTS is a
+-- POST-filter over that index's candidate rows, not an indexed predicate -- fine
+-- at OCI scale (spec §3 stage 8 says so explicitly).
+--
+-- coalesce(accessed_at, created_at), NOT created_at alone (finding 18): a deduped,
+-- hot base-image manifest can be old by created_at while still being pulled
+-- constantly through a DIFFERENT tag in the SAME backend that this query's
+-- anti-join does not see (a different repo, same digest) -- that is precisely the
+-- CAS trap CLAUDE.md's GC/M4 note describes, reproduced one layer up in OCI. The
+-- coalesce rule is what a fresh StatUncached-triggered read (which touches
+-- accessed_at through the LRU, spec §6.1) keeps alive even with zero tags pointing
+-- at it directly.
+--
+-- No DeleteObjectsByKeys round trip: this is a single self-contained DELETE
+-- because, unlike the sstate root derivation, the anti-join needs no Go-side
+-- lookup to decide eligibility. No explicit digest ordering either (contrast
+-- DeleteObjectsByKeys): manifests are an IMMUTABLE namespace written only by
+-- PutObjectImmutable, so the refcount trigger's INSERT/DELETE branches each take
+-- exactly one blobs row lock -- the paired-lock UPDATE branch that motivates
+-- digest ordering never fires here.
+--
+-- name: SweepUnreferencedManifests :execrows
+WITH run AS (
+    SELECT started_at, snapshot FROM gc_runs WHERE id = sqlc.arg(run_id)
+)
+DELETE FROM cache_objects m
+ USING run g
+ WHERE m.backend_id = sqlc.arg(backend_id)
+   AND m.namespace   = 'manifests'
+   AND m.created_at  < g.started_at
+   AND pg_visible_in_snapshot(m.live_xid::text::xid8, g.snapshot::pg_snapshot)
+   AND coalesce(m.accessed_at, m.created_at) < now() - sqlc.arg(retention_window)::interval
+   AND NOT EXISTS (
+       SELECT 1 FROM cache_objects t
+        WHERE t.backend_id = m.backend_id
+          AND t.namespace  = 'tags'
+          AND t.digest     = m.digest
+   );
+
+-- name: DryRunSweepUnreferencedManifests :one
+WITH run AS (
+    SELECT started_at, snapshot FROM gc_runs WHERE id = sqlc.arg(run_id)
+)
+SELECT count(*)::bigint AS would_delete
+  FROM cache_objects m, run g
+ WHERE m.backend_id = sqlc.arg(backend_id)
+   AND m.namespace   = 'manifests'
+   AND m.created_at  < g.started_at
+   AND pg_visible_in_snapshot(m.live_xid::text::xid8, g.snapshot::pg_snapshot)
+   AND coalesce(m.accessed_at, m.created_at) < now() - sqlc.arg(retention_window)::interval
+   AND NOT EXISTS (
+       SELECT 1 FROM cache_objects t
+        WHERE t.backend_id = m.backend_id
+          AND t.namespace  = 'tags'
+          AND t.digest     = m.digest
+   );
+
+-- ===========================================================================
+-- Quota / storage gauges (spec §8).
+-- ===========================================================================
+
+-- One row per backend, upserted by the sweep's own scan pass or by the
+-- lightweight --gc-usage-interval pass that runs even with retention disabled
+-- (finding 7b/13). objects_count/logical_bytes are the LOGICAL accounting the
+-- 000012 table comment explains; measured_at is what makes staleness detectable
+-- (bakery_gc_usage_measured_timestamp_seconds, spec §9.9).
+--
+-- name: UpsertBackendUsage :exec
+INSERT INTO cache_backend_usage (backend_id, objects_count, logical_bytes, measured_at)
+VALUES (sqlc.arg(backend_id), sqlc.arg(objects_count), sqlc.arg(logical_bytes), now())
+ON CONFLICT (backend_id) DO UPDATE
+   SET objects_count = EXCLUDED.objects_count,
+       logical_bytes = EXCLUDED.logical_bytes,
+       measured_at   = EXCLUDED.measured_at;
+
+-- The INSTANCE-WIDE, backend-blind physical gauge (finding 15): quota accounting
+-- is logical and per-backend (cache_backend_usage above), so it is the wrong
+-- number for "how much disk is this process actually using" under cross-project
+-- dedup -- a blob named by three backends counts three times in their logical
+-- totals and once here. bakery_storage_physical_bytes is the number an operator
+-- alerts on for disk pressure; 'live' excludes bytes already marked
+-- pending_delete (not yet reaped, but no longer counted as space in productive
+-- use).
+--
+-- name: InstancePhysicalBytes :one
+SELECT coalesce(sum(size_bytes), 0)::bigint AS physical_bytes
+  FROM blobs
+ WHERE state = 'live';
+
+-- ===========================================================================
+-- Operator surface (spec §9.10): GET /api/v1/gc/runs[, /{id}], read-only. Nothing
+-- below writes; both ride gc_runs_started_at_idx / the primary key.
+-- ===========================================================================
+
+-- KEYSET pagination on id DESC, not OFFSET: gc_runs.id is a bigint IDENTITY that
+-- only ever grows, and it agrees with gc_runs_started_at_idx's own DESC order
+-- (rows are inserted in id order), so "id < the last row on the previous page"
+-- resumes exactly where that page left off. An OFFSET page would silently skip or
+-- repeat a row the instant a new run starts between two requests -- which, for an
+-- endpoint whose whole purpose is watching runs start, is not a rare case.
+--
+-- sqlc.narg(status) / sqlc.narg(before_id): NULL means "no filter" and "from the
+-- newest row", which is how the API's optional ?status= and a first page both
+-- read -- no separate "list everything" query to keep in sync with this one.
+--
+-- name: ListGCRuns :many
+SELECT id, started_at, finished_at, status, error, trigger, dry_run,
+       objects_deleted, blobs_marked, blobs_deleted, bytes_reclaimed, hashserv_rows_deleted
+  FROM gc_runs
+ WHERE (sqlc.narg(status)::gc_run_status IS NULL OR status = sqlc.narg(status)::gc_run_status)
+   AND (sqlc.narg(before_id)::bigint IS NULL OR id < sqlc.narg(before_id)::bigint)
+ ORDER BY id DESC
+ LIMIT sqlc.arg(page_limit);
+
+-- name: GetGCRun :one
+SELECT id, started_at, finished_at, status, error, trigger, dry_run,
+       objects_deleted, blobs_marked, blobs_deleted, bytes_reclaimed, hashserv_rows_deleted
+  FROM gc_runs
+ WHERE id = sqlc.arg(id);

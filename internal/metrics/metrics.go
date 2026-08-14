@@ -189,6 +189,11 @@ type Metrics struct {
 	// series for free; these describe the UPSTREAM leg, which has no local analogue.
 	// See oci.go.
 	oci ociCollectors
+
+	// gc. UNEXPORTED, reached through Metrics.GC. The sweep is also the FIRST writer
+	// of StorageObjects/StorageBytes above -- nothing else measures them, because
+	// nothing else does a full pass over a backend's rows. See gc.go.
+	gc gcCollectors
 }
 
 // httpBuckets start at 100us. prometheus' DefBuckets start at 5ms, which would
@@ -306,6 +311,7 @@ func New() *Metrics {
 		hashserv: newHashservCollectors(f),
 		bazel:    newBazelCollectors(f),
 		oci:      newOCICollectors(f),
+		gc:       newGCCollectors(f),
 	}
 }
 

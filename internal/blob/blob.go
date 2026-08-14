@@ -43,6 +43,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
@@ -288,6 +289,11 @@ type Config struct {
 
 	// CacheSize is the LRU's entry ceiling. Zero means defaultCacheSize.
 	CacheSize int
+
+	// Logger is used by the background access toucher and nothing else -- every
+	// request path in this package reports through errors and metrics, never logs.
+	// Nil means slog.Default().
+	Logger *slog.Logger
 }
 
 // Service is the keyed blob service.
@@ -296,9 +302,14 @@ type Service struct {
 	tx      Txer
 	store   storage.Store
 	metrics *metrics.Metrics
+	log     *slog.Logger
 
 	lru *lruCache
 	sf  singleflight.Group
+
+	// aux is the non-LRU pending-touch set: spec 6.3's reachability marks. See
+	// toucher.go for why there are two mark sources and not one.
+	aux *auxPending
 
 	// THE RECORDER MEMO, and it is not the same thing as metrics.RecorderCache.
 	//
@@ -325,6 +336,9 @@ type Service struct {
 	qDelete     counter
 	qGetPhysDel counter
 	qReap       counter
+
+	qTouchAccessed counter
+	qDeleteByKeys  counter
 
 	sfInFlight gauge
 }
@@ -357,13 +371,20 @@ func New(cfg Config) (*Service, error) {
 
 	m := cfg.Metrics
 
+	log := cfg.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+
 	return &Service{
 		reader:      cfg.Reader,
 		tx:          cfg.Tx,
 		store:       cfg.Storage,
 		metrics:     m,
+		log:         log,
 		recs:        make(map[recKey]*metrics.Recorder),
 		lru:         newLRU(m, size),
+		aux:         newAuxPending(),
 		qStat:       m.DBQueries.WithLabelValues("StatObject"),
 		qStatBatch:  m.DBQueries.WithLabelValues("StatObjectsBatch"),
 		qList:       m.DBQueries.WithLabelValues("ListObjectKeysByPrefix"),
@@ -376,7 +397,11 @@ func New(cfg Config) (*Service, error) {
 		qDelete:     m.DBQueries.WithLabelValues("DeleteObject"),
 		qGetPhysDel: m.DBQueries.WithLabelValues("GetBlobForPhysicalDelete"),
 		qReap:       m.DBQueries.WithLabelValues("ReapBlob"),
-		sfInFlight:  m.SingleflightInFlight,
+
+		qTouchAccessed: m.DBQueries.WithLabelValues("TouchObjectsAccessed"),
+		qDeleteByKeys:  m.DBQueries.WithLabelValues("DeleteObjectsByKeys"),
+
+		sfInFlight: m.SingleflightInFlight,
 	}, nil
 }
 

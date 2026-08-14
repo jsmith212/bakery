@@ -83,6 +83,11 @@ func Run(ctx context.Context, command string, cli config.CLI) error {
 	case "downloads push":
 		return downloadsPush(ctx, client, r, cli.Downloads.Push)
 
+	case "gc run":
+		return gcRun(ctx, client, r, cli.GC.Run)
+	case "gc list":
+		return gcList(ctx, client, r, cli.GC.List)
+
 	default:
 		return fmt.Errorf("unknown command: %q", command)
 	}

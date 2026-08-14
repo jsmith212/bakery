@@ -23,6 +23,7 @@ import (
 	"github.com/jsmith212/bakery/internal/cache/oci"
 	"github.com/jsmith212/bakery/internal/config"
 	"github.com/jsmith212/bakery/internal/db"
+	"github.com/jsmith212/bakery/internal/gc"
 	"github.com/jsmith212/bakery/internal/metrics"
 	"github.com/jsmith212/bakery/internal/storage"
 )
@@ -178,15 +179,6 @@ func Boot(ctx context.Context, p BootParams) error {
 			"with no credential. This is a total authentication bypass. Never run this in production.")
 	}
 
-	apiSrv, err := api.New(api.Config{
-		Store: store, Auth: authSvc, Metrics: m, Log: log,
-		AllowSelfServeOrgs:   cmd.AllowSelfServeOrgs,
-		AllowLocalSiteAdmins: cmd.AllowLocalSiteAdmins,
-	})
-	if err != nil {
-		return fmt.Errorf("build api: %w", err)
-	}
-
 	// The blob service: the ONE writer of object metadata and the only door to the
 	// bytes. Its Reader/Txer are the same *db.Store; dedup, refcounts, the LRU,
 	// singleflight and the headline cache metrics all live behind it.
@@ -195,9 +187,54 @@ func Boot(ctx context.Context, p BootParams) error {
 		Tx:      store,
 		Storage: byteStore,
 		Metrics: m,
+		Logger:  log,
 	})
 	if err != nil {
 		return fmt.Errorf("build blob service: %w", err)
+	}
+
+	// M6: the garbage collector. It is constructed unconditionally -- the boot reaper
+	// below and the toucher's T ramp are its responsibilities whether or not the sweep
+	// itself runs -- and its loops decide for themselves whether to start.
+	//
+	// Built BEFORE apiSrv (M6 stage 5): POST /api/v1/gc/run needs the engine
+	// itself, not just Store, to answer 409 the instant a second real run is
+	// attempted -- see api.Config.GC.
+	gcEngine, err := gc.New(gc.Deps{DB: store, Blobs: blobs, Metrics: m, Log: log}, gc.Config{
+		Enabled:            cmd.GC.GCEnabled,
+		AllowMultiInstance: cmd.AllowMultiInstance,
+		Interval:           cmd.GC.GCInterval,
+		UsageInterval:      cmd.GC.GCUsageInterval,
+		GracePeriod:        cmd.GC.GCGracePeriod,
+		BatchSize:          cmd.GC.GCBatchSize,
+		BatchPause:         cmd.GC.GCBatchPause,
+		DisableRetention:   cmd.GC.GCDisableRetention,
+		TouchInterval:      cmd.GC.GCTouchInterval,
+		TouchStaleness:     cmd.GC.GCTouchStaleness,
+	})
+	if err != nil {
+		return fmt.Errorf("build gc engine: %w", err)
+	}
+
+	apiSrv, err := api.New(api.Config{
+		Store: store, Auth: authSvc, Metrics: m, Log: log, GC: gcEngine,
+		AllowSelfServeOrgs:   cmd.AllowSelfServeOrgs,
+		AllowLocalSiteAdmins: cmd.AllowLocalSiteAdmins,
+	})
+	if err != nil {
+		return fmt.Errorf("build api: %w", err)
+	}
+
+	// THE BOOT REAPER RUNS IFF THIS PROCESS ACTUALLY HOLDS THE BOOT LOCK (spec §9.3),
+	// which is why the gate is `lock != nil` and not `!cmd.AllowMultiInstance`: a boot
+	// that merely passed the flag may be starting alongside a healthy instance whose
+	// sweep is live, and marking that run failed would both lie in the audit trail and
+	// hand the active slot to a second concurrent sweep. Holding the lock is the proof
+	// that anything still 'running' is this process's own predecessor.
+	if lock != nil {
+		if err := gcEngine.ReapOrphanedRuns(ctx); err != nil {
+			return fmt.Errorf("reap orphaned gc runs: %w", err)
+		}
 	}
 
 	// The M2 cache backends: sstate and downloads, both the shared httpblob handler
@@ -284,10 +321,15 @@ func Boot(ctx context.Context, p BootParams) error {
 		grpc.MaxSendMsgSize(grpcMaxMsgSize),
 	)
 
+	// Captured in a named var, not inlined into cacheBackends below, so boot can also
+	// hand its access-toucher loop (M6 spec 6.1's hashserv paragraph) a starting
+	// point beside blobs.StartAccessToucher.
+	hashservBackend := hashserv.New(cacheDeps, routes, hashservAuth{svc: authSvc}, store, upstreams)
+
 	cacheBackends := []cache.Backend{
 		httpblob.NewSstate(cacheDeps, routes, authn),
 		httpblob.NewDownloads(cacheDeps, routes, authn),
-		hashserv.New(cacheDeps, routes, hashservAuth{svc: authSvc}, store, upstreams),
+		hashservBackend,
 		bazel.New(cacheDeps, routes, authn, bazelAuth{svc: authSvc}),
 		httpblob.NewSccache(cacheDeps, routes, authn),
 
@@ -315,10 +357,43 @@ func Boot(ctx context.Context, p BootParams) error {
 		}
 	}
 
-	// Background maintenance. Both are tied to ctx, so they stop when the server
-	// does; both are loops, so both must be goroutines.
+	// Background maintenance. All are tied to ctx, so they stop when the server does;
+	// all are loops, so all must be goroutines.
 	go authSvc.StartKeyToucher(ctx, keyTouchInterval)
 	go sessions.StartCleanup(ctx, sessionCleanupInterval)
+	go gcEngine.RedrivePendingDelete(ctx)
+	go gcEngine.UsageLoop(ctx)
+
+	// The two workers whose shutdown does real work are WAITED ON below: the access
+	// toucher's final flush is the only thing that stops a restart-heavy deployment
+	// losing every read record it ever takes, and the sweep's terminal FinishGCRun is
+	// what stops a crashed run holding the active slot until the next boot. Both run
+	// under context.WithoutCancel internally, so the wait is for them to FINISH that
+	// work, not for them to notice the cancellation.
+	gcDone := make(chan struct{})
+	touchDone := make(chan struct{})
+	hashservTouchDone := make(chan struct{})
+
+	go func() {
+		defer close(gcDone)
+
+		gcEngine.Loop(ctx)
+	}()
+
+	go func() {
+		defer close(touchDone)
+
+		blobs.StartAccessToucher(ctx, gcEngine.TouchInterval(), gcEngine.TouchStaleness)
+	}()
+
+	// hashserv's own toucher (spec 6.1's hashserv paragraph): same F/T ramp as the
+	// blob access toucher above, over the hashserv_unihashes GC root instead of
+	// cache_objects.
+	go func() {
+		defer close(hashservTouchDone)
+
+		hashservBackend.StartUnihashToucher(ctx, gcEngine.TouchInterval(), gcEngine.TouchStaleness)
+	}()
 
 	log.Info("bakery ready",
 		"version", p.Version,
@@ -330,7 +405,7 @@ func Boot(ctx context.Context, p BootParams) error {
 		"oidc", cmd.OIDCIssuer != "",
 	)
 
-	return New(Config{
+	serveErr := New(Config{
 		Addr:          cmd.Addr(),
 		Version:       p.Version,
 		MetricsAddr:   cmd.MetricsAddr,
@@ -345,6 +420,36 @@ func Boot(ctx context.Context, p BootParams) error {
 		CacheBackends: cacheBackends,
 		Ready:         p.Ready,
 	}).Run(ctx)
+
+	// Run returns once both listeners have drained, which is also when ctx is already
+	// cancelled -- so this waits for work that is by then running under
+	// context.WithoutCancel. It is bounded because a wedged pool must not hold the
+	// process open: the boot reaper covers a lost FinishGCRun, and a lost final flush
+	// costs one interval of read records.
+	waitForBackground(log, backgroundDrainTimeout, gcDone, touchDone, hashservTouchDone)
+
+	return serveErr
+}
+
+// backgroundDrainTimeout bounds the wait for the GC sweep and the access toucher to
+// finish their shutdown work.
+const backgroundDrainTimeout = 30 * time.Second
+
+// waitForBackground waits for every channel, or gives up loudly.
+func waitForBackground(log *slog.Logger, timeout time.Duration, done ...<-chan struct{}) {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+
+	for _, ch := range done {
+		select {
+		case <-ch:
+		case <-deadline.C:
+			log.Warn("background workers did not finish their shutdown work in time",
+				"timeout", timeout)
+
+			return
+		}
+	}
 }
 
 // cacheAuth adapts *auth.Service to httpblob.Authenticator. It exists only to widen

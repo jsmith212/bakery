@@ -30,6 +30,7 @@ import (
 type recordedRequest struct {
 	method      string
 	path        string
+	rawQuery    string
 	auth        string
 	contentType string
 	body        string
@@ -59,6 +60,7 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 		f.requests = append(f.requests, recordedRequest{
 			method:      r.Method,
 			path:        strings.TrimPrefix(r.URL.Path, api.Prefix),
+			rawQuery:    r.URL.RawQuery,
 			auth:        r.Header.Get("Authorization"),
 			contentType: r.Header.Get("Content-Type"),
 			body:        body,
@@ -159,6 +161,7 @@ func TestClientVerbs(t *testing.T) {
 
 		wantMethod string
 		wantPath   string
+		wantQuery  string // empty means "no query string", asserted for every case
 		wantBody   string
 	}{
 		{
@@ -407,6 +410,83 @@ func TestClientVerbs(t *testing.T) {
 			wantPath:   "/orgs/acme/projects/widgets/keys/k1",
 			wantBody:   "",
 		},
+		{
+			name: "gc trigger",
+			respond: func(w http.ResponseWriter, _ *http.Request) bool {
+				writeJSONResp(w, http.StatusAccepted, api.TriggerGCRunResponse{ID: 42, Status: "running"})
+
+				return true
+			},
+			call: func(ctx context.Context, c *Client) error {
+				run, err := c.TriggerGCRun(ctx, true)
+				if err != nil {
+					return err
+				}
+
+				if run.ID != 42 || run.Status != "running" {
+					return errors.New("trigger gc run did not round-trip")
+				}
+
+				return nil
+			},
+			wantMethod: http.MethodPost,
+			wantPath:   "/gc/run",
+			wantBody:   `{"dry_run":true}`,
+		},
+		{
+			name: "gc get",
+			respond: func(w http.ResponseWriter, _ *http.Request) bool {
+				writeJSONResp(w, http.StatusOK, api.GCRun{
+					ID: 42, Status: "succeeded", Trigger: "api", DryRun: false,
+					StartedAt: created, FinishedAt: &created,
+				})
+
+				return true
+			},
+			call: func(ctx context.Context, c *Client) error {
+				run, err := c.GetGCRun(ctx, 42)
+				if err != nil {
+					return err
+				}
+
+				if run.ID != 42 || run.Status != "succeeded" {
+					return errors.New("get gc run did not round-trip")
+				}
+
+				return nil
+			},
+			wantMethod: http.MethodGet,
+			wantPath:   "/gc/runs/42",
+			wantBody:   "",
+		},
+		{
+			name: "gc list",
+			respond: func(w http.ResponseWriter, _ *http.Request) bool {
+				id := int64(7)
+				writeJSONResp(w, http.StatusOK, api.GCRunList{
+					Items:      []api.GCRun{{ID: 7, Status: "failed", Trigger: "interval"}},
+					NextCursor: &id,
+				})
+
+				return true
+			},
+			call: func(ctx context.Context, c *Client) error {
+				list, err := c.ListGCRuns(ctx, "failed", 5)
+				if err != nil {
+					return err
+				}
+
+				if len(list.Items) != 1 || list.Items[0].Status != "failed" {
+					return errors.New("list gc runs did not round-trip")
+				}
+
+				return nil
+			},
+			wantMethod: http.MethodGet,
+			wantPath:   "/gc/runs",
+			wantQuery:  "limit=5&status=failed",
+			wantBody:   "",
+		},
 	}
 
 	for _, tc := range tests {
@@ -428,6 +508,10 @@ func TestClientVerbs(t *testing.T) {
 
 			if got.path != tc.wantPath {
 				t.Errorf("path = %s, want %s", got.path, tc.wantPath)
+			}
+
+			if got.rawQuery != tc.wantQuery {
+				t.Errorf("query = %s, want %s", got.rawQuery, tc.wantQuery)
 			}
 
 			if body := strings.TrimSpace(got.body); body != tc.wantBody {

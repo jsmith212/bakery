@@ -47,6 +47,10 @@ type session struct {
 	rec   *metrics.HashservRecorder
 	log   *slog.Logger
 
+	// touch is the unihash toucher (spec 6.1's hashserv paragraph, toucher.go).
+	// Nil-safe: every method on it tolerates a nil receiver.
+	touch *unihashToucher
+
 	// perms is mutable: it starts at whatever the connection is entitled to anonymously and
 	// is REPLACED by a successful `auth`. Upstream's client re-authenticates after every
 	// reconnect for exactly this reason.
@@ -229,6 +233,9 @@ func (s *session) handleGet(ctx context.Context, payload json.RawMessage) error 
 			return sendJSON(ctx, s.conn, nil)
 		}
 
+		// A HIT: an existing hashserv_unihashes row was read via (method, taskhash).
+		s.touch.mark(s.route.BackendID, req.Method, req.Taskhash)
+
 		return sendJSON(ctx, s.conn, row)
 	}
 
@@ -239,11 +246,15 @@ func (s *session) handleGet(ctx context.Context, payload json.RawMessage) error 
 
 	if !ok {
 		// A miss goes upstream and is WRITTEN THROUGH -- this is the non-streaming path, so
-		// there is no hot-path budget to protect and the write is worth doing inline.
+		// there is no hot-path budget to protect and the write is worth doing inline. It is
+		// a fresh INSERT, not a read of an existing row, so it is never marked: created_at
+		// already says everything a touch would.
 		var found bool
 		if unihash, found = s.upstreamUnihash(ctx, req.Method, req.Taskhash, true); !found {
 			return sendJSON(ctx, s.conn, nil)
 		}
+	} else {
+		s.touch.mark(s.route.BackendID, req.Method, req.Taskhash)
 	}
 
 	return sendJSON(ctx, s.conn, unihashResponse{
@@ -332,12 +343,20 @@ func (s *session) handleGetOuthash(ctx context.Context, payload json.RawMessage)
 
 		// Write through the UPSTREAM row -- binding upstream's own taskhash, not the caller's.
 		// Binding req.Taskhash here would be a cache-poisoning primitive; see store.persistUpstream.
+		// A fresh INSERT, not a read of an existing row: not marked, for the same reason
+		// handleGet's upstream write-through above is not.
 		if err := s.store.persistUpstream(ctx, *up); err != nil {
 			s.log.WarnContext(ctx, "hashserv: upstream write-through failed", slog.Any("error", err))
 		}
 
 		return sendJSON(ctx, s.conn, up)
 	}
+
+	// A HIT: getOuthash JOINS hashserv_unihashes on (method, row.Taskhash) -- the task
+	// that produced this output, NOT req.Taskhash, which get-outhash ignores for
+	// lookup (see store.getOuthash's comment). row.Taskhash is the pair whose
+	// unihash row this response actually read.
+	s.touch.mark(s.route.BackendID, req.Method, row.Taskhash)
 
 	return sendJSON(ctx, s.conn, row)
 }
@@ -363,6 +382,8 @@ func (s *session) handleGetStream(ctx context.Context) error {
 		}
 
 		if ok {
+			s.touch.mark(s.route.BackendID, method, taskhash)
+
 			return unihash, nil
 		}
 

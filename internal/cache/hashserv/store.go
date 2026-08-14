@@ -41,6 +41,11 @@ type Queries interface {
 	RemoveOuthashesByOuthash(ctx context.Context, arg repository.RemoveOuthashesByOuthashParams) (int64, error)
 	RemoveUnihashesByMethod(ctx context.Context, arg repository.RemoveUnihashesByMethodParams) (int64, error)
 	RemoveOuthashesByMethod(ctx context.Context, arg repository.RemoveOuthashesByMethodParams) (int64, error)
+
+	// TouchUnihashesAccessed is the toucher's only write (toucher.go). Batched and
+	// staleness-guarded, exactly like blob.Service's TouchObjectsAccessed -- see
+	// that query's comment for why accessed_at is maintained off the hot path.
+	TouchUnihashesAccessed(ctx context.Context, arg repository.TouchUnihashesAccessedParams) (int64, error)
 }
 
 // upstreamLookup is the read side of an upstream hashserv, as the equivalence algorithm

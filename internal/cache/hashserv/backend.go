@@ -38,11 +38,25 @@ type Backend struct {
 	authn     Authenticator
 	q         Queries
 	upstreams upstreamProvider
+
+	// touch is the unihash toucher (toucher.go, spec 6.1's hashserv paragraph). Nil
+	// only for a Backend a test builds by hand instead of through New; every method
+	// on it is nil-safe for exactly that reason.
+	touch *unihashToucher
 }
 
-// New builds the hashserv backend. upstreams may be nil, which disables chaining entirely.
+// New builds the hashserv backend. upstreams may be nil, which disables chaining
+// entirely. q may be nil in a test that only exercises the auth-denial paths (see
+// backend_test.go); the toucher is then left nil too, and every method on it
+// no-ops rather than dereferencing a nil Queries.
 func New(deps cache.Deps, routes RouteResolver, authn Authenticator, q Queries, upstreams upstreamProvider) *Backend {
-	return &Backend{deps: deps, routes: routes, authn: authn, q: q, upstreams: upstreams}
+	b := &Backend{deps: deps, routes: routes, authn: authn, q: q, upstreams: upstreams}
+
+	if q != nil {
+		b.touch = newUnihashToucher(q)
+	}
+
+	return b
 }
 
 // Kind reports the DB enum this backend serves.
@@ -135,6 +149,7 @@ func (b *Backend) ServeStream(w http.ResponseWriter, r *http.Request, route cach
 		route: route,
 		rec:   rec,
 		log:   log,
+		touch: b.touch,
 
 		// The connection starts with exactly what an anonymous caller gets: permRead on an open
 		// mirror, nothing at all otherwise. A successful `auth` REPLACES this.

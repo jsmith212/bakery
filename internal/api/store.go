@@ -101,6 +101,13 @@ type Store interface {
 	UpdateBackend(ctx context.Context, arg repository.UpdateBackendParams) (repository.CacheBackend, error)
 	DeleteBackend(ctx context.Context, id int64) (int64, error)
 
+	// GC run history (spec §9.10). Read-only: the write side -- starting a sweep --
+	// goes through gcTrigger, not Store, because answering 409 without first writing
+	// a row that would violate gc_runs' partial unique index needs the ENGINE's
+	// in-process CompareAndSwap, which no query can provide.
+	ListGCRuns(ctx context.Context, arg repository.ListGCRunsParams) ([]repository.ListGCRunsRow, error)
+	GetGCRun(ctx context.Context, id int64) (repository.GetGCRunRow, error)
+
 	// Tx is required, not optional. A project-role DOWNGRADE must revoke the keys
 	// that now exceed the role IN THE SAME TRANSACTION as the downgrade -- key
 	// validation deliberately does not join project_memberships (that would put a

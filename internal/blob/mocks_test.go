@@ -2,12 +2,16 @@ package blob
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/jsmith212/bakery/internal/db/repository"
@@ -197,4 +201,116 @@ func (f *fakeReader) add(key string, digest []byte, size int64) {
 		SizeBytes: size,
 		UpdatedAt: pgtype.Timestamptz{Time: time.Unix(0, 0), InfinityModifier: 0, Valid: true},
 	}
+}
+
+// fakeTxer is the WRITE half against a fake DBTX, which means the tests below run the
+// REAL generated queries -- the same SQL text, the same argument order sqlc built --
+// without a Postgres. What is being asserted is what the Service issues and how often
+// (one UPDATE for N reads; one DELETE, retried on 40P01), which is a property of this
+// package, not of the database. Everything that is a property of the DATABASE (the
+// digest ordering actually preventing a deadlock, the refcount trigger) is asserted
+// against a real Postgres instead.
+type fakeTxer struct{ db *fakeDBTX }
+
+func (f *fakeTxer) Tx(ctx context.Context, fn func(*repository.Queries) error) error {
+	return fn(repository.New(f.db))
+}
+
+// fakeExec is one recorded statement.
+type fakeExec struct {
+	sql  string
+	args []any
+
+	// ctxErr is the context's error AS SEEN INSIDE Exec. The shutdown-flush gate reads
+	// it: the final flush must run under context.WithoutCancel, so a nil here is the
+	// assertion that the already-cancelled shutdown context did not travel into the
+	// write.
+	ctxErr error
+}
+
+type fakeDBTX struct {
+	mu    sync.Mutex
+	execs []fakeExec
+
+	// errs is a queue of per-call outcomes, popped from the front. A non-nil entry is
+	// returned instead of running the statement -- that is how the deadlock retry is
+	// driven without a second connection.
+	errs []error
+
+	// reader, when set, is mutated by a DeleteObjectsByKeys so a follow-up Exists
+	// really misses.
+	reader *fakeReader
+
+	// onExec runs INSIDE the statement, which is what lets a test observe the world
+	// while a flush is in flight -- the window in which the pending-touch veto must
+	// still answer true.
+	onExec func(sql string)
+}
+
+func (f *fakeDBTX) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.execs = append(f.execs, fakeExec{sql: sql, args: args, ctxErr: ctx.Err()})
+
+	if f.onExec != nil {
+		f.onExec(sql)
+	}
+
+	if len(f.errs) > 0 {
+		err := f.errs[0]
+		f.errs = f.errs[1:]
+
+		if err != nil {
+			return pgconn.CommandTag{}, err
+		}
+	}
+
+	switch {
+	case strings.Contains(sql, "name: DeleteObjectsByKeys"):
+		keys, _ := args[0].([]string)
+
+		if f.reader != nil {
+			for _, k := range keys {
+				delete(f.reader.rows, k)
+			}
+		}
+
+		return pgconn.NewCommandTag(fmt.Sprintf("DELETE %d", len(keys))), nil
+
+	case strings.Contains(sql, "name: TouchObjectsAccessed"):
+		keys, _ := args[2].([]string)
+
+		return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", len(keys))), nil
+	}
+
+	return pgconn.NewCommandTag("SELECT 0"), nil
+}
+
+func (f *fakeDBTX) Query(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+	return nil, errors.New("fakeDBTX: Query is not implemented")
+}
+
+func (f *fakeDBTX) QueryRow(_ context.Context, _ string, _ ...any) pgx.Row {
+	return errRow{}
+}
+
+type errRow struct{}
+
+func (errRow) Scan(...any) error { return errors.New("fakeDBTX: QueryRow is not implemented") }
+
+// calls returns the recorded statements matching name.
+func (f *fakeDBTX) calls(name string) []fakeExec {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var out []fakeExec
+
+	for _, e := range f.execs {
+		if strings.Contains(e.sql, "name: "+name) {
+			out = append(out, e)
+		}
+	}
+
+	return out
 }
