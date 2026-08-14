@@ -185,12 +185,22 @@ wrong delete. On `GetActionResult` (a read of an already-committed, already-unma
 flushed by the same flusher. This closes the `--remote_download_minimal` divergence
 *exactly*: an AC hit now touches its outputs whether or not Bazel fetches them.
 
-The ladder (`W_cas = 2·W_ac`) stays as defense in depth. A source-verification pass on
-Bazel's AC-hit output-probing behavior (BwoB lease extension, FindMissingBlobs on outputs,
-by version) is running; its outcome tunes the default `W_cas` note in the upgrade docs but
-does not gate the design — the touch makes CAS safe regardless of the verdict.
-Opaque-`/ac` clients (ccache, sccache, moon-http, bazel-http) need no equivalent: none of
-them has a download-minimal mode; they fetch what they hit, and fetches touch.
+The ladder (`W_cas = 2·W_ac`) stays as defense in depth — but the touch is **load-bearing,
+not optional**, per source verification (2026-08-14, Bazel 6.4/6.5/7.0/7.4/8.0 +
+moon master): `lookupCache` issues only `GetActionResult`; under
+`--remote_download_minimal` the skip-download decision (`RemoteOutputChecker.
+shouldDownloadOutput`) is purely local and skipped outputs are `injectRemoteFile`d from
+`ActionResult` metadata with **zero CAS contact**. The only Bazel mechanism that ever
+probes AC-hit outputs is `--experimental_remote_cache_lease_extension` (Bazel 7+, default
+**false**, current-build Skyframe graph only), whose own comment assumes the server treats
+`FindMissingBlobs` as a lease-extending touch — exactly our `accessed_at` semantics.
+Default-config Bazel instead trusts the server's TTL contract
+(`--experimental_remote_cache_ttl`, default 3h — far under our windows) and discovers an
+evicted blob only lazily, as the `LostInputsEvent` rewind. Without §6.3's touch, "hot AC,
+cold CAS" is therefore the *normal* BwoB steady state, not an edge case.
+Opaque-`/ac` clients (ccache, sccache, moon-http, bazel-http) need no equivalent: none has
+a download-minimal mode — moon's `hydrate_manifest` unconditionally reads every output blob
+on every hit — they fetch what they hit, and fetches touch.
 
 Gating tests: `TestCASOutlivesItsActionCacheEntry`,
 `TestWindowLadderIgnoresAnInvertedConfig`, `TestACHitTouchesItsOutputs` (new — AC hit under
