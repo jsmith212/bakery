@@ -245,6 +245,155 @@ func TestHashservDisableUpstreamIsOffByDefaultAndFlagOrEnvSettable(t *testing.T)
 	}
 }
 
+// TestExternalURLBinding pins the flag/env binding for the OCI Bearer challenge
+// realm. Empty is the supported default (a direct-connection deployment derives it
+// from the request); an operator setting it must see it land verbatim, with no
+// trimming or normalization here -- that belongs to the OCI backend, which strips a
+// trailing slash itself (see oci.tokenURL).
+func TestExternalURLBinding(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		args []string
+		want string
+	}{
+		{
+			name: "empty by default",
+			env:  map[string]string{"DB_URL": dsn},
+			args: []string{"serve"},
+			want: "",
+		},
+		{
+			name: "env var sets it",
+			env:  map[string]string{"DB_URL": dsn, "EXTERNAL_URL": "https://bakery.example.com"},
+			args: []string{"serve"},
+			want: "https://bakery.example.com",
+		},
+		{
+			name: "flag sets it",
+			env:  map[string]string{"DB_URL": dsn},
+			args: []string{"serve", "--external-url=https://bakery.example.com"},
+			want: "https://bakery.example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+
+			_, cli := parse(t, tt.args...)
+
+			if got := cli.Serve.ExternalURL; got != tt.want {
+				t.Errorf("ExternalURL = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestOCIUpstreamAuthBinding pins the repeated host=user:secret flag -- the same
+// shape moon/bazel and the group-map flag families already use for Kong-bound
+// key=value pairs, repeatable. It ONLY tests that Kong hands the raw strings through
+// unmangled; oci.ParseUpstreamAuth (exercised by its own package tests) owns parsing.
+func TestOCIUpstreamAuthBinding(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		args []string
+		want []string
+	}{
+		{
+			name: "empty by default",
+			env:  map[string]string{"DB_URL": dsn},
+			args: []string{"serve"},
+			want: nil,
+		},
+		{
+			name: "one entry via flag",
+			env:  map[string]string{"DB_URL": dsn},
+			args: []string{"serve", "--oci-upstream-auth=docker.io=alice:pat"},
+			want: []string{"docker.io=alice:pat"},
+		},
+		{
+			name: "repeated flags accumulate",
+			env:  map[string]string{"DB_URL": dsn},
+			args: []string{
+				"serve",
+				"--oci-upstream-auth=docker.io=alice:pat",
+				"--oci-upstream-auth=ghcr.io=bob:ghp_x",
+			},
+			want: []string{"docker.io=alice:pat", "ghcr.io=bob:ghp_x"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+
+			_, cli := parse(t, tt.args...)
+
+			if !slices.Equal(cli.Serve.OCIUpstreamAuth, tt.want) {
+				t.Errorf("OCIUpstreamAuth = %v, want %v", cli.Serve.OCIUpstreamAuth, tt.want)
+			}
+		})
+	}
+}
+
+// TestOCIDisableUpstreamIsOffByDefaultAndFlagOrEnvSettable mirrors
+// TestHashservDisableUpstreamIsOffByDefaultAndFlagOrEnvSettable exactly: same shape,
+// same reason -- an operator incident-responding to a slow or down upstream registry
+// must be able to reach this without a database migration.
+func TestOCIDisableUpstreamIsOffByDefaultAndFlagOrEnvSettable(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		args []string
+		want bool
+	}{
+		{
+			name: "off by default: a configured upstream is honoured",
+			env:  map[string]string{"DB_URL": dsn},
+			args: []string{"serve"},
+			want: false,
+		},
+		{
+			name: "env var pulls upstream fetching",
+			env:  map[string]string{"DB_URL": dsn, "BAKERY_OCI_DISABLE_UPSTREAM": "true"},
+			args: []string{"serve"},
+			want: true,
+		},
+		{
+			name: "flag pulls upstream fetching",
+			env:  map[string]string{"DB_URL": dsn},
+			args: []string{"serve", "--oci-disable-upstream"},
+			want: true,
+		},
+		{
+			name: "env var explicitly false leaves upstream fetching on",
+			env:  map[string]string{"DB_URL": dsn, "BAKERY_OCI_DISABLE_UPSTREAM": "false"},
+			args: []string{"serve"},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+
+			_, cli := parse(t, tt.args...)
+
+			if got := cli.Serve.OCIDisableUpstream; got != tt.want {
+				t.Errorf("OCIDisableUpstream = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCommandTree(t *testing.T) {
 	tests := []struct {
 		name string

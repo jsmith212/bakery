@@ -371,6 +371,138 @@ func TestSnippetBazelNoCompression(t *testing.T) {
 	}
 }
 
+// TestSnippetContainerdBothAuthPaths pins the containerd trap this snippet exists to
+// avoid: the hosts.toml must carry BOTH the default Bearer-challenge path (which needs
+// no credential in the file at all) and the commented-out static-header alternative
+// that pins the real token -- and it must not append /v2 itself, since containerd does
+// that.
+func TestSnippetContainerdBothAuthPaths(t *testing.T) {
+	out := snippetFor(t, SnippetToolContainerd, "read", "https", "bakery.corp")
+
+	toml := snippetFileContent(t, out)
+
+	// The mount is the docker/v2 family, with NO trailing /v2 -- containerd appends it.
+	mount := "https://bakery.corp/cache/acme/firmware/docker"
+	if !strings.Contains(toml, fmt.Sprintf(`[host.%q]`, mount)) {
+		t.Errorf("hosts.toml missing the [host] block for %s:\n%s", mount, toml)
+	}
+
+	if strings.Contains(toml, mount+"/v2") {
+		t.Errorf("hosts.toml must NOT append /v2 itself -- containerd does that:\n%s", toml)
+	}
+
+	// Default path: the challenge is implicit (no WWW-Authenticate line belongs in a
+	// config file), but the block must say so and must NOT require a credential.
+	if !strings.Contains(toml, "Bearer challenge") {
+		t.Errorf("hosts.toml must document the default Bearer-challenge auth path:\n%s", toml)
+	}
+
+	// Alternative path: the static header table, commented out, carrying the real token.
+	if !strings.Contains(toml, fmt.Sprintf(`[host.%q.header]`, mount)) {
+		t.Errorf("hosts.toml missing the static [host.\"...\".header] alternative:\n%s", toml)
+	}
+
+	if !strings.Contains(toml, `Authorization = "Bearer `+snippetToken+`"`) {
+		t.Errorf("hosts.toml header alternative must pin the real token:\n%s", toml)
+	}
+}
+
+// TestSnippetBuildkitTraps pins BuildKit's mirror shape (the OPPOSITE prefix position
+// from containerd: no /cache, no /docker -- Bakery's second route family) and the
+// bare-Basic skip: BuildKit silently disables a mirror whose credential has an empty
+// half, so the doc comment must tell the operator to set BOTH fields.
+func TestSnippetBuildkitTraps(t *testing.T) {
+	out := snippetFor(t, SnippetToolBuildkit, "read", "https", "bakery.corp")
+
+	toml := snippetFileContent(t, out)
+
+	if !strings.Contains(toml, `mirrors = ["bakery.corp/acme/firmware"]`) {
+		t.Errorf("buildkitd.toml mirrors must be the bare tenant path (no /cache, no /docker):\n%s", toml)
+	}
+
+	if strings.Contains(toml, "/cache/") || strings.Contains(toml, "/docker") {
+		t.Errorf("buildkitd.toml must not carry containerd's /cache/.../docker shape:\n%s", toml)
+	}
+
+	if !strings.Contains(toml, "docker login bakery.corp -u "+snippetToken+" -p "+snippetToken) {
+		t.Errorf("buildkitd.toml must document BOTH credential fields (bare Basic silently skips the mirror):\n%s", toml)
+	}
+}
+
+// TestSnippetPodmanNoNamespace pins podman's shape: containers/image never sends
+// ?ns=, so the mirror is a bare path with no query param, and its credentials cannot
+// be inherited from a docker.io login (cross-domain creds are stripped) so the doc must
+// carry a direct `podman login` line.
+func TestSnippetPodmanNoNamespace(t *testing.T) {
+	out := snippetFor(t, SnippetToolPodman, "read", "https", "bakery.corp")
+
+	toml := snippetFileContent(t, out)
+
+	if !strings.Contains(toml, `location = "bakery.corp/acme/firmware"`) {
+		t.Errorf("registries.conf mirror location must be the bare tenant path:\n%s", toml)
+	}
+
+	if strings.Contains(toml, `location = "bakery.corp/acme/firmware?ns=`) {
+		t.Errorf("registries.conf mirror location must not carry a ?ns= query -- containers/image never sends it:\n%s", toml)
+	}
+
+	if !strings.Contains(toml, "default_upstream") {
+		t.Errorf("registries.conf must note the backend needs default_upstream set:\n%s", toml)
+	}
+
+	if !strings.Contains(toml, "podman login bakery.corp -u "+snippetToken+" -p "+snippetToken) {
+		t.Errorf("registries.conf must document a direct podman login (cross-domain creds are stripped):\n%s", toml)
+	}
+}
+
+// TestSnippetDockerHubOnlyWarning pins three things at once: the daemon.json is valid
+// JSON with no token embedded (Docker Engine has no per-mirror credential slot), the
+// mirror URL is Hub-only and path-prefixed, and the loud credential-transit warning
+// (product decision: support Docker Engine, but warn) surfaces on the response.
+func TestSnippetDockerHubOnlyWarning(t *testing.T) {
+	out := snippetFor(t, SnippetToolDocker, "read", "https", "bakery.corp")
+
+	body := snippetFileContent(t, out)
+
+	var decoded struct {
+		RegistryMirrors []string `json:"registry-mirrors"`
+	}
+	if err := json.Unmarshal([]byte(body), &decoded); err != nil {
+		t.Fatalf("daemon.json must be valid JSON (no comments -- dockerd parses it strictly): %v\n%s", err, body)
+	}
+
+	want := []string{"https://bakery.corp/cache/acme/firmware/docker"}
+	if len(decoded.RegistryMirrors) != 1 || decoded.RegistryMirrors[0] != want[0] {
+		t.Errorf("registry-mirrors = %v, want %v", decoded.RegistryMirrors, want)
+	}
+
+	if strings.Contains(body, snippetToken) {
+		t.Errorf("daemon.json must NOT contain the token -- Docker Engine has no per-mirror credential slot:\n%s", body)
+	}
+
+	if len(out.Warnings) == 0 {
+		t.Fatal("docker snippet must carry a Warnings entry -- daemon.json can't carry a comment")
+	}
+
+	joined := strings.Join(out.Warnings, " ")
+	for _, want := range []string{"Docker Hub", "unscoped", "never logged", "authenticated"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("warning text missing %q:\n%s", want, joined)
+		}
+	}
+}
+
+// TestSnippetOCIToolsHaveNoPushCommands: pull-through only, no registry push API --
+// every M5 client gets an empty PushCommands, exactly like the M4 clients.
+func TestSnippetOCIToolsHaveNoPushCommands(t *testing.T) {
+	for _, tool := range []string{SnippetToolContainerd, SnippetToolBuildkit, SnippetToolPodman, SnippetToolDocker} {
+		out := snippetFor(t, tool, "read", "https", "bakery.corp")
+		if len(out.PushCommands) != 0 {
+			t.Errorf("%s: push_commands = %v, want none (pull-through only)", tool, out.PushCommands)
+		}
+	}
+}
+
 // TestSnippetRequiresProjectRead: an outsider gets nothing.
 func TestSnippetRequiresProjectRead(t *testing.T) {
 	store := fixtureStore(t)

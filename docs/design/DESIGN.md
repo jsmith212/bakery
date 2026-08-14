@@ -176,7 +176,7 @@ Each is independently shippable and leaves the tree green.
 - **M2 — Yocto sstate + downloads. ✅ DONE** (see "M2 as landed" below). `httpblob` + two Policies + `bakery sstate push`. First thing a user can actually point bitbake at.
 - **M3 — hashserv. ✅ DONE** (see "M3 as landed" below). ([spec](specs/2026-07-13-m3-hashserv.md)) WebSocket-only, framing-first, one writer goroutine per connection, auth denied in-band. Upstream bitbake's own hashserv suite **and** the real `bitbake-hashclient` both run against Bakery in CI, and the gate earned its keep on day one — it caught a real divergence the design review had not.
 - **M4 — Bazel REAPI (gRPC) + `/ac` `/cas` `/sccache` HTTP. ✅ DONE** (see "M4 as landed" below). Ships moon (gRPC), Bazel (gRPC + HTTP), ccache and sccache together.
-- **M5 — Docker OCI pull-through proxy.** Byte-exact manifests, stale-while-revalidate, own 401 challenge.
+- **M5 — Docker OCI pull-through proxy. ✅ DONE** (see "M5 as landed" below). Byte-exact manifests, stale-while-revalidate, own Bearer challenge; ships containerd, BuildKit, podman/skopeo and Docker Engine.
 - **M6 — GC, retention, quotas + UI polish.** (The GC *write barrier* and refcount tests land with M1, not here.)
 
 ### M3: what the pre-implementation review got right, and what it got wrong
@@ -443,6 +443,45 @@ stdout/stderr, `cache_objects.accessed_at` (an M6 call), moon in the CI gate (a 
 the DoD; `just moon-conformance` is a followup), and the SPA snippet wiring (the endpoint grows to
 moon/ccache/sccache/bazel; the screen still renders mock data — and the snippet's gRPC endpoint still
 assumes a single-ingress host, which the SPA-wiring wave must resolve).
+
+### M5 as landed
+
+`internal/cache/oci/` — the pull-through proxy: two route families (`/cache/{o}/{p}/docker/v2/…`
+for containerd + Docker Engine, `/v2/{o}/{p}/…` for BuildKit + podman), both `/v2/` pings, and a
+`/v2/token` endpoint on GET **and** POST. One `oci` `cache_backends` row per project; three
+`cache_objects` namespaces (`manifests`, `blobs`, `tags`) plus one nullable `content_type` column —
+the only migration. Staleness is **derived** (`updated_at + tag_ttl`), never stored.
+
+**The design was settled by a tiered research wave** (5 Sonnet source-verifiers over containerd
+v2.3.3 *and* v1.7.34, moby, BuildKit, containers/image, go-containerregistry, distribution — plus a
+live Docker Hub probe) **adjudicated and adversarially critiqued by big-model agents**; the critique
+found 10 gaps in the adjudicated memo, all folded in, and the post-implementation review found 6 more
+(an open-backend authorization bypass, a singleflight context-cancellation hazard, a stampeding SWR
+refresh, an http:// realm disclosure, a digest-mismatch serve, a CDN-host metrics leak) — each fixed
+with a regression test before the milestone commit.
+
+The invariants that came out of it are in CLAUDE.md; the load-bearing ones: the Bearer challenge is
+emitted **on the 200 ping** (containers/image harvests challenges only there); the stored manifest
+digest is **self-computed** (re-serialization is structurally unstorable); **nil principal = no
+upstream contact** (anonymous miss = 404, and a valid-but-foreign credential on an open backend is
+downgraded to anonymous — the open-relay gate); `?ns=` resolves only against the backend's upstream
+**allowlist** (the SSRF gate); forwarded Docker Hub credentials are shape-gated before any code path
+that could validate or log them; upstream credentials are **server-level env only** (no extensions,
+no plaintext-in-DB). Tag refresh runs detached, bounded, singleflighted, and **touches freshness on
+the unchanged branch** without resetting the GC write barrier.
+
+**The CI gate** (`just oci-conformance`, in `image.needs`): containerd's real resolver library,
+crane through both route families, skopeo when present, a Docker Engine URL-shape test, and a fake
+upstream seeded with **vendored real multi-arch index bytes** — with the anti-bypass assertion (a
+second pull sees **zero** upstream requests), because every registry client masks a broken mirror by
+silently falling back to the real registry, so only a served-by-Bakery proof means anything.
+
+**What M5 did NOT build:** the registry push API / catalog / tags-list / referrers (pull-through
+only; 404/405 is the verified-safe answer), non-sha256 digests (clean 404), schema1 (2.x rejects it;
+1.7 tolerates a proxied upstream serving it — nothing for Bakery to do), tee-streamed first pulls and
+upstream Range resume (perf, revisit with S3), per-tenant upstream credentials and envelope
+encryption (deferred until a tenant needs them), `accessed_at` (still M6's call), and the SPA
+screens. A real `nerdctl pull` through hosts.toml is the DoD manual step, like moon in M4.
 
 ---
 

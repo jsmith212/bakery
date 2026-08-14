@@ -151,13 +151,23 @@ build --remote_header=authorization=Bearer {key}
 
 ## containerd — `/etc/containerd/certs.d/<registry>/hosts.toml`
 
-One file **per upstream registry namespace**, all pointing at the **same** Bakery endpoint.
+One file **per upstream registry namespace**, all pointing at the **same** Bakery endpoint (the `/cache/{org}/{proj}/docker` mount — containerd appends `/v2` itself).
 
 ```toml
 # /etc/containerd/certs.d/docker.io/hosts.toml
 server = "https://registry-1.docker.io"
+
 [host."https://bakery.corp/cache/{org}/{proj}/docker"]
   capabilities = ["pull", "resolve"]
+
+  # DEFAULT: no credential configured -- containerd follows Bakery's WWW-Authenticate:
+  # Bearer challenge automatically (the ping answers it even on 200; see the warning
+  # below). Zero config beyond this file, and it is enough against an OPEN backend.
+
+  # ALTERNATIVE: skip the challenge round trip entirely with a static per-request
+  # header. Mutually exclusive with the default above:
+  # [host."https://bakery.corp/cache/{org}/{proj}/docker".header]
+  #   Authorization = "Bearer {key}"
 ```
 ```toml
 # /etc/containerd/certs.d/ghcr.io/hosts.toml
@@ -180,22 +190,74 @@ containerdConfigPatches:
 
 **⚠️ Migration note:** the older `[plugins."…".registry.mirrors."docker.io"] endpoint = [...]` style does **not** produce `?ns=` and is removed in containerd 2.0. It must be replaced with `config_path` + `hosts.toml`.
 
+**⚠️ Credentialed containerd (a `docker config.json` entry for this host, not the header alternative above) sends a POST first, not GET.** containerd's authorizer issues an OAuth2 form POST to the token endpoint whenever it holds a secret, falling back to GET only on 405/404/401/400 — and the 405 fallback additionally requires a non-empty username, so an `identitytoken` credential (which has none) has no fallback at all if the server is GET-only. Bakery's token endpoint answers **both** GET and POST for exactly this reason — nothing to configure, just don't assume GET-only if you crib this endpoint elsewhere.
+
 ---
 
-## BuildKit
+## Podman / CRI-O / skopeo — `/etc/containers/registries.conf`
+
+```toml
+[[registry]]
+  location = "docker.io"
+
+  [[registry.mirror]]
+    location = "bakery.corp/{org}/{proj}"
+```
+
+**containers/image never sends `?ns=`.** Unlike containerd and BuildKit, podman/CRI-O/skopeo rewrite the image reference itself rather than appending a query hint — so Bakery cannot learn the upstream from the request. The project's OCI backend **must** have `default_upstream` configured (server-side, `cache_backends.config`); absent that, only whatever `default_upstream` names is reachable through this mirror.
+
+**⚠️ Credentials do NOT inherit from a `docker.io` login.** containers/image strips the upstream registry's credentials whenever the mirror's domain differs from the image's own domain (`docker_image_src.go`, verified) — a login stored against `docker.io` never reaches `bakery.corp`. Authenticate to the mirror host directly:
+
+```bash
+podman login bakery.corp -u {key} -p {key}
+```
+
+**⚠️ podman/skopeo/CRI-O ping the bare host root, not the mirror path** — `GET https://bakery.corp/v2/`, outside any tenant prefix — and hard-error on anything other than 200 or 401. This is a required endpoint for this client family specifically; containerd never issues it during a pull.
+
+---
+
+## BuildKit — `/etc/buildkit/buildkitd.toml`
 
 ```toml
 [registry."docker.io"]
-  mirrors = ["bakery.corp/cache/{org}/{proj}/docker"]
+  mirrors = ["bakery.corp/{org}/{proj}"]
+  http = false
 ```
 
-**⚠️ BuildKit puts the path prefix AFTER `/v2`** (`path.Join("/v2", mirrorPath)`) — the opposite of containerd. So the request is:
+**⚠️ BuildKit puts the path prefix AFTER `/v2`** (`path.Join("/v2", mirrorPath)`) — the opposite of containerd and Docker Engine. So the request is:
 
 ```
-GET /v2/cache/{org}/{proj}/docker/library/alpine/manifests/latest?ns=docker.io
+GET /v2/{org}/{proj}/library/alpine/manifests/latest?ns=docker.io
 ```
 
-Bakery serves both shapes.
+Bakery serves this off a SEPARATE route family (`/v2/{org}/{proj}/...`) from containerd's (`/cache/{org}/{proj}/docker/v2/...`) — the mirror value above carries no `/cache` and no `/docker` segment; that shape belongs to containerd only.
+
+**⚠️ BuildKit's Basic-auth path only installs a handler when BOTH `username` AND `secret` are non-empty.** A `docker config.json` entry for this host with an empty password does not error — it silently **skips the mirror** for that host, with no log line a user is likely to find. Configure both fields with the token, or configure neither and rely on the anonymous Bearer flow against an open backend:
+
+```bash
+docker login bakery.corp -u {key} -p {key}
+```
+
+**⚠️ On an OPEN backend (`read_auth_required = false`), `docker login bakery.corp` appears to succeed with ANY password — including a wrong one.** That is not a bug: unrecognized credentials on the read path are deliberately treated as anonymous (Docker Engine forwards real Docker Hub logins to its mirror, and rejecting them would break every `docker login`'d engine), and the token endpoint therefore answers 200 to any credential. A wrong Bakery token on an open backend gets anonymous service — cache hits work, misses 404 and fall back — so "login succeeded" does NOT confirm the token is valid. To verify a token, use it against a `read_auth_required` backend, or check the key's `last_used_at` in the console.
+
+---
+
+## Docker Engine (`dockerd`) — `/etc/docker/daemon.json`
+
+```json
+{
+  "registry-mirrors": ["https://bakery.corp/cache/{org}/{proj}/docker"]
+}
+```
+
+**Supported as of M5, with a warning.** `registry-mirrors` only ever mirrors Docker Hub — there is no `?ns=`, no multi-registry routing, and no `default_upstream` question, because Hub is the only upstream this client can name. It uses the SAME `/cache/{org}/{proj}/docker` mount and implicit-`/v2` shape as containerd (Docker Engine v28.5.2's `ValidateMirror` accepts a path prefix — contrary to older advice that mirror URLs must be domain roots, which is true only of `registry:2`'s own `remoteurl`).
+
+**⚠️ CREDENTIAL-TRANSIT WARNING.** Docker Engine forwards the operator's **own real Docker Hub login** to whatever `registry-mirrors` names, unscoped, on every single pull — there is no per-mirror credential slot, so there is no way to give it a Bakery token instead. Two consequences:
+
+1. **Only point this at Bakery if you accept that your Docker Hub credentials transit through it on every pull.** Bakery never logs a forwarded credential.
+2. **This only works against an OCI backend with authenticated reads turned OFF.** A forwarded Hub credential is never `bkry_`-shaped, so it is always treated as anonymous — a backend that requires an authenticated read will 401 every request from a plain Docker Engine, and the engine will silently fall back to the real registry (0% hit rate, no error anywhere).
+
+Support-and-warn was a deliberate product decision, not an oversight: leaving the most-common Docker client entirely undocumented does not stop users from pointing it at Bakery anyway.
 
 ---
 
@@ -203,7 +265,8 @@ Bakery serves both shapes.
 
 | Client | Why |
 |---|---|
-| **Plain `docker pull` (dockerd)** | `registry-mirrors` only ever mirrors Docker Hub, and the mirror URL must be a bare domain root — no path, so no project. Multi-registry is impossible without a MITM CA proxy. |
-| **podman / CRI-O** | `registries.conf` supports path prefixes, but containers/image **never sends `?ns=`**, so Bakery cannot learn the upstream from the request. Would require encoding the registry in the path and a per-project `default_upstream`. Deferred. |
 | **Yocto < Scarthgap 5.0** | No WebSocket transport, no hashserv auth, no GC. |
 | **Binary package feeds (ipk/deb/rpm)** | Out of scope — that's a repository server with a mutable index, not a cache. |
+| **Registry push, `/v2/_catalog`, tags list, delete, referrers** | Bakery's OCI backend is pull-through only. A client that tries one of these gets an honest 404/405 and falls back to the real registry, exactly like a mirror miss. |
+| **Docker Schema1 manifests** | Rejected by containerd ≥ 2.0 already; no fallback rewrite exists on Bakery's side either. |
+| **Non-sha256 digests (e.g. `sha512:...`)** | go-containerregistry — the library Bakery's upstream client is built on — cannot fetch them either. A clean 404 sends the client to a registry that can. |

@@ -479,16 +479,8 @@ func (b *Backend) serveObject(w http.ResponseWriter, r *http.Request, ref blob.R
 	defer func() { _ = rc.Close() }()
 
 	// Set Content-Type explicitly so ServeContent skips its 512-byte sniff read+seek.
+	// ServeObject requires it to be set; see its doc.
 	w.Header().Set("Content-Type", "application/octet-stream")
 
-	if rs, ok := rc.(io.ReadSeeker); ok {
-		http.ServeContent(w, r, "", meta.UpdatedAt, rs) // Range/206/416/If-Range for free
-
-		return
-	}
-
-	// Non-seekable fallback (S3 deferred; its Get is not a Seeker): full 200, no Range.
-	w.Header().Set("Content-Length", strconv.FormatInt(meta.Size, 10))
-	w.WriteHeader(http.StatusOK)
-	_, _ = io.Copy(w, rc)
+	ServeObject(w, r, meta, rc)
 }

@@ -176,8 +176,11 @@ func TestUnroutedCachePathsAre404(t *testing.T) {
 	}
 
 	// Every target's 4th segment is deliberately NOT a real backend kind (sstate, downloads,
-	// hashserv, and the future ac/cas/sccache), and the /v2/ ones are the OCI shape M5 has
-	// not landed -- so all of these stay unrouted across the milestones this test outlives.
+	// hashserv, and ac/cas/sccache), and this test's own backend list deliberately excludes
+	// the real oci.Backend -- see oci_wiring_test.go's TestOCIMountsInBothModes and
+	// TestUnroutedCachePathsAre404OCI for the M5 routes mounted -- so the /v2/ paths below
+	// stay unrouted here regardless of milestone: they exercise the catch-all alone, without
+	// a real OCI backend claiming them.
 	cases := []struct {
 		name          string
 		method        string
@@ -189,8 +192,8 @@ func TestUnroutedCachePathsAre404(t *testing.T) {
 		{name: "moon http-mode /status probe", method: http.MethodGet, target: "/cache/status"},
 		{name: "garbage kind segment", method: http.MethodGet, target: "/cache/acme/widget/nope/x"},
 		{name: "bare cache prefix", method: http.MethodGet, target: "/cache/acme"},
-		{name: "oci manifest (BuildKit shape, pre-M5)", method: http.MethodGet, target: "/v2/acme/widget/manifests/latest"},
-		{name: "oci blob (pre-M5)", method: http.MethodHead, target: "/v2/acme/widget/blobs/sha256:deadbeef"},
+		{name: "oci manifest shape, no oci backend in THIS mux", method: http.MethodGet, target: "/v2/acme/widget/manifests/latest"},
+		{name: "oci blob shape, no oci backend in THIS mux", method: http.MethodHead, target: "/v2/acme/widget/blobs/sha256:deadbeef"},
 
 		// Controls: a routed-but-unconfigured path must still 404, and it must reach the
 		// backend's own pattern (here the stub answers 418) -- proving the catch-all did not

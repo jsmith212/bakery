@@ -40,9 +40,14 @@ var Pattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 // grammar above forbids uppercase, so that exact string is already
 // unrepresentable and reserving it verbatim would be a no-op -- while
 // `actionresults`, the string a user CAN create, would slip through.
+// `token` is the M5 addition: the OCI backend mounts the Docker Bearer token
+// endpoint at /v2/token, in the same path space as /v2/{org}/{project}/..., so an
+// org named `token` would live underneath it and the two would be distinguished
+// only by segment count.
 var reserved = []string{
 	"blobs", "uploads", "actions", "actionresults", "operations",
 	"capabilities", "compressed-blobs", "ac", "cas", "v2", "api", "cache",
+	"token",
 }
 
 // Reserved returns the routing denylist. The slice is a copy; the list is not

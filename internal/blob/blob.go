@@ -48,6 +48,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/jsmith212/bakery/internal/db/repository"
@@ -174,6 +175,17 @@ type Meta struct {
 	Digest    Digest
 	Size      int64
 	UpdatedAt time.Time
+
+	// ContentType is the stored cache_objects.content_type, "" when the column is
+	// NULL -- which it is for every namespace except OCI's manifests and tags.
+	//
+	// It is carried on Meta rather than re-derived because the only trustworthy copy
+	// of a manifest's media type is the one the upstream registry sent beside the
+	// bytes: containerd takes the response Content-Type VERBATIM as
+	// ocispec.Descriptor.MediaType and dispatches on it, and the OCI image-spec's own
+	// `mediaType` field inside the document has been optional for most of its life,
+	// so sniffing it back out mis-types perfectly legal indexes.
+	ContentType string
 }
 
 // Verify is the per-call digest-verification policy. Construct it with NoVerify or
@@ -210,6 +222,11 @@ type PutOptions struct {
 
 	// Verify has no usable zero value. See the package doc.
 	Verify Verify
+
+	// ContentType is stored on the object row and returned by Stat. Empty means
+	// NULL: sstate, downloads, /ac and /cas all leave it unset and set their own
+	// Content-Type header on the way out. Only the OCI backend populates it.
+	ContentType string
 }
 
 // PutResult reports what the write actually did.
@@ -296,6 +313,7 @@ type Service struct {
 	qRevive     counter
 	qPut        counter
 	qPutOver    counter
+	qTouch      counter
 	qDelete     counter
 	qGetPhysDel counter
 	qReap       counter
@@ -345,6 +363,7 @@ func New(cfg Config) (*Service, error) {
 		qRevive:     m.DBQueries.WithLabelValues("CreateOrReviveBlob"),
 		qPut:        m.DBQueries.WithLabelValues("PutObjectImmutable"),
 		qPutOver:    m.DBQueries.WithLabelValues("PutObjectOverwritable"),
+		qTouch:      m.DBQueries.WithLabelValues("TouchObject"),
 		qDelete:     m.DBQueries.WithLabelValues("DeleteObject"),
 		qGetPhysDel: m.DBQueries.WithLabelValues("GetBlobForPhysicalDelete"),
 		qReap:       m.DBQueries.WithLabelValues("ReapBlob"),
@@ -428,6 +447,103 @@ func (s *Service) Stat(ctx context.Context, ref Ref) (Meta, error) {
 	return meta, nil
 }
 
+// StatUncached is Stat with the in-process LRU BYPASSED IN BOTH DIRECTIONS: it does
+// not read the cache and it does not fill it. One query, every time.
+//
+// IT EXISTS FOR EXACTLY ONE CALLER: the OCI backend's `tags` namespace, the only
+// MUTABLE key space in the system whose value carries a FRESHNESS CONTRACT.
+//
+// Every other namespace is immutable (sstate, downloads, /cas, OCI manifests and
+// blobs) or mutable-but-unversioned (/ac, where a stale read is a cache miss and the
+// client simply rewrites). A tag is neither: `latest` legitimately repoints, and the
+// answer is a digest that the client will then trust and pull. The LRU is a
+// PER-PROCESS cache, and the boot advisory lock is what makes that sound -- but the
+// lock can be waived (--allow-multi-instance), and the moment it is, instance A's
+// repoint of a tag is invisible to instance B's LRU until eviction. B then serves an
+// old digest indefinitely, with correct bytes and a correct Docker-Content-Digest,
+// which is undetectable from the client side. That is the one failure this cache
+// cannot be allowed to have, and bypassing it is cheaper than the alternatives: a tag
+// is read once per TTL per tag, not once per layer, so this is not a hot path and
+// never becomes one.
+//
+// The IMMUTABLE half of an OCI pull still goes through Stat/Get and keeps the whole
+// LRU: the tag lookup answers "which digest", and everything downstream of that
+// digest is content-addressed and cannot go stale.
+func (s *Service) StatUncached(ctx context.Context, ref Ref) (Meta, error) {
+	rec := s.recorder(ref)
+
+	meta, err := s.queryObject(ctx, ref)
+	if err != nil {
+		rec.Observe(metrics.OpHead, metrics.ResultError)
+
+		return Meta{}, err
+	}
+
+	rec.Observe(metrics.OpHead, result(meta.Exists))
+
+	return meta, nil
+}
+
+// Touch bumps an existing object's updated_at and NOTHING else, returning false when
+// the row is gone.
+//
+// It is the freshness half of OCI's stale-while-revalidate: a revalidation that finds
+// the tag unchanged writes no bytes and repoints no row, so without this the object's
+// updated_at never moves and the tag is stale forever after its first TTL -- one
+// upstream HEAD per window, per tag, in perpetuity, and a ResultStale on every
+// response that makes a real upstream outage unreadable.
+//
+// It does NOT reset the GC write barrier (created_at / live_xid): see the TouchObject
+// query, which explains why "this row was revalidated" and "this row was created"
+// must not be the same fact.
+//
+// It DROPS the LRU entry rather than rewriting it. The entry's UpdatedAt is now
+// wrong, and dropping is the one update that cannot be wrong -- the tags namespace
+// reads through StatUncached anyway, so the drop costs nothing and closes the case
+// where some future caller does not.
+func (s *Service) Touch(ctx context.Context, ref Ref) (bool, error) {
+	if s.tx == nil {
+		return false, errors.New("blob: service is read-only (no Txer configured)")
+	}
+
+	if err := ref.validate(); err != nil {
+		return false, err
+	}
+
+	var found bool
+
+	err := s.tx.Tx(ctx, func(q *repository.Queries) error {
+		s.qTouch.Inc()
+
+		_, err := q.TouchObject(ctx, repository.TouchObjectParams{
+			BackendID: ref.BackendID, Namespace: ref.Namespace, Key: ref.Key,
+		})
+
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			// The row was deleted underneath the refresh. Not an error: the caller
+			// learns it and declines to assert freshness about an object that is gone.
+			return nil
+		case err != nil:
+			return fmt.Errorf("touch object: %w", err)
+		}
+
+		found = true
+
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+
+	if found {
+		var buf [512]byte
+		s.lru.del(ref.appendCacheKey(buf[:0]))
+	}
+
+	return found, nil
+}
+
 // stat is the uninstrumented lookup: LRU, then singleflight, then one primary-key
 // probe. Every public method funnels through it so the cache, the collapse and the
 // negative caching are implemented once.
@@ -504,6 +620,23 @@ func (s *Service) statDB(ctx context.Context, ref Ref, ck []byte) (Meta, error) 
 	// shard's write generation moved while we were in flight.
 	seq := s.lru.seq(ck)
 
+	meta, err := s.queryObject(ctx, ref)
+	if err != nil {
+		return Meta{}, err
+	}
+
+	// The NEGATIVE entry is filled too, and it is not an optimisation: without it the
+	// first build against an empty cache sends every HEAD to Postgres, and no test
+	// that pre-populates the repository will ever reveal it.
+	s.lru.putIfUnchanged(ck, meta, seq)
+
+	return meta, nil
+}
+
+// queryObject is the bare primary-key probe with NO cache interaction in either
+// direction. statDB wraps it with the LRU fill; StatUncached calls it naked, which is
+// the whole reason it is a separate function.
+func (s *Service) queryObject(ctx context.Context, ref Ref) (Meta, error) {
 	s.qStat.Inc()
 
 	row, err := s.reader.StatObject(ctx, repository.StatObjectParams{
@@ -513,13 +646,7 @@ func (s *Service) statDB(ctx context.Context, ref Ref, ck []byte) (Meta, error) 
 	})
 
 	if errors.Is(err, pgx.ErrNoRows) {
-		// THE NEGATIVE ENTRY. Not an optimisation: without it the first build
-		// against an empty cache sends every HEAD to Postgres, and no test that
-		// pre-populates the repository will ever reveal it.
-		meta := Meta{Exists: false, Digest: Digest{}, Size: 0, UpdatedAt: time.Time{}}
-		s.lru.putIfUnchanged(ck, meta, seq)
-
-		return meta, nil
+		return Meta{Exists: false, Digest: Digest{}, Size: 0, UpdatedAt: time.Time{}, ContentType: ""}, nil
 	}
 
 	if err != nil {
@@ -531,10 +658,10 @@ func (s *Service) statDB(ctx context.Context, ref Ref, ck []byte) (Meta, error) 
 		return Meta{}, fmt.Errorf("decode stored digest: %w", err)
 	}
 
-	meta := Meta{Exists: true, Digest: d, Size: row.SizeBytes, UpdatedAt: row.UpdatedAt.Time}
-	s.lru.putIfUnchanged(ck, meta, seq)
-
-	return meta, nil
+	return Meta{
+		Exists: true, Digest: d, Size: row.SizeBytes,
+		UpdatedAt: row.UpdatedAt.Time, ContentType: row.ContentType.String,
+	}, nil
 }
 
 // ExistsBatch answers REAPI FindMissingBlobs: "which of these do you have?", asked
@@ -650,7 +777,10 @@ func (s *Service) ExistsBatch(ctx context.Context, refs []Ref) ([]bool, error) {
 				return nil, fmt.Errorf("decode stored digest: %w", err)
 			}
 
-			meta := Meta{Exists: true, Digest: d, Size: row.SizeBytes, UpdatedAt: row.UpdatedAt.Time}
+			meta := Meta{
+				Exists: true, Digest: d, Size: row.SizeBytes,
+				UpdatedAt: row.UpdatedAt.Time, ContentType: row.ContentType.String,
+			}
 			s.lru.putIfUnchanged(p.ck, meta, p.seq)
 
 			for _, i := range p.indices {
@@ -666,7 +796,7 @@ func (s *Service) ExistsBatch(ctx context.Context, refs []Ref) ([]bool, error) {
 				continue
 			}
 
-			meta := Meta{Exists: false, Digest: Digest{}, Size: 0, UpdatedAt: time.Time{}}
+			meta := Meta{Exists: false, Digest: Digest{}, Size: 0, UpdatedAt: time.Time{}, ContentType: ""}
 			s.lru.putIfUnchanged(p.ck, meta, p.seq)
 		}
 	}
@@ -863,7 +993,7 @@ func (s *Service) put(ctx context.Context, ref Ref, r io.Reader, opts PutOptions
 			return fmt.Errorf("%w: %s", ErrSizeMismatch, digest)
 		}
 
-		created, err = s.putObject(ctx, q, ref, digest, size, opts.Overwrite)
+		created, err = s.putObject(ctx, q, ref, digest, size, opts)
 		if err != nil {
 			return err
 		}
@@ -874,7 +1004,7 @@ func (s *Service) put(ctx context.Context, ref Ref, r io.Reader, opts PutOptions
 		return PutResult{}, err
 	}
 
-	s.cache(ref, digest, size, created)
+	s.cache(ref, digest, size, opts.ContentType, created)
 
 	return PutResult{Digest: digest, Size: size, Deduped: deduped, Created: created}, nil
 }
@@ -882,14 +1012,18 @@ func (s *Service) put(ctx context.Context, ref Ref, r io.Reader, opts PutOptions
 // putObject writes the metadata row. [THEN METADATA.] The trigger increments the
 // refcount; there is no increment query, and there must never be one.
 func (s *Service) putObject(
-	ctx context.Context, q *repository.Queries, ref Ref, digest Digest, size int64, overwrite bool,
+	ctx context.Context, q *repository.Queries, ref Ref, digest Digest, size int64, opts PutOptions,
 ) (bool, error) {
-	if overwrite {
+	// Empty means NULL, not the empty string: a namespace that stores no media type
+	// must leave the column absent rather than claim a media type of "".
+	contentType := pgtype.Text{String: opts.ContentType, Valid: opts.ContentType != ""}
+
+	if opts.Overwrite {
 		s.qPutOver.Inc()
 
 		n, err := q.PutObjectOverwritable(ctx, repository.PutObjectOverwritableParams{
 			BackendID: ref.BackendID, Namespace: ref.Namespace, Key: ref.Key,
-			Digest: digest.Bytes(), SizeBytes: size,
+			Digest: digest.Bytes(), SizeBytes: size, ContentType: contentType,
 		})
 		if err != nil {
 			return false, fmt.Errorf("put object (overwritable): %w", err)
@@ -902,7 +1036,7 @@ func (s *Service) putObject(
 
 	n, err := q.PutObjectImmutable(ctx, repository.PutObjectImmutableParams{
 		BackendID: ref.BackendID, Namespace: ref.Namespace, Key: ref.Key,
-		Digest: digest.Bytes(), SizeBytes: size,
+		Digest: digest.Bytes(), SizeBytes: size, ContentType: contentType,
 	})
 	if err != nil {
 		return false, fmt.Errorf("put object (immutable): %w", err)
@@ -917,7 +1051,7 @@ func (s *Service) putObject(
 // key someone else won), the row in the database is not the one we just described,
 // so the entry is DROPPED rather than asserted -- a wrong positive entry serves the
 // wrong digest to every subsequent GET.
-func (s *Service) cache(ref Ref, digest Digest, size int64, created bool) {
+func (s *Service) cache(ref Ref, digest Digest, size int64, contentType string, created bool) {
 	var buf [512]byte
 
 	ck := ref.appendCacheKey(buf[:0])
@@ -928,7 +1062,10 @@ func (s *Service) cache(ref Ref, digest Digest, size int64, created bool) {
 		return
 	}
 
-	s.lru.put(ck, Meta{Exists: true, Digest: digest, Size: size, UpdatedAt: time.Now()})
+	s.lru.put(ck, Meta{
+		Exists: true, Digest: digest, Size: size,
+		UpdatedAt: time.Now(), ContentType: contentType,
+	})
 }
 
 // Delete removes an object's METADATA and nothing else. [METADATA FIRST.]

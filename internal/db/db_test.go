@@ -158,11 +158,11 @@ func TestMigrationVersion(t *testing.T) {
 		t.Error("dirty = true on a cleanly migrated database")
 	}
 
-	// 10 up/down pairs ship in internal/db/migrations. If this number changes, the
-	// change was deliberate and this line moves with it. (000010 is M3's hashserv
-	// tables.)
-	if version != 10 {
-		t.Errorf("version = %d, want 10", version)
+	// 11 up/down pairs ship in internal/db/migrations. If this number changes, the
+	// change was deliberate and this line moves with it. (000011 is M5's OCI change:
+	// cache_objects.content_type plus the `token` reserved slug.)
+	if version != 11 {
+		t.Errorf("version = %d, want 11", version)
 	}
 }
 

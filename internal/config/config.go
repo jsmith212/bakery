@@ -390,6 +390,38 @@ type ServeCmd struct {
 	// credential, so any path that could enable it at runtime would be a total
 	// authentication bypass. Default off, and it stays a boot-time-only decision.
 	DevLoginEnabled bool `env:"DEV_LOGIN_ENABLED" help:"Seed a dev site admin and expose an unauthenticated dev-login endpoint. Never enable this in production."`
+
+	// ExternalURL is the server's public base URL, e.g. "https://bakery.example.com".
+	//
+	// M5's Docker Bearer challenge (WWW-Authenticate: Bearer realm=...) MUST carry an
+	// ABSOLUTE realm URL, and a server behind a TLS-terminating reverse proxy cannot
+	// derive its own scheme or host from the request -- r.TLS is nil on the inside of
+	// that proxy, so a request-derived realm says "http://" and names the internal
+	// hostname. That failure reproduces in NO test that talks to the server directly
+	// and in EVERY production deployment that terminates TLS at an ingress. Empty
+	// falls back to the request's own scheme and Host (correct for a direct
+	// connection, e.g. `bakery serve` on a laptop) -- SET THIS IN ANY DEPLOYMENT WITH
+	// A PROXY IN FRONT OF IT.
+	ExternalURL string `env:"EXTERNAL_URL" help:"The server's public base URL (e.g. https://bakery.example.com), used as the OCI Bearer challenge realm. Set this when a TLS-terminating proxy sits in front of Bakery -- request-derived URLs are wrong there." name:"external-url"`
+
+	// OCIUpstreamAuth is the SERVER-LEVEL credential map for M5's upstream registry
+	// fetches: "host=user:secret", repeated. It lives here and NOT in the database for
+	// the same reason as everything else that would be a plaintext secret at rest --
+	// there is no encryption-at-rest facility and pgcrypto is banned outright
+	// (migration 000001) -- and because an upstream credential must be REPLAYED, so it
+	// cannot be hashed the way a Bakery API key is. Parsed by oci.ParseUpstreamAuth; a
+	// host absent from this map is fetched anonymously, which is correct for public
+	// images.
+	OCIUpstreamAuth []string `env:"BAKERY_OCI_UPSTREAM_AUTH" help:"Upstream registry credential, as host=user:secret. Repeatable. A host with no entry is fetched anonymously." name:"oci-upstream-auth"`
+
+	// OCIDisableUpstream is the M5 kill switch, mirroring HashservDisableUpstream --
+	// same rationale, same shape. It does not take the mirror down: every already
+	// cached manifest, tag and blob keeps serving. It stops Bakery from making any
+	// NEW outbound request to an upstream registry, server-wide, overriding every
+	// backend's allowlist. The day Docker Hub is slow -- which is worse than down,
+	// because it stalls builds rather than failing them -- this is the flag an
+	// operator reaches for without a database migration.
+	OCIDisableUpstream bool `env:"BAKERY_OCI_DISABLE_UPSTREAM" help:"Ignore every OCI backend's upstream: serve only what is already cached. The kill switch for when an upstream registry is down or slow." name:"oci-disable-upstream"`
 }
 
 // MigrateCmd groups the schema subcommands.

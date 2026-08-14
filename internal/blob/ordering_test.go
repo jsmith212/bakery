@@ -53,7 +53,7 @@ func TestStat_StaleNegativeFillCannotClobberAConcurrentPut(t *testing.T) {
 	// A committed Put publishes the positive entry, exactly as blob.put does after its
 	// transaction commits. This bumps the shard generation.
 	digest := storage.KeyOf([]byte("the object that a concurrent push just landed"))
-	svc.cache(ref, digest, 4096, true)
+	svc.cache(ref, digest, 4096, "", true)
 
 	close(repo.gate) // let A's probe return ErrNoRows and attempt its (stale) fill.
 	wg.Wait()
