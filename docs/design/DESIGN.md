@@ -177,7 +177,7 @@ Each is independently shippable and leaves the tree green.
 - **M3 — hashserv. ✅ DONE** (see "M3 as landed" below). ([spec](specs/2026-07-13-m3-hashserv.md)) WebSocket-only, framing-first, one writer goroutine per connection, auth denied in-band. Upstream bitbake's own hashserv suite **and** the real `bitbake-hashclient` both run against Bakery in CI, and the gate earned its keep on day one — it caught a real divergence the design review had not.
 - **M4 — Bazel REAPI (gRPC) + `/ac` `/cas` `/sccache` HTTP. ✅ DONE** (see "M4 as landed" below). Ships moon (gRPC), Bazel (gRPC + HTTP), ccache and sccache together.
 - **M5 — Docker OCI pull-through proxy. ✅ DONE** (see "M5 as landed" below). Byte-exact manifests, stale-while-revalidate, own Bearer challenge; ships containerd, BuildKit, podman/skopeo and Docker Engine.
-- **M6 — GC, retention, quotas + UI polish.** (The GC *write barrier* and refcount tests land with M1, not here.)
+- **M6 — GC, retention, quotas + UI polish.** ([spec](specs/2026-08-14-m6-gc-retention-quotas.md)) (The GC *write barrier* and refcount tests land with M1, not here.) Product decisions confirmed 2026-08-14: retention ships ON with per-kind defaults, `downloads` is an archive (never auto-evicts), org quota is a seed default only, OCI gets no quota, scheduling is a plain interval.
 
 ### M3: what the pre-implementation review got right, and what it got wrong
 
