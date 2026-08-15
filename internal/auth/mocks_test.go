@@ -499,8 +499,29 @@ func newTestService(t *testing.T, groupMapJSON string, devLogin bool) *testServi
 	t.Helper()
 
 	pool := dbtest.New(t)
-	store := db.NewStore(pool)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
+	return newTestServiceOn(t, pool, groupMapJSON, devLogin, NewSessionStore(pool, log))
+}
+
+// newTestServiceWithSessionStore is newTestService, but with an INJECTABLE
+// scs.Store instead of the real Postgres-backed one -- for a test that needs to
+// arm a controlled session-store failure (fakeSessionStore.deleteErr, e.g. B8's
+// "establish failed" and HandleLogin's RenewToken-failure redirect arms) while
+// login reconciliation still runs, faithfully, against a real database.
+func newTestServiceWithSessionStore(t *testing.T, groupMapJSON string, sessionStore scs.Store) *testService {
+	t.Helper()
+
+	return newTestServiceOn(t, dbtest.New(t), groupMapJSON, false, sessionStore)
+}
+
+// newTestServiceOn is the shared builder behind both constructors above.
+func newTestServiceOn(
+	t *testing.T, pool *pgxpool.Pool, groupMapJSON string, devLogin bool, sessionStore scs.Store,
+) *testService {
+	t.Helper()
+
+	store := db.NewStore(pool)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	var groups *config.GroupMap
@@ -514,7 +535,7 @@ func newTestService(t *testing.T, groupMapJSON string, devLogin bool) *testServi
 		}
 	}
 
-	sessions := NewSessionManager(NewSessionStore(pool, log), false)
+	sessions := NewSessionManager(sessionStore, false)
 
 	svc, err := New(Deps{
 		Store:    store,
@@ -536,6 +557,35 @@ func newTestService(t *testing.T, groupMapJSON string, devLogin bool) *testServi
 	}
 
 	return &testService{Service: svc, pool: pool, store: store}
+}
+
+// seedCallbackState puts `state` in a fresh session and returns the cookie
+// carrying it -- the same stash HandleLogin performs for a real browser, minus
+// the round trip through an actual IdP redirect. Callers that need the callback
+// to reach Provider.Exchange also need a matching code/token from newFakeIDP;
+// callers that only need to get past the state check (a missing-code or a
+// deliberately-unknown-code test) do not.
+func seedCallbackState(t *testing.T, ts *testService, state string) *http.Cookie {
+	t.Helper()
+
+	seedRec := httptest.NewRecorder()
+	ts.LoadAndSave(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		if err := ts.sessions.RenewToken(r.Context()); err != nil {
+			t.Fatalf("seed RenewToken: %v", err)
+		}
+
+		ts.sessions.Put(r.Context(), sessionStateKey, state)
+	})).ServeHTTP(seedRec, httptest.NewRequest(http.MethodGet, "/api/v1/seed", nil))
+
+	for _, c := range seedRec.Result().Cookies() {
+		if c.Name == "bakery_session" {
+			return c
+		}
+	}
+
+	t.Fatal("seed did not set a session cookie; the test cannot exercise the callback")
+
+	return nil
 }
 
 // identity builds an Identity as though an ID token had just been verified and

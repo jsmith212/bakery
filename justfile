@@ -65,6 +65,16 @@ run: web generate
   # file and whose DB host is `db`, not localhost.
   go run . serve
 
+# Run the Vite dev server against a locally running `just run`
+#
+# The browser only ever talks to :5173; vite.config.ts proxies /api/v1 and
+# /cache through to 127.0.0.1:8080, so the SameSite=Lax session cookie stays
+# genuinely same-origin. There is no CORS anywhere in this product and none is
+# needed -- production is one binary, one port, one origin, and this recipe
+# keeps development the same shape.
+dev: web-deps
+  cd web && npm run dev
+
 # Run unit tests (Go + frontend). DB tests spawn an ephemeral Postgres via docker,
 # or use TEST_DB_URL if it is exported.
 test: web generate web-test
@@ -225,6 +235,46 @@ oci-conformance: generate
     fi; \
     echo "oci-conformance: containerd + crane + skopeo + the Docker Engine URL shape ran green" '
 
+# Drive the REAL bakery binary + a real Chromium through the console (a skip FAILS)
+web-e2e: build
+  # `build` gives this a fresh ./build/bakery, and playwright.config.ts's
+  # webServer spawns exactly that binary with `cwd` pinned at the repo root --
+  # NOT `web/e2e/` (Playwright's own default), which is the trap: a bare
+  # relative `build/bakery` resolved against the config file's directory is
+  # `web/e2e/build/bakery`, a path that does not exist.
+  #
+  # Chromium only, installed here rather than assumed present -- `npx
+  # playwright install` is idempotent and near-instant on a cache hit, same
+  # shape as `hashserv-conformance` installing its pinned websockets into a
+  # cached target dir on every run.
+  #
+  # PLAYWRIGHT_JSON_OUTPUT_NAME + `jq -e '.stats.skipped == 0'`, never a
+  # stdout grep: Playwright's own JSON reporter writes structured output
+  # there, and `--reporter=list,json` on the command line keeps the `list`
+  # progress output human-readable in the log without interleaving into the
+  # JSON file. A `.skip()`/`.fixme()` left in a spec, or `forbidOnly` firing
+  # on a stray `.only`, must fail this exactly like a `--- SKIP` fails the Go
+  # conformance recipes -- a suite that quietly ran fewer tests than it
+  # claims is not a passing suite.
+  # bash + pipefail (not `sh`): with `sh` the exit status of `playwright test |
+  # tee` is tee's, so a failing suite would report as a pass -- the same trap
+  # `test-db` and every conformance recipe document.
+  #
+  # PLAYWRIGHT_JSON_OUTPUT_NAME resolves relative to the CONFIG FILE's
+  # directory (web/e2e/), not the process cwd -- ../../build lands at the
+  # repo root's build/, matching every other recipe's log location.
+  mkdir -p build
+  cd web && npx playwright install chromium
+  bash -euo pipefail -c ' \
+    cd web && \
+    PLAYWRIGHT_JSON_OUTPUT_NAME=../../build/web-e2e.json npx playwright test -c e2e/playwright.config.ts --reporter=list,json 2>&1 | tee ../build/web-e2e.log; \
+    cd .. && \
+    jq -e ".stats.skipped == 0" build/web-e2e.json > /dev/null || { \
+      echo "FAIL: the web e2e suite SKIPPED a test -- it did not run, so it did not pass."; \
+      exit 1; \
+    }; \
+    echo "web-e2e: the real bakery binary + a real Chromium ran the console flow green" '
+
 # Run the race detector
 race: web generate
   go test -race ./...
@@ -248,7 +298,12 @@ db-down:
   -docker rm -f bakery-testdb
 
 # Run all code checks
-check: check-format vet lint web-check
+#
+# web-test is in this list for SPEED, not coverage: vitest is already CI-gated
+# through `just coverage` in the build job, so this only moves a frontend
+# failure out of the slow job and into the fast one, where it costs half a
+# second instead of a full `go test -race`.
+check: check-format vet lint web-check web-test
 
 # Check the format of the code
 check-format:

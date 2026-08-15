@@ -12,6 +12,8 @@
 		delta?: string;
 		deltaKind?: DeltaKind;
 		deltaGood?: boolean;
+		/** A line under the value for a state numbers alone can't say -- "not yet measured", "across 3 capped backends". */
+		caption?: string;
 		spark?: number[];
 		sparkColor?: string;
 		class?: string;
@@ -24,6 +26,7 @@
 		delta,
 		deltaKind,
 		deltaGood,
+		caption,
 		spark,
 		sparkColor,
 		class: klass = ''
@@ -57,6 +60,9 @@
 			</span>
 		{/if}
 	</div>
+	{#if caption}
+		<div class="text-xs text-text-3">{caption}</div>
+	{/if}
 	{#if spark && spark.length}
 		<div class="mt-1">
 			<Sparkline data={spark} color={sparkColor} />

@@ -1,0 +1,23 @@
+{
+  "items": [
+    {
+      "id": "1c9c9e2a-3e4f-4a5b-8c7d-6e5f4a3b2c1d",
+      "slug": "acme",
+      "name": "Acme",
+      "role": "admin",
+      "default_retention_window": "2160h0m0s",
+      "default_quota_bytes": 549755813888,
+      "created_at": "2026-07-12T09:14:02.114Z",
+      "updated_at": "2026-08-01T11:02:41.881Z"
+    },
+    {
+      "id": "3e0e0a4c-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
+      "slug": "robotics-lab",
+      "name": "Robotics Lab",
+      "default_retention_window": null,
+      "default_quota_bytes": null,
+      "created_at": "2026-07-30T16:41:19.007Z",
+      "updated_at": "2026-07-30T16:41:19.007Z"
+    }
+  ]
+}

@@ -100,6 +100,16 @@ func TestRouteTable(t *testing.T) {
 		{AccessSiteAdmin, "GET /api/v1/gc/runs"},
 		{AccessSiteAdmin, "GET /api/v1/gc/runs/{id}"},
 		{AccessSiteAdmin, "POST /api/v1/gc/run"},
+
+		// SPA->API wiring wave, backend track (spec 2026-08-15).
+		{AccessOrgView, "GET /api/v1/orgs/{org}/gc/activity"}, // B7: org-scoped, not site-admin
+
+		{AccessOrgView, "GET /api/v1/orgs/{org}/usage"},                        // B2a
+		{AccessProjectRead, "GET /api/v1/orgs/{org}/projects/{project}/usage"}, // B2b
+
+		{AccessProjectRead, "GET /api/v1/orgs/{org}/projects/{project}/backends/{kind}/objects"}, // B3
+
+		{AccessSiteAdmin, "GET /api/v1/instance"}, // B6
 	}
 
 	a := &API{

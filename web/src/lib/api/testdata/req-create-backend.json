@@ -1,0 +1,7 @@
+{
+  "kind": "sstate",
+  "enabled": true,
+  "read_auth_required": true,
+  "config": {},
+  "retention_window": "2160h"
+}

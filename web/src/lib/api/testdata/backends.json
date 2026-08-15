@@ -1,0 +1,28 @@
+{
+  "items": [
+    {
+      "id": 41,
+      "project_id": "2d8d8f3b-4f5a-4b6c-9d8e-7f6a5b4c3d2e",
+      "kind": "sstate",
+      "enabled": true,
+      "read_auth_required": true,
+      "config": {},
+      "retention_window": "2160h0m0s",
+      "quota_bytes": 549755813888,
+      "created_at": "2026-07-12T09:16:00.000Z",
+      "updated_at": "2026-08-01T09:00:00.000Z"
+    },
+    {
+      "id": 42,
+      "project_id": "2d8d8f3b-4f5a-4b6c-9d8e-7f6a5b4c3d2e",
+      "kind": "hashserv",
+      "enabled": true,
+      "read_auth_required": true,
+      "config": {},
+      "retention_window": "2160h0m0s",
+      "quota_bytes": null,
+      "created_at": "2026-07-12T09:16:05.000Z",
+      "updated_at": "2026-07-12T09:16:05.000Z"
+    }
+  ]
+}

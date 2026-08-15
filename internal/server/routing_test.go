@@ -36,7 +36,20 @@ func TestHeadlessDoesNotRouteTheSPA(t *testing.T) {
 			name: "console: deep link falls back to the SPA", headless: false,
 			path: "/overview", want: http.StatusOK,
 		},
+		{
+			// The tenancy-in-the-path shape the console moved to: /o/{org}/p/{project}.
+			// Four segments deep, two of them caller-supplied slugs, and it must reach
+			// the SPA fallback rather than any of the explicitly registered mounts --
+			// /cache/, /v2/ and /api/v1/ all 404 their unrouted subpaths on purpose, so
+			// a deep link that collided with one would silently stop resolving.
+			name: "console: a tenancy deep link falls back to the SPA", headless: false,
+			path: "/o/acme/p/firmware/backends/sstate", want: http.StatusOK,
+		},
 		{name: "headless: root is not routed", headless: true, path: "/", want: http.StatusNotFound},
+		{
+			name: "headless: a tenancy deep link is not routed", headless: true,
+			path: "/o/acme/p/firmware/backends/sstate", want: http.StatusNotFound,
+		},
 		{
 			name: "headless: deep link is not routed", headless: true,
 			path: "/overview", want: http.StatusNotFound,

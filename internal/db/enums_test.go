@@ -182,6 +182,13 @@ func TestNewPoolRefusesDatabaseMissingAnEnum(t *testing.T) {
 	}
 	defer admin.Close()
 
+	// gc_run_backends (000013) FKs onto gc_runs with no ON DELETE CASCADE (gc_runs
+	// rows are never deleted in production, so there was nothing to cascade FOR),
+	// so it has to go first here.
+	if _, err := admin.Exec(ctx, `DROP TABLE gc_run_backends`); err != nil {
+		t.Fatalf("drop gc_run_backends: %v", err)
+	}
+
 	if _, err := admin.Exec(ctx, `DROP TABLE gc_runs`); err != nil {
 		t.Fatalf("drop gc_runs: %v", err)
 	}

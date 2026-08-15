@@ -1,0 +1,5 @@
+{
+  "name": "Acme Corp",
+  "default_retention_window": "720h",
+  "default_quota_bytes": 549755813888
+}

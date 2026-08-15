@@ -159,12 +159,14 @@ func TestMigrationVersion(t *testing.T) {
 		t.Error("dirty = true on a cleanly migrated database")
 	}
 
-	// 12 up/down pairs ship in internal/db/migrations. If this number changes, the
+	// 13 up/down pairs ship in internal/db/migrations. If this number changes, the
 	// change was deliberate and this line moves with it. (000012 is M6's GC
 	// retention/quotas change: accessed_at, cache_backends.retention_window/
-	// quota_bytes, cache_backend_usage, and the gc_runs trigger/dry_run columns.)
-	if version != 12 {
-		t.Errorf("version = %d, want 12", version)
+	// quota_bytes, cache_backend_usage, and the gc_runs trigger/dry_run columns.
+	// 000013 is the SPA->API wiring wave's B7: gc_run_backends, per-backend GC
+	// attribution.)
+	if version != 13 {
+		t.Errorf("version = %d, want 13", version)
 	}
 }
 

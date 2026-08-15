@@ -189,6 +189,17 @@ type AuthConfig struct {
 	// DevLoginEnabled mirrors DEV_LOGIN_ENABLED. It is REPORTED here, never SET
 	// here: this struct is serialized outward and never parsed inward.
 	DevLoginEnabled bool `json:"dev_login_enabled"`
+
+	// AllowSelfServeOrgs mirrors --allow-self-serve-orgs (B8, critique finding
+	// 10). It gates the console's "Create organization" affordance, and it has
+	// to live on a PUBLIC, unauthenticated document: the alternative homes
+	// considered were api.Me (authenticated only -- a signed-out visitor could
+	// not decide whether to render the affordance on their FIRST screen) and
+	// GET /instance (AccessSiteAdmin -- the one principal who never needs the
+	// answer, because they can always self-serve). Without this, "Create
+	// organization" 403s with no explanation for every non-site-admin on an
+	// installation that restricts it.
+	AllowSelfServeOrgs bool `json:"allow_self_serve_orgs"`
 }
 
 // AuthConfig renders the provider half of the /auth/config document.

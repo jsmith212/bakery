@@ -1,0 +1,25 @@
+{
+  "items": [
+    {
+      "user_id": "aa11bb22-cc33-4d44-8e55-ff6600112233",
+      "email": "ops@bakery.internal",
+      "display_name": "Ops",
+      "site_role": "admin",
+      "site_role_oidc": "admin",
+      "site_oidc_group": "cn=platform-admins,ou=groups,dc=acme,dc=dev",
+      "granted_at": null,
+      "site_role_source": "oidc_groups"
+    },
+    {
+      "user_id": "9a3c2e51-2a8b-4d0e-8b6c-1e2d3c4b5a69",
+      "email": "bo@acme.dev",
+      "display_name": "Bo Lind",
+      "site_role": "admin",
+      "site_role_local": "admin",
+      "granted_by": "",
+      "granted_by_email": "",
+      "granted_at": "2026-07-12T08:00:00.000Z",
+      "site_role_source": "local"
+    }
+  ]
+}

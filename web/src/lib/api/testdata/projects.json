@@ -1,0 +1,29 @@
+{
+  "items": [
+    {
+      "id": "2d8d8f3b-4f5a-4b6c-9d8e-7f6a5b4c3d2e",
+      "org_id": "1c9c9e2a-3e4f-4a5b-8c7d-6e5f4a3b2c1d",
+      "org_slug": "acme",
+      "slug": "firmware",
+      "name": "Firmware",
+      "role": "admin",
+      "backends": [
+        "sstate",
+        "downloads",
+        "hashserv"
+      ],
+      "created_at": "2026-07-12T09:15:44.201Z",
+      "updated_at": "2026-07-12T09:15:44.201Z"
+    },
+    {
+      "id": "4f1f1b5d-6b7c-4d8e-9f0a-1b2c3d4e5f60",
+      "org_id": "1c9c9e2a-3e4f-4a5b-8c7d-6e5f4a3b2c1d",
+      "org_slug": "acme",
+      "slug": "tools",
+      "name": "Tools",
+      "backends": [],
+      "created_at": "2026-08-02T08:00:00.000Z",
+      "updated_at": "2026-08-02T08:00:00.000Z"
+    }
+  ]
+}

@@ -178,6 +178,7 @@ Each is independently shippable and leaves the tree green.
 - **M4 — Bazel REAPI (gRPC) + `/ac` `/cas` `/sccache` HTTP. ✅ DONE** (see "M4 as landed" below). Ships moon (gRPC), Bazel (gRPC + HTTP), ccache and sccache together.
 - **M5 — Docker OCI pull-through proxy. ✅ DONE** (see "M5 as landed" below). Byte-exact manifests, stale-while-revalidate, own Bearer challenge; ships containerd, BuildKit, podman/skopeo and Docker Engine.
 - **M6 — GC, retention, quotas. ✅ DONE** (see "M6 as landed" below). ([spec](specs/2026-08-14-m6-gc-retention-quotas.md)) Product decisions confirmed 2026-08-14: retention ships ON with per-kind defaults, `downloads` is an archive (never auto-evicts), org quota is a seed default only, OCI gets no quota, scheduling is a plain interval. (UI polish descoped to the SPA wiring wave.)
+- **SPA → API wiring wave. ✅ DONE** (see "SPA wiring as landed" below). ([spec](specs/2026-08-15-spa-api-wiring.md)) The console is real: every screen wired to `/api/v1`, zero mock data, path-based tenancy, session auth end to end, the snippet generator rebuilt (backend-aware, gRPC endpoint fixed, preview mode), new usage/objects/instance/GC-activity endpoints, and a Playwright e2e driving the real binary in CI.
 
 ### M3: what the pre-implementation review got right, and what it got wrong
 
@@ -520,6 +521,43 @@ maintenance-window scheduler, S3 reap, and ALL SPA wiring (GC-runs screen + gaug
 land with the SPA wave). Known follow-ups: boot's `RedrivePendingDelete` overlaps the first
 startup sweep's stage 0 (harmless duplicate scan), and the engine's flusher wiring in
 `Boot` is proven by compilation rather than a wiring test.
+
+### SPA wiring as landed (2026-08-15)
+
+The whole console runs on real data: typed hand-written client (`web/src/lib/api/`,
+JSON-tag-faithful, Go↔TS golden test over shared fixtures), path tenancy
+(`/o/[org]/p/[project]`), session auth (cookie-only; `/me` guard; every browser-facing
+OIDC failure redirects to `/login?denied=<reason>`; `requireJSON` now also gates
+`AccessPublic` mutations), and honest states everywhere (loading/empty/loaded triads,
+`measured_at` on every usage figure, `~` on `accessed_at`, deleted time-series charts
+replaced by empty states pointing at Prometheus — components retained for a future
+rollup milestone).
+
+**Backend track:** the snippet generator rewrite (reads `cache_backends` and emits only
+configured kinds' blocks with loud warnings; `--grpc-external-endpoint` + `--external-url`
+threading with the gRPC port taken from `--grpc-addr`, never the HTTP port; https
+fail-closed scheme incl. a constrained `X-Forwarded-Proto`; the five-block yocto form with
+`BB_HASHSERVE` + the separately-keyed hashserv netrc line; **preview mode that mints
+nothing** — a mint is exactly one explicit gesture, scope capped at the caller's ceiling);
+usage endpoints (first readers of `cache_backend_usage`); the keyset object browser;
+org seed-defaults on the wire; `GET /instance`; **org-visible GC activity**
+(`gc_run_backends` per-backend attribution, migration `000013`); callback-denial
+redirects and `Cache-Control: no-store` on `/auth/*`.
+
+**Process:** research wave → adjudicated memo → 21-finding critique (four of the memo's
+load-bearing claims were wrong; the critique won) → spec → 7-stage build-gated
+implementation → 3-lens review (37 findings incl. a protocol-facts panel teaching the
+forbidden hashserv 401, revoked keys rendering live, and a lossy quota round-trip that
+rewrote stored values on every save) → fix wave → independent verify (SHIP; all items
+mechanism-verified). Gates: 227 Vitest, 416-file svelte-check clean, full `just test-db`
+no-skips, Playwright e2e (dev-login → org → project → backends → key → snippet, plus the
+sstate-only negative leg) against the real binary, new `web-e2e` CI job.
+
+**Not built (recorded):** time-series/rollups, audit log, per-object delete, personal
+access tokens (placeholder ships; future milestone), invitations, multi-IdP, org slug
+mutation, ESLint-for-web. Known pre-existing flake: dbtest container provisioning can
+lose a race under full-suite parallelism (`TestCleanupDropsDatabase` et al.) — re-run the
+package; not caused by this wave.
 
 ---
 

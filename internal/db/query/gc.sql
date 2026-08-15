@@ -702,3 +702,63 @@ SELECT id, started_at, finished_at, status, error, trigger, dry_run,
        objects_deleted, blobs_marked, blobs_deleted, bytes_reclaimed, hashserv_rows_deleted
   FROM gc_runs
  WHERE id = sqlc.arg(id);
+
+-- ===========================================================================
+-- gc_run_backends (000013, SPA->API wiring wave B7): per-backend attribution, so
+-- an org viewer can see what a sweep did to THEIR projects.
+-- ===========================================================================
+
+-- RecordGCRunBackend is the engine's own write, called once per swept backend per
+-- real run from internal/gc/sweep.go (sweepHashserv's and sweepBackend's own
+-- summary points) -- never for a dry run, never for MeasureUsage's usage-only
+-- pass, and never for a backend the plan declined to sweep at all. ON CONFLICT is
+-- a defensive upsert, not the expected path: (run_id, backend_id) is written by
+-- exactly one call per run under this engine's single-writer discipline (spec
+-- CLAUDE.md, "boot takes pg_try_advisory_lock and refuses a second instance"), so
+-- the conflict arm exists only to make a retry of this one statement idempotent
+-- rather than a second, disagreeing row.
+--
+-- name: RecordGCRunBackend :exec
+INSERT INTO gc_run_backends (run_id, backend_id, objects_deleted, bytes_freed)
+VALUES (sqlc.arg(run_id), sqlc.arg(backend_id), sqlc.arg(objects_deleted), sqlc.arg(bytes_freed))
+ON CONFLICT (run_id, backend_id) DO UPDATE
+   SET objects_deleted = EXCLUDED.objects_deleted,
+       bytes_freed     = EXCLUDED.bytes_freed;
+
+-- ListOrgGCActivity is GET /orgs/{org}/gc/activity: the most recent RUNS that
+-- touched this org's projects, each with every one of ITS backend rows that
+-- belongs to this org (a run can span many orgs; only this org's slice is
+-- returned).
+--
+-- Paginated on RUNS, not on the flat (run, backend) rows the query returns --
+-- the API groups this result by run_id in Go and the ?limit= the caller gave
+-- bounds how many runs come back, not how many backend rows. The `runs` CTE picks
+-- the page of run ids FIRST, scoped to the org and the keyset cursor, and the
+-- outer SELECT re-joins to fetch every row of exactly those runs; a plain
+-- `LIMIT` on the flat join would cut a run's backend list off mid-way and the
+-- caller would never know it was truncated rather than short.
+--
+-- sqlc.narg(before_id): NULL means "from the newest run", matching ListGCRuns'
+-- own convention above.
+--
+-- name: ListOrgGCActivity :many
+WITH runs AS (
+    SELECT DISTINCT gr.id
+      FROM gc_runs gr
+      JOIN gc_run_backends grb ON grb.run_id = gr.id
+      JOIN cache_backends cb ON cb.id = grb.backend_id
+      JOIN projects p ON p.id = cb.project_id
+     WHERE p.org_id = sqlc.arg(org_id)
+       AND (sqlc.narg(before_id)::bigint IS NULL OR gr.id < sqlc.narg(before_id)::bigint)
+     ORDER BY gr.id DESC
+     LIMIT sqlc.arg(run_limit)
+)
+SELECT gr.id AS run_id, gr.started_at, gr.finished_at, gr.status,
+       p.slug AS project_slug, cb.kind, grb.objects_deleted, grb.bytes_freed
+  FROM runs
+  JOIN gc_runs gr ON gr.id = runs.id
+  JOIN gc_run_backends grb ON grb.run_id = gr.id
+  JOIN cache_backends cb ON cb.id = grb.backend_id
+  JOIN projects p ON p.id = cb.project_id
+ WHERE p.org_id = sqlc.arg(org_id)
+ ORDER BY gr.id DESC, p.slug, cb.kind;

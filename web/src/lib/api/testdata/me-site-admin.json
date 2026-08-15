@@ -1,0 +1,10 @@
+{
+  "user_id": "aa11bb22-cc33-4d44-8e55-ff6600112233",
+  "email": "ops@bakery.internal",
+  "display_name": "Ops",
+  "method": "session",
+  "site_role": "admin",
+  "is_site_admin": true,
+  "orgs": [],
+  "projects": []
+}

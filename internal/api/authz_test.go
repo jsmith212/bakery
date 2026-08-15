@@ -450,27 +450,40 @@ func TestStateChangingRequestsRequireJSON(t *testing.T) {
 		method      string
 		contentType string
 		body        string
+		access      Access
 		want        int
 	}{
-		{"json is accepted", http.MethodPost, "application/json", `{}`, http.StatusOK},
+		{"json is accepted", http.MethodPost, "application/json", `{}`, AccessAuthenticated, http.StatusOK},
 		{
 			"json with a charset is accepted", http.MethodPost,
-			"application/json; charset=utf-8", `{}`, http.StatusOK,
+			"application/json; charset=utf-8", `{}`, AccessAuthenticated, http.StatusOK,
 		},
 		{
 			"a cross-site form post is refused", http.MethodPost,
-			"application/x-www-form-urlencoded", "a=b", http.StatusUnsupportedMediaType,
+			"application/x-www-form-urlencoded", "a=b", AccessAuthenticated, http.StatusUnsupportedMediaType,
 		},
 		{
 			"a multipart form post is refused", http.MethodPost,
-			"multipart/form-data; boundary=x", "x", http.StatusUnsupportedMediaType,
+			"multipart/form-data; boundary=x", "x", AccessAuthenticated, http.StatusUnsupportedMediaType,
 		},
 		{
 			"a text/plain post is refused", http.MethodPost,
-			"text/plain", "x", http.StatusUnsupportedMediaType,
+			"text/plain", "x", AccessAuthenticated, http.StatusUnsupportedMediaType,
 		},
-		{"a bodyless DELETE is accepted", http.MethodDelete, "", "", http.StatusOK},
-		{"a GET is never gated", http.MethodGet, "", "", http.StatusOK},
+		{"a bodyless DELETE is accepted", http.MethodDelete, "", "", AccessAuthenticated, http.StatusOK},
+		{"a GET is never gated", http.MethodGet, "", "", AccessAuthenticated, http.StatusOK},
+		// AccessPublic covers POST /auth/logout and POST /auth/dev-login: "public"
+		// means "no credential required", not "exempt from the CSRF defence" -- the
+		// guard must run requireJSON ahead of its AccessPublic short-circuit.
+		{
+			"an AccessPublic cross-site form post is refused (dev-login/logout share this guard)",
+			http.MethodPost, "application/x-www-form-urlencoded", "a=b", AccessPublic, http.StatusUnsupportedMediaType,
+		},
+		{
+			"an AccessPublic bodyless POST is accepted (the dev-login/logout shape)",
+			http.MethodPost, "", "", AccessPublic, http.StatusOK,
+		},
+		{"an AccessPublic GET is never gated", http.MethodGet, "", "", AccessPublic, http.StatusOK},
 	}
 
 	a := testAPI(t, fixtureStore(t), nil)
@@ -479,7 +492,7 @@ func TestStateChangingRequestsRequireJSON(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mux := http.NewServeMux()
-			mux.HandleFunc("/x", a.guard(AccessAuthenticated, func(w http.ResponseWriter, _ *http.Request) error {
+			mux.HandleFunc("/x", a.guard(tt.access, func(w http.ResponseWriter, _ *http.Request) error {
 				w.WriteHeader(http.StatusOK)
 
 				return nil

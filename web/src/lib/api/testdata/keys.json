@@ -1,0 +1,32 @@
+{
+  "items": [
+    {
+      "id": "c1d2e3f4-0a1b-4c2d-8e3f-4a5b6c7d8e9f",
+      "name": "ci-runner",
+      "project_id": "2d8d8f3b-4f5a-4b6c-9d8e-7f6a5b4c3d2e",
+      "token_prefix": "bkry_7f3a91c2",
+      "scope": "write",
+      "owner_id": "8f2b1d40-1f7a-4c9d-9a7a-0d2c3b4e5f60",
+      "owner_email": "anna@acme.dev",
+      "owner_name": "Anna Roux",
+      "created_at": "2026-07-20T10:00:00.000Z",
+      "expires_at": null,
+      "last_used_at": "2026-08-14T22:41:03.552Z",
+      "revoked_at": null
+    },
+    {
+      "id": "d2e3f4a5-1b2c-4d3e-9f4a-5b6c7d8e9f0a",
+      "name": "old-laptop",
+      "project_id": "2d8d8f3b-4f5a-4b6c-9d8e-7f6a5b4c3d2e",
+      "token_prefix": "bkry_1a2b3c4d",
+      "scope": "read",
+      "owner_id": "8f2b1d40-1f7a-4c9d-9a7a-0d2c3b4e5f60",
+      "owner_email": "anna@acme.dev",
+      "owner_name": "Anna Roux",
+      "created_at": "2026-06-01T09:00:00.000Z",
+      "expires_at": null,
+      "last_used_at": "2026-06-15T12:00:00.000Z",
+      "revoked_at": "2026-07-01T08:30:00.000Z"
+    }
+  ]
+}

@@ -28,6 +28,33 @@ type Summary struct {
 	// BackendsRefused counts sstate backends the coverage guard would not sweep
 	// (spec §5). Non-zero is an operator-visible condition, not an error.
 	BackendsRefused int
+
+	// LogicalBytesFreed is a RUNNING TOTAL, across every backend this run has
+	// swept so far, of size_bytes for cache_objects rows this run has deleted --
+	// the SPA->API wiring wave's B7 attribution (000013, gc_run_backends).
+	//
+	// It is NOT BytesReclaimed. BytesReclaimed is Layer B's PHYSICAL reap --
+	// instance-wide, deduped, delayed behind the grace period -- and cannot be
+	// attributed to one backend at all: two backends can name the same blob, and
+	// the byte only actually leaves disk when the last namer's row is gone.
+	// LogicalBytesFreed is the SAME "logical" convention cache_backend_usage
+	// (000012) and the quota histogram already use: full charge, to every
+	// backend whose row named the bytes, the instant that row is deleted --
+	// which is knowable immediately, from the scan the delete already read.
+	//
+	// publishRunBackend reads a BEFORE/AFTER delta of this field around one
+	// backend's own sweepBackend/sweepHashserv call to get that backend's share,
+	// which is sound because the sweep visits backends strictly one at a time
+	// (spec CLAUDE.md: GC is single-writer by construction).
+	//
+	// stage 8 (SweepUnreferencedManifests, sweepManifests in this file) does NOT
+	// add to this: that statement deletes without reading size_bytes back (its
+	// own comment explains why touching its write-barrier-critical RETURNING
+	// clause for a reporting figure is not worth the risk), so an OCI backend's
+	// manifest deletions are undercounted here BY DESIGN. Manifests are small
+	// JSON documents; the OCI blob layers they name go through the ordinary
+	// per-page path below and ARE counted.
+	LogicalBytesFreed int64
 }
 
 // coverageProbePages bounds the sstate coverage guard's look-ahead (spec §5).
@@ -197,7 +224,7 @@ func (e *Engine) runFrom(
 	sum := Summary{
 		RunID: run.ID, Trigger: trigger, DryRun: dryRun,
 		ObjectsDeleted: 0, HashservRows: 0, BlobsMarked: 0, BlobsDeleted: 0,
-		BytesReclaimed: 0, BackendsRefused: 0,
+		BytesReclaimed: 0, BackendsRefused: 0, LogicalBytesFreed: 0,
 	}
 
 	e.log.InfoContext(ctx, "gc run started",
@@ -487,6 +514,15 @@ func (e *Engine) sweepHashserv(ctx context.Context, runID int64, p backendPlan, 
 			slog.Int64("siginfo_cleared", siginfos), slog.Bool("dry_run", sum.DryRun))
 	}
 
+	// B7 (000013): hashserv owns no cache_objects rows and no blobs, so its
+	// objects_deleted is unihashes+outhashes -- the same figure HashservRows
+	// above just accumulated -- and bytes_freed is always zero, structurally: a
+	// unihash row has no size_bytes column to sum. This is reached only past the
+	// !p.hasWindow guard at the top of this function, so a hashserv backend with
+	// no configured window (nothing for this run to have swept) gets no row,
+	// exactly like a cache_objects backend the plan declined.
+	e.publishRunBackend(ctx, runID, p.id, unihashes+outhashes, 0, sum.DryRun)
+
 	return nil
 }
 
@@ -527,6 +563,13 @@ func (e *Engine) sweepBackend(
 		return nil
 	}
 
+	// B7 (000013): snapshot the run-wide counters BEFORE this backend's own
+	// stages and quota eviction run, so the delta below is exactly this
+	// backend's share. Sound because the sweep visits backends strictly one at a
+	// time -- there is no concurrent sweepBackend call whose writes could land
+	// between this read and the one after evictToQuota returns.
+	beforeObjects, beforeBytes := sum.ObjectsDeleted, sum.LogicalBytesFreed
+
 	u := newUsage(len(p.stages))
 	cov := coverage{scanned: 0, resolved: 0}
 
@@ -560,7 +603,46 @@ func (e *Engine) sweepBackend(
 
 	e.publishUsage(ctx, p, u, sum.DryRun)
 
-	return e.evictToQuota(ctx, runID, now, &p, u, sum)
+	evictErr := e.evictToQuota(ctx, runID, now, &p, u, sum)
+
+	// Published REGARDLESS of evictErr, mirroring finish()'s own posture on the
+	// run as a whole: a partial figure ("how far this backend got before it
+	// failed") is more useful to an org viewer than none, and the run itself
+	// still ends up FAILED (runFrom propagates evictErr up), which is the loud
+	// signal.
+	e.publishRunBackend(ctx, runID, p.id, sum.ObjectsDeleted-beforeObjects, sum.LogicalBytesFreed-beforeBytes, sum.DryRun)
+
+	return evictErr
+}
+
+// publishRunBackend writes B7's gc_run_backends row (000013) for the ONE backend
+// sweepBackend or sweepHashserv just finished sweeping -- best-effort, exactly
+// like publishUsage immediately above: logged and swallowed on failure rather
+// than failing an otherwise-successful run over a reporting write.
+//
+// A DRY RUN WRITES NOTHING, for the same reason publishUsage's own dry-run guard
+// exists: the figures describe a sweep that is not going to happen. A
+// usage-only run (MeasureUsage) never reaches this function at all -- it drives
+// its own read-only measureAll loop and calls neither sweepBackend nor
+// sweepHashserv -- so "real run only" falls out of WHO CALLS THIS rather than a
+// second trigger check here.
+func (e *Engine) publishRunBackend(
+	ctx context.Context, runID, backendID, objectsDeleted, bytesFreed int64, dryRun bool,
+) {
+	if dryRun {
+		return
+	}
+
+	stmtCtx, cancel := chunkCtx(ctx)
+	defer cancel()
+
+	if err := e.db.RecordGCRunBackend(stmtCtx, repository.RecordGCRunBackendParams{
+		RunID: runID, BackendID: backendID,
+		ObjectsDeleted: objectsDeleted, BytesFreed: bytesFreed,
+	}); err != nil {
+		e.log.ErrorContext(ctx, "recording gc run backend activity",
+			slog.Int64("run", runID), slog.Int64("backend", backendID), slog.Any("error", err))
+	}
 }
 
 // decider decides which rows of one scan page are doomed. It is per PAGE rather than
@@ -873,6 +955,20 @@ func (e *Engine) processPage(
 
 	batch := make([]blob.DeleteRef, 0, len(page))
 
+	// batchBytes is the LOGICAL size of the batch this page is about to request
+	// deleted -- B7's gc_run_backends.bytes_freed (000013). It is summed from the
+	// SAME scan that built batch, so it costs no extra round trip, and it is
+	// credited on the REQUESTED set rather than re-derived from what DeleteBatch
+	// actually removed: DeleteObjectsByKeys re-checks the write barrier at delete
+	// time and can legitimately delete fewer than len(batch) rows (a key a
+	// concurrent /ac/ overwrite just resurrected), and that gap is the same one
+	// ScanObjectsForGC's own comment already accepts as costing nothing at the
+	// call site. The ObjectsDeleted counter below is NOT relaxed the same way --
+	// it uses the real DeleteBatch count, n -- so this is the one place the two
+	// totals can disagree by the width of that race, which is bounded by a
+	// single chunk and never by more.
+	var batchBytes int64
+
 	for i, row := range page {
 		// THE VETO (spec §6.2). A pending, unflushed touch is INVISIBLE to the scan's
 		// SELECT -- the row still carries its old accessed_at -- so a key this process
@@ -887,6 +983,7 @@ func (e *Engine) processPage(
 		}
 
 		batch = append(batch, deleteRef(p, st, row))
+		batchBytes += row.SizeBytes
 	}
 
 	if len(batch) == 0 {
@@ -895,6 +992,7 @@ func (e *Engine) processPage(
 
 	if sum.DryRun {
 		sum.ObjectsDeleted += int64(len(batch))
+		sum.LogicalBytesFreed += batchBytes
 		e.rec.ObjectsDeleted(p.backend, st.namespace, st.reason, int64(len(batch)))
 
 		return nil
@@ -910,6 +1008,7 @@ func (e *Engine) processPage(
 	}
 
 	sum.ObjectsDeleted += n
+	sum.LogicalBytesFreed += batchBytes
 	e.rec.ObjectsDeleted(p.backend, st.namespace, st.reason, n)
 
 	return nil

@@ -41,6 +41,11 @@ type fakeQueries struct {
 	scanAt     []time.Time
 	finished   []repository.FinishGCRunParams
 	usage      []repository.UpsertBackendUsageParams
+	// runBackends records every RecordGCRunBackend call (B7, 000013), in call
+	// order, so a test can assert exactly which backends got a row and with what
+	// totals for a given run -- including that a declined or refused backend, or
+	// a dry/usage run, produced NONE.
+	runBackends []repository.RecordGCRunBackendParams
 
 	startErr error
 	scanErr  error
@@ -62,7 +67,8 @@ func newFakeQueries() *fakeQueries {
 		unihashes: map[int64]map[string]struct{}{},
 		nextRun:   0, startedAt: time.Now(),
 		calls: map[string]int{}, scanLimits: nil, scanAt: nil, finished: nil, usage: nil,
-		startErr: nil, scanErr: nil, rampUntil: time.Time{}, rampErr: nil, onScan: nil,
+		runBackends: nil,
+		startErr:    nil, scanErr: nil, rampUntil: time.Time{}, rampErr: nil, onScan: nil,
 	}
 }
 
@@ -300,6 +306,19 @@ func (f *fakeQueries) InstancePhysicalBytes(_ context.Context) (int64, error) {
 	f.note("InstancePhysicalBytes")
 
 	return 0, nil
+}
+
+func (f *fakeQueries) RecordGCRunBackend(
+	_ context.Context, arg repository.RecordGCRunBackendParams,
+) error {
+	f.note("RecordGCRunBackend")
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.runBackends = append(f.runBackends, arg)
+
+	return nil
 }
 
 func (f *fakeQueries) SweepUnreferencedManifests(

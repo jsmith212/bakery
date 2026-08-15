@@ -292,6 +292,112 @@ func TestExternalURLBinding(t *testing.T) {
 	}
 }
 
+// TestGRPCExternalEndpointBinding pins the B1 flag/env binding, mirroring
+// TestExternalURLBinding above.
+//
+// It is a SEPARATE knob from GRPCAddr and must stay one: GRPCAddr is where the
+// process binds, this is where the world reaches it, and nothing in the process can
+// derive the second from the first. Empty is the supported default -- the snippet
+// generator then derives an endpoint from the request host and GRPCAddr's port and
+// warns once -- and the value is taken verbatim, with no normalization here: a
+// scheme, a port, or neither is the operator's statement about their ingress, not
+// something this layer may improve.
+func TestGRPCExternalEndpointBinding(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		args []string
+		want string
+	}{
+		{
+			name: "empty by default",
+			env:  map[string]string{"DB_URL": dsn},
+			args: []string{"serve"},
+			want: "",
+		},
+		{
+			name: "env var sets it",
+			env: map[string]string{
+				"DB_URL": dsn, "GRPC_EXTERNAL_ENDPOINT": "grpcs://reapi.bakery.example.com:443",
+			},
+			args: []string{"serve"},
+			want: "grpcs://reapi.bakery.example.com:443",
+		},
+		{
+			name: "flag sets it",
+			env:  map[string]string{"DB_URL": dsn},
+			args: []string{"serve", "--grpc-external-endpoint=grpcs://reapi.bakery.example.com:443"},
+			want: "grpcs://reapi.bakery.example.com:443",
+		},
+		{
+			name: "it does not disturb --grpc-addr, which is a different question",
+			env:  map[string]string{"DB_URL": dsn},
+			args: []string{"serve", "--grpc-external-endpoint=grpcs://public:443", "--grpc-addr=0.0.0.0:9092"},
+			want: "grpcs://public:443",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+
+			_, cli := parse(t, tt.args...)
+
+			if got := cli.Serve.GRPCExternalEndpoint; got != tt.want {
+				t.Errorf("GRPCExternalEndpoint = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGRPCAddrBinding pins the listener address the snippet generator takes its
+// PORT from. The default is loopback:9092 -- REAPI is its own listener, never the
+// public port -- and an empty value disables it, which is what makes a bazel/moon
+// snippet a 409 rather than a config pointing at nothing.
+func TestGRPCAddrBinding(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		args []string
+		want string
+	}{
+		{
+			name: "loopback :9092 by default",
+			env:  map[string]string{"DB_URL": dsn},
+			args: []string{"serve"},
+			want: "127.0.0.1:9092",
+		},
+		{
+			name: "env var sets it",
+			env:  map[string]string{"DB_URL": dsn, "GRPC_ADDR": "0.0.0.0:9092"},
+			args: []string{"serve"},
+			want: "0.0.0.0:9092",
+		},
+		{
+			name: "empty disables the listener",
+			env:  map[string]string{"DB_URL": dsn, "GRPC_ADDR": ""},
+			args: []string{"serve"},
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+
+			_, cli := parse(t, tt.args...)
+
+			if got := cli.Serve.GRPCAddr; got != tt.want {
+				t.Errorf("GRPCAddr = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestOCIUpstreamAuthBinding pins the repeated host=user:secret flag -- the same
 // shape moon/bazel and the group-map flag families already use for Kong-bound
 // key=value pairs, repeatable. It ONLY tests that Kong hands the raw strings through

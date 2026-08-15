@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -17,12 +18,31 @@ type CreateOrgRequest struct {
 	Name string `json:"name"`
 }
 
-// UpdateOrgRequest renames an organization. The slug is NOT updatable: it is the
-// first path segment of every cache URL, and a rename would silently break every
-// configured BitBake, Bazel and Docker client pointed at it. Renaming is a
-// delete-and-recreate, which is honest about the cost.
+// UpdateOrgRequest renames an organization and/or patches its M6 seed defaults.
+// The slug is NOT updatable: it is the first path segment of every cache URL,
+// and a rename would silently break every configured BitBake, Bazel and Docker
+// client pointed at it. Renaming is a delete-and-recreate, which is honest
+// about the cost.
 type UpdateOrgRequest struct {
 	Name string `json:"name"`
+
+	// DefaultRetentionWindow / DefaultQuotaBytes are B4: the same three-state
+	// encoding UpdateBackendRequest's own two fields use (absent keeps the
+	// current column, explicit null clears it back to "fall back to the
+	// per-kind default", a value sets an override) -- json.RawMessage rather
+	// than a pointer for the same reason: a pointer can only carry two of the
+	// three states.
+	//
+	// omitempty ON THE WIRE-ENCODING SIDE (never consulted by decodeJSON, which
+	// reads raw bytes off the request body and never re-marshals this struct):
+	// without it, a Go CALLER that builds an UpdateOrgRequest{Name: x} and
+	// leaves these two at their nil zero value would have json.Marshal emit
+	// them as explicit `"default_retention_window":null`, which decodeJSON's
+	// own reader is honor-bound to treat as "clear it" -- turning a plain
+	// rename into a silent default-wipe. internal/cli's RenameOrg is exactly
+	// that caller.
+	DefaultRetentionWindow json.RawMessage `json:"default_retention_window,omitempty"`
+	DefaultQuotaBytes      json.RawMessage `json:"default_quota_bytes,omitempty"`
 }
 
 // handleListOrgs lists the orgs the CALLER can see.
@@ -194,7 +214,8 @@ func (a *API) handleGetOrg(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// handleUpdateOrg renames an org. Org admin or site admin.
+// handleUpdateOrg renames an org and/or patches its M6 seed defaults. Org admin
+// or site admin.
 func (a *API) handleUpdateOrg(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 
@@ -204,6 +225,17 @@ func (a *API) handleUpdateOrg(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	s := scopeFrom(ctx)
+
+	// current is read FIRST so an omitted default_* field can be passed straight
+	// back -- UpdateOrganization (000012 + B4) sets all three columns
+	// unconditionally, the same read-modify-write PATCH shape
+	// handleUpdateBackend uses, and for the same reason: a query-level "leave
+	// alone" has nowhere to encode itself once NULL is already a meaningful
+	// value for both columns.
+	current, err := a.store.GetOrganizationBySlug(ctx, s.OrgSlug)
+	if err != nil {
+		return fmt.Errorf("load organization: %w", err)
+	}
 
 	var req UpdateOrgRequest
 	if err := decodeJSON(r, &req); err != nil {
@@ -215,8 +247,20 @@ func (a *API) handleUpdateOrg(w http.ResponseWriter, r *http.Request) error {
 		return errValidation("name", "name must not be empty")
 	}
 
+	window, setWindow, err := retentionWindowPatch(req.DefaultRetentionWindow, "default_retention_window")
+	if err != nil {
+		return err
+	}
+
+	quota, setQuota, err := quotaBytesPatch(req.DefaultQuotaBytes, "default_quota_bytes")
+	if err != nil {
+		return err
+	}
+
 	org, err := a.store.UpdateOrganization(ctx, repository.UpdateOrganizationParams{
 		ID: s.OrgID, Name: req.Name,
+		DefaultRetentionWindow: pickInterval(setWindow, window, current.DefaultRetentionWindow),
+		DefaultQuotaBytes:      pickInt8(setQuota, quota, current.DefaultQuotaBytes),
 	})
 	if err != nil {
 		return fmt.Errorf("update organization: %w", err)

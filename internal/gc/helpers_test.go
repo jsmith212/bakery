@@ -3,12 +3,14 @@ package gc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -495,4 +497,43 @@ func (f *fixture) usageRow(backendID int64) (objects, bytes int64) {
 	}
 
 	return objects, bytes
+}
+
+// runBackendRow reads back B7's gc_run_backends row (000013) for one
+// (run, backend) pair. ok is false when no such row exists -- the whole point
+// of the table, so tests assert on ok as often as on the counts themselves.
+func (f *fixture) runBackendRow(runID, backendID int64) (objectsDeleted, bytesFreed int64, ok bool) {
+	f.t.Helper()
+
+	err := f.pool.QueryRow(f.t.Context(),
+		`SELECT objects_deleted, bytes_freed FROM gc_run_backends WHERE run_id = $1 AND backend_id = $2`,
+		runID, backendID).Scan(&objectsDeleted, &bytesFreed)
+
+	switch {
+	case err == nil:
+		return objectsDeleted, bytesFreed, true
+	case errors.Is(err, pgx.ErrNoRows):
+		return 0, 0, false
+	default:
+		f.t.Fatalf("read gc_run_backends (run %d, backend %d): %v", runID, backendID, err)
+
+		return 0, 0, false
+	}
+}
+
+// latestGCRunID reads the id of the most recent gc_runs row with the given
+// trigger -- how a test finds the run id MeasureUsage's usage-only pass
+// produced, since MeasureUsage itself returns none.
+func (f *fixture) latestGCRunID(trigger Trigger) int64 {
+	f.t.Helper()
+
+	var id int64
+
+	if err := f.pool.QueryRow(f.t.Context(),
+		`SELECT id FROM gc_runs WHERE trigger = $1 ORDER BY id DESC LIMIT 1`,
+		string(trigger)).Scan(&id); err != nil {
+		f.t.Fatalf("latest gc_runs row for trigger %q: %v", trigger, err)
+	}
+
+	return id
 }

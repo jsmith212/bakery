@@ -1,0 +1,11 @@
+{
+  "tool": "yocto",
+  "host": "bakery.corp",
+  "base_url": "https://bakery.corp/cache/acme/firmware",
+  "local_conf": "SSTATE_MIRRORS ?= \"file://.* https://bakery.corp/cache/acme/firmware/sstate/PATH;downloadfilename=PATH\"\nBB_SIGNATURE_HANDLER = \"OEEquivHash\"\nBB_HASHSERVE = \"wss://bakery.corp/cache/acme/firmware/hashserv\"",
+  "netrc": "machine bakery.corp login «create an API key» password «create an API key»\nmachine wss://bakery.corp/cache/acme/firmware/hashserv login «create an API key» password «create an API key»",
+  "push_commands": [
+    "bakery sstate push acme firmware ./build/sstate-cache"
+  ],
+  "preview": true
+}

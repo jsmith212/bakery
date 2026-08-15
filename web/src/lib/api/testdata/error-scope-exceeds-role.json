@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "scope_exceeds_role",
+    "field": "scope",
+    "message": "a write-scoped key exceeds your role on this project"
+  }
+}

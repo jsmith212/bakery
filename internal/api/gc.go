@@ -339,3 +339,120 @@ func (a *API) handleTriggerGCRun(w http.ResponseWriter, r *http.Request) error {
 
 	return nil
 }
+
+// ---------------------------------------------------------------------------
+// GC org visibility (B7, spec docs/design/specs/2026-08-15-spa-api-wiring.md,
+// product decision 2): per-backend sweep attribution, surfaced to an ORG VIEWER
+// rather than only a site admin -- "swept, nothing eligible" (a gc_run_backends
+// row at 0/0) is distinguishable from "not swept" (no row), which is the whole
+// point of migration 000013 and internal/gc/sweep.go's publishRunBackend. The
+// full /gc operations screen (runs above, the trigger) stays SITE-ADMIN-ONLY;
+// this is deliberately narrower -- an org's own history, nothing instance-wide.
+// ---------------------------------------------------------------------------
+
+// GCActivityBackend is one backend's row within one run, scoped to the CALLER's
+// org (a run can span many orgs; only this org's slice is ever returned).
+type GCActivityBackend struct {
+	ProjectSlug string `json:"project_slug"`
+	// Kind is sstate|downloads|hashserv|bazel|oci.
+	Kind           string `json:"kind"`
+	ObjectsDeleted int64  `json:"objects_deleted"`
+	// BytesFreed is LOGICAL bytes -- see migration 000013's own comment and
+	// sweep.go's Summary.LogicalBytesFreed: full charge to this backend at
+	// delete time, not a physical Layer-B reclaim figure, and undercounted by
+	// design for OCI manifest deletions specifically (stage 8 deletes without
+	// reading size_bytes back).
+	BytesFreed int64 `json:"bytes_freed"`
+}
+
+// GCActivityRun is one run's org-scoped summary: the run's own identity plus
+// every backend row of THIS org's projects it touched.
+type GCActivityRun struct {
+	RunID      int64      `json:"run_id"`
+	StartedAt  time.Time  `json:"started_at"`
+	FinishedAt *time.Time `json:"finished_at"`
+	Status     string     `json:"status"` // running|succeeded|failed
+
+	Backends []GCActivityBackend `json:"backends"`
+}
+
+// GCActivityList is the paginated envelope for GET /orgs/{org}/gc/activity.
+// NextCursor is the oldest run id on this page to pass as ?before= for the
+// next (older) page; nil means this was the last page -- gc_runs' own
+// convention (handleListGCRuns), reused rather than reinvented.
+type GCActivityList struct {
+	Items      []GCActivityRun `json:"items"`
+	NextCursor *int64          `json:"next_cursor"`
+}
+
+// groupGCActivity folds ListOrgGCActivity's flat (run, backend) rows into one
+// entry PER RUN. It relies on the query's own ORDER BY (gr.id DESC, p.slug,
+// cb.kind) to keep runs newest-first and each run's backend rows contiguous and
+// stably ordered, so this is a single linear pass -- no second sort, no map.
+func groupGCActivity(rows []repository.ListOrgGCActivityRow) []GCActivityRun {
+	items := make([]GCActivityRun, 0, len(rows))
+
+	for _, row := range rows {
+		b := GCActivityBackend{
+			ProjectSlug: row.ProjectSlug, Kind: string(row.Kind),
+			ObjectsDeleted: row.ObjectsDeleted, BytesFreed: row.BytesFreed,
+		}
+
+		if n := len(items); n > 0 && items[n-1].RunID == row.RunID {
+			items[n-1].Backends = append(items[n-1].Backends, b)
+
+			continue
+		}
+
+		items = append(items, GCActivityRun{
+			RunID: row.RunID, StartedAt: row.StartedAt.Time, FinishedAt: timePtr(row.FinishedAt),
+			Status: string(row.Status), Backends: []GCActivityBackend{b},
+		})
+	}
+
+	return items
+}
+
+// handleGetOrgGCActivity is B7. OrgView -- an org VIEWER, not an admin: this is
+// read-only history about the caller's own tenant, the same floor as GET
+// /orgs/{org}/projects. limit bounds the number of RUNS returned (not the
+// number of flat backend rows the query joins), clamped by gcRunLimit exactly
+// like GET /gc/runs -- never rejected, per gc.go:155-173's convention.
+func (a *API) handleGetOrgGCActivity(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+	s := scopeFrom(ctx)
+
+	before, err := gcRunCursor(r.URL.Query().Get("before"))
+	if err != nil {
+		return err
+	}
+
+	limit, err := gcRunLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		return err
+	}
+
+	rows, err := a.store.ListOrgGCActivity(ctx, repository.ListOrgGCActivityParams{
+		OrgID: s.OrgID, BeforeID: before, RunLimit: limit,
+	})
+	if err != nil {
+		return fmt.Errorf("list org gc activity: %w", err)
+	}
+
+	items := groupGCActivity(rows)
+
+	// A FULL page of RUNS means there may be more; a short one proves there is
+	// not -- items, not rows, because the clamp bounds the number of distinct
+	// runs, and a single wide run's backend rows must never be mistaken for
+	// "more runs to page through".
+	var next *int64
+
+	if int32(len(items)) == limit && len(items) > 0 {
+		id := items[len(items)-1].RunID
+		next = &id
+	}
+
+	writeJSON(w, http.StatusOK, GCActivityList{Items: items, NextCursor: next})
+
+	return nil
+}

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"google.golang.org/grpc"
@@ -293,6 +294,16 @@ func Boot(ctx context.Context, p BootParams) error {
 		Store: store, Auth: authSvc, Metrics: m, Log: log, GC: gcEngine,
 		AllowSelfServeOrgs:   cmd.AllowSelfServeOrgs,
 		AllowLocalSiteAdmins: cmd.AllowLocalSiteAdmins,
+		Instance:             instanceInfo(cmd, p.Version),
+
+		// B1: the config-snippet generator's origin inputs. ExternalURL is the SAME
+		// flag the OCI Bearer realm reads (boot's oci wiring below) -- one public
+		// origin, stated once. GRPCAddr is threaded so the generator can take the
+		// REAPI PORT from the listener it is actually bound to instead of guessing
+		// the HTTP one.
+		ExternalURL:          cmd.ExternalURL,
+		GRPCExternalEndpoint: cmd.GRPCExternalEndpoint,
+		GRPCAddr:             cmd.GRPCAddr,
 	})
 	if err != nil {
 		return fmt.Errorf("build api: %w", err)
@@ -708,17 +719,54 @@ func buildAuth(
 	}
 
 	svc, err := auth.New(auth.Deps{
-		Store:    store,
-		Sessions: sessions,
-		Provider: provider,
-		Groups:   groups,
-		Metrics:  m,
-		Log:      log,
-		DevLogin: cmd.DevLoginEnabled,
+		Store:              store,
+		Sessions:           sessions,
+		Provider:           provider,
+		Groups:             groups,
+		Metrics:            m,
+		Log:                log,
+		DevLogin:           cmd.DevLoginEnabled,
+		AllowSelfServeOrgs: cmd.AllowSelfServeOrgs,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("build auth service: %w", err)
 	}
 
 	return svc, sessionStore, nil
+}
+
+// instanceInfo builds B6's GET /instance body ONCE, at boot, from the same cmd
+// (config.ServeCmd) and version every other Config field in this file reads
+// from. It is never recomputed per request -- see api/instance.go's package
+// doc for why a static echo is the whole point.
+//
+// storage_driver is a constant, not read off anything: S3 is deferred
+// (CLAUDE.md, "local disk only"), so metrics.DriverLocal is the only value
+// that has ever existed, and it is the SAME constant the "storage ready" log
+// line above uses -- one source, not two strings that could drift.
+func instanceInfo(cmd config.ServeCmd, version string) api.InstanceInfo {
+	return api.InstanceInfo{
+		Version:       version,
+		StorageDriver: metrics.DriverLocal,
+		PublicAddr:    net.JoinHostPort(cmd.Host, strconv.Itoa(cmd.Port)),
+		MetricsAddr:   cmd.MetricsAddr,
+		GRPCAddr:      cmd.GRPCAddr,
+		ExternalURL:   cmd.ExternalURL,
+		// B1: reported because it is the operator's confirmation that the value the
+		// snippet generator uses verbatim is the one they think they set. An empty
+		// grpc_external_endpoint with a non-empty grpc_addr is the DERIVING case,
+		// which is a guess about their ingress.
+		GRPCExternalEndpoint: cmd.GRPCExternalEndpoint,
+		OIDCIssuer:           cmd.OIDCIssuer,
+		DevLoginEnabled:      cmd.DevLoginEnabled,
+
+		AllowSelfServeOrgs:   cmd.AllowSelfServeOrgs,
+		AllowLocalSiteAdmins: cmd.AllowLocalSiteAdmins,
+		AllowMultiInstance:   cmd.AllowMultiInstance,
+
+		GCEnabled:       cmd.GC.GCEnabled,
+		GCInterval:      cmd.GC.GCInterval.String(),
+		GCUsageInterval: cmd.GC.GCUsageInterval.String(),
+		GCGracePeriod:   cmd.GC.GCGracePeriod.String(),
+	}
 }
