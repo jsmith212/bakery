@@ -11,6 +11,7 @@ import (
 
 	"github.com/jsmith212/bakery/internal/auth"
 	"github.com/jsmith212/bakery/internal/db/repository"
+	"github.com/jsmith212/bakery/internal/gc"
 )
 
 // Shared fakes. Per-endpoint fakes live in the test file that uses them (kbi's
@@ -661,10 +662,32 @@ func (s *fakeStore) CreateBackend(
 	b := repository.CacheBackend{
 		ID: int64(len(s.backends) + 1), ProjectID: arg.ProjectID, Kind: arg.Kind,
 		Enabled: arg.Enabled, ReadAuthRequired: arg.ReadAuthRequired, Config: arg.Config,
+		RetentionWindow: seededRetention(arg.Kind),
 	}
 	s.backends = append(s.backends, b)
 
 	return b, nil
+}
+
+// seededRetention mirrors CreateBackend's own per-kind seeding (query/backends.sql,
+// spec §4): the opinionated defaults are computed IN SQL, so a fake that returned a
+// NULL window would let a handler bug -- clobbering the seed on the very next PATCH
+// -- pass unnoticed. Org-level overrides are not modelled; no handler reads them.
+func seededRetention(kind repository.BackendKind) pgtype.Interval {
+	days := map[repository.BackendKind]int32{
+		repository.BackendKindSstate:   90,
+		repository.BackendKindHashserv: 90,
+		repository.BackendKindBazel:    30,
+		repository.BackendKindOci:      30,
+	}
+
+	d, ok := days[kind]
+	if !ok {
+		// downloads is an ARCHIVE: NULL, and it stays NULL (spec §1.2).
+		return pgtype.Interval{}
+	}
+
+	return pgtype.Interval{Days: d, Microseconds: 0, Months: 0, Valid: true}
 }
 
 func (s *fakeStore) UpdateBackend(
@@ -677,6 +700,12 @@ func (s *fakeStore) UpdateBackend(
 			s.backends[i].Enabled = arg.Enabled
 			s.backends[i].ReadAuthRequired = arg.ReadAuthRequired
 			s.backends[i].Config = arg.Config
+
+			// UNCONDITIONAL, exactly as the query is (000012's UpdateBackend is a plain
+			// nullable UPDATE): a handler that omits these two must CLEAR them here, so a
+			// test can catch the PATCH that silently turned a backend's retention off.
+			s.backends[i].RetentionWindow = arg.RetentionWindow
+			s.backends[i].QuotaBytes = arg.QuotaBytes
 
 			return s.backends[i], nil
 		}
@@ -716,6 +745,12 @@ func (s *fakeStore) ListGCRuns(
 
 	for _, run := range s.gcRuns {
 		if arg.Status.Valid && run.Status != arg.Status.GcRunStatus {
+			continue
+		}
+
+		// The real query's `(include_usage OR trigger <> 'usage')` (R7#12): the
+		// six-hourly measurement rows are hidden unless the caller opts in.
+		if !arg.IncludeUsage && run.Trigger == string(gc.TriggerUsage) {
 			continue
 		}
 

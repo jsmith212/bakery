@@ -32,6 +32,7 @@ func TestGCUnlabeledSeriesRegisteredAtBoot(t *testing.T) {
 		"bakery_gc_pending_delete_backlog",
 		"bakery_storage_physical_bytes",
 		"bakery_gc_touch_flush_rows_total",
+		"bakery_gc_touch_aux_dropped_total",
 	} {
 		if got := seriesFor(t, m, name); len(got) == 0 {
 			t.Errorf("%s has no series at boot -- it must be collectible before any sweep runs", name)
@@ -58,6 +59,7 @@ func TestGCRecorderWritesEverySeries(t *testing.T) {
 	rec.Usage("acme", "widget", BackendSstate, 10, 2048, 4096, finishedAt)
 	rec.PhysicalBytes(8192)
 	rec.TouchFlushRows(6)
+	rec.TouchAuxDropped(4)
 
 	tenant := map[string]string{"org": "acme", "project": "widget", "backend": "sstate"}
 
@@ -76,6 +78,7 @@ func TestGCRecorderWritesEverySeries(t *testing.T) {
 		{"bakery_gc_blobs_deleted_total", nil, 2},
 		{"bakery_gc_bytes_reclaimed_total", nil, 4096},
 		{"bakery_gc_touch_flush_rows_total", nil, 6},
+		{"bakery_gc_touch_aux_dropped_total", nil, 4},
 	}
 
 	for _, c := range counters {

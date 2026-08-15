@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"testing"
 	"time"
@@ -150,3 +151,94 @@ func TestBootWithoutTheLockLeavesRunningRunsAlone(t *testing.T) {
 			"that is, and marking it failed is a lie plus a second concurrent sweep", got)
 	}
 }
+
+// A LOST BOOT LOCK STOPS THE SERVER (M: R7#2).
+//
+// BootLock's own contract says so in as many words: "The server MUST select on this
+// and shut down: continuing to serve past it is the two-writers state the lock
+// exists to forbid." Nothing consumed Lost() before, so a process that lost its
+// lock to a second instance kept serving with a stale route cache, a stale object
+// LRU and a GC that believes its pending-read set is complete -- with one ERROR
+// line from the watcher as the only sign.
+//
+// The seam is unit-tested rather than driven through a real Boot: reproducing a
+// genuine loss needs the pinned session killed AND another process holding the lock
+// before the watcher's next tick, which is a slow, racy way to assert a select
+// statement. internal/db's own bootlock tests cover the DETECTION; this covers what
+// the server does with it.
+func TestWatchBootLockCancelsTheServerOnLoss(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a loss cancels the lifetime context", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		lost := make(chan struct{})
+
+		go watchBootLock(t.Context(), lost, cancel, testLogger())
+
+		select {
+		case <-ctx.Done():
+			t.Fatal("the server context was cancelled before the lock was lost")
+		default:
+		}
+
+		close(lost)
+
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Second):
+			t.Fatal("the server kept serving after losing the boot lock: it is no longer the " +
+				"sole writer and every process-local cache it owns is now stale")
+		}
+	})
+
+	t.Run("an ordinary shutdown does not leak the watcher", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+
+		go func() {
+			defer close(done)
+
+			watchBootLock(ctx, make(chan struct{}), func() {
+				t.Error("watchBootLock cancelled the server on a clean shutdown")
+			}, testLogger())
+		}()
+
+		cancel()
+
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("watchBootLock outlived its context")
+		}
+	})
+
+	t.Run("a nil channel is the --allow-multi-instance boot", func(t *testing.T) {
+		t.Parallel()
+
+		done := make(chan struct{})
+
+		go func() {
+			defer close(done)
+
+			watchBootLock(t.Context(), nil, func() {
+				t.Error("watchBootLock cancelled the server for a boot that holds no lock")
+			}, testLogger())
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("watchBootLock blocked forever on a nil Lost() channel")
+		}
+	})
+}
+
+// testLogger discards: these tests assert behaviour, not log output, and a real
+// handler would interleave a loud ERROR line into every run.
+func testLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }

@@ -2,6 +2,7 @@ package gc
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"log/slog"
 	"sync/atomic"
@@ -34,6 +35,7 @@ type fixture struct {
 	blobs *blob.Service
 	mx    *metrics.Metrics
 	eng   *Engine
+	touch *stubUnihashFlusher
 
 	orgSlug     string
 	projectSlug string
@@ -73,8 +75,18 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 		t.Fatalf("blob.New() error = %v", err)
 	}
 
-	eng, err := New(Deps{
+	// The unihash flusher is a stub over the REAL TouchUnihashesAccessed statement
+	// rather than a live *hashserv.Backend: reaching hashserv's own toucher requires
+	// a WebSocket session and its RPC layer, and what this package's tests are the
+	// subject of is the ENGINE -- that it forces a flush BEFORE stage 1 rather than
+	// after it, or not at all. hashserv's own suite proves FlushNow writes inside the
+	// staleness window (TestBackendFlushNowForcesWriteInsideStalenessWindow); this
+	// stub issues exactly the statement that flush ends in.
+	touch := &stubUnihashFlusher{store: store, marks: nil}
+
+	eng, err := New(t.Context(), Deps{
 		DB: store, Blobs: blobs, Metrics: mx, Log: slog.New(slog.DiscardHandler),
+		Access: blobs, Unihash: touch,
 	}, cfg)
 	if err != nil {
 		t.Fatalf("gc.New() error = %v", err)
@@ -95,9 +107,41 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 	}
 
 	return &fixture{
-		t: t, pool: pool, store: store, blobs: blobs, mx: mx, eng: eng,
+		t: t, pool: pool, store: store, blobs: blobs, mx: mx, eng: eng, touch: touch,
 		orgSlug: slug, projectSlug: "widget", projectID: project.ID,
 	}
+}
+
+// stubUnihashFlusher stands in for *hashserv.Backend's unihash toucher: mark()
+// records a (backend, method, taskhash) the way a get-stream hit does, and
+// FlushNow issues the one UPDATE the real flusher issues.
+type stubUnihashFlusher struct {
+	store *db.Store
+	marks []repository.TouchUnihashesAccessedParams
+}
+
+func (s *stubUnihashFlusher) mark(backendID int64, method, taskhash string) {
+	s.marks = append(s.marks, repository.TouchUnihashesAccessedParams{
+		BackendID: backendID, Methods: []string{method}, Taskhashes: []string{taskhash},
+		Staleness: pgtype.Interval{Microseconds: 0, Days: 0, Months: 0, Valid: true},
+	})
+}
+
+func (s *stubUnihashFlusher) FlushNow(ctx context.Context) (int64, error) {
+	var rows int64
+
+	for _, m := range s.marks {
+		n, err := s.store.TouchUnihashesAccessed(ctx, m)
+		if err != nil {
+			return rows, err
+		}
+
+		rows += n
+	}
+
+	s.marks = nil
+
+	return rows, nil
 }
 
 // backendOpts is what a test wants a cache_backends row to say. A zero window means
@@ -330,6 +374,38 @@ func (f *fixture) unihash(backendID int64, taskhash, unihash string, created tim
 	}
 }
 
+// unihashExists reports whether one hashserv row survived the sweep.
+func (f *fixture) unihashExists(backendID int64, taskhash string) bool {
+	f.t.Helper()
+
+	var n int64
+
+	if err := f.pool.QueryRow(f.t.Context(),
+		`SELECT count(*) FROM hashserv_unihashes WHERE backend_id = $1 AND taskhash = $2`,
+		backendID, taskhash).Scan(&n); err != nil {
+		f.t.Fatalf("unihashExists(%q): %v", taskhash, err)
+	}
+
+	return n > 0
+}
+
+// unihashAccessedAt reads one hashserv row's accessed_at. An invalid (NULL) value
+// is what a mark that is still only in this process's memory looks like from the
+// sweep's side.
+func (f *fixture) unihashAccessedAt(backendID int64, taskhash string) pgtype.Timestamptz {
+	f.t.Helper()
+
+	var at pgtype.Timestamptz
+
+	if err := f.pool.QueryRow(f.t.Context(),
+		`SELECT accessed_at FROM hashserv_unihashes WHERE backend_id = $1 AND taskhash = $2`,
+		backendID, taskhash).Scan(&at); err != nil {
+		f.t.Fatalf("unihashAccessedAt(%q): %v", taskhash, err)
+	}
+
+	return at
+}
+
 // run executes one real sweep and fails the test if it did not reach a terminal
 // success.
 func (f *fixture) run() Summary {
@@ -369,6 +445,44 @@ func (f *fixture) runRow(id int64) (status, errMsg string) {
 func ago(days int) time.Time { return time.Now().Add(-time.Duration(days) * 24 * time.Hour) }
 
 func day(n int) time.Duration { return time.Duration(n) * 24 * time.Hour }
+
+// storageObjects reads bakery_storage_objects for one backend off the real
+// registry, or -1 when the series is absent. Absence is the assertion in P: R6#8 --
+// a backend that vanishes from the gauges is exactly the failure -- so it has to be
+// distinguishable from a genuine zero.
+func (f *fixture) storageObjects(backend metrics.Backend) float64 {
+	f.t.Helper()
+
+	families, err := f.mx.Registry().Gather()
+	if err != nil {
+		f.t.Fatalf("gather metrics: %v", err)
+	}
+
+	for _, fam := range families {
+		if fam.GetName() != "bakery_storage_objects" {
+			continue
+		}
+
+		for _, metric := range fam.GetMetric() {
+			match := 0
+
+			for _, label := range metric.GetLabel() {
+				switch {
+				case label.GetName() == "org" && label.GetValue() == f.orgSlug,
+					label.GetName() == "project" && label.GetValue() == f.projectSlug,
+					label.GetName() == "backend" && label.GetValue() == string(backend):
+					match++
+				}
+			}
+
+			if match == 3 {
+				return metric.GetGauge().GetValue()
+			}
+		}
+	}
+
+	return -1
+}
 
 // usageRow reads a backend's recorded measurement.
 func (f *fixture) usageRow(backendID int64) (objects, bytes int64) {

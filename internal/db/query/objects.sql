@@ -52,6 +52,50 @@ SELECT key, digest, size_bytes, updated_at, content_type
 -- name: LockBlobDigest :exec
 SELECT pg_advisory_xact_lock(bakery_blob_lock_key($1));
 
+-- LockBlobDigests (plural): the ABBA pre-lock for blob.Service.DeleteBatch
+-- (spec §9.2, R7#11), called ONCE inside the SAME transaction, BEFORE
+-- DeleteObjectsByKeys (query/gc.sql).
+--
+-- Mirrors cache_objects_refcount()'s own pre-lock EXACTLY (000006_blobs_and_
+-- objects.up.sql: "Take BOTH row locks in a deterministic (digest) order FIRST
+-- ... two transactions swapping the same pair of digests in opposite directions
+-- deadlock -- an ABBA that surfaces only under concurrent ccache writes"). That
+-- trigger fires on the /ac/ overwrite branch of a cache_objects UPDATE and takes
+-- its two blobs row locks via `ORDER BY digest ... FOR NO KEY UPDATE`.
+-- DeleteObjectsByKeys's own DELETE ALSO sorts its driving set `ORDER BY d.digest`
+-- inside its USING subquery, and the two together read as "already ABBA-safe" --
+-- but an ORDER BY inside a USING/FROM subquery is a PLANNER HINT about output
+-- ROW ORDER, not a guarantee about the order Postgres acquires the underlying
+-- blobs row locks the DELETE's cascading UPDATE (fired by the very same
+-- refcount trigger, on ITS OWN DELETE branch) takes while executing. Nothing in
+-- the SQL standard or Postgres's own executor promises those two orders coincide
+-- for a set-returning DELETE. A SEPARATE, explicit, deterministic pre-lock
+-- removes the ordering from the planner's hands entirely: every writer that
+-- might lock two blobs rows together -- this batch delete (via
+-- LockBlobDigests, called first) and the trigger's /ac/ overwrite branch (via
+-- its own identically-ordered PERFORM) -- now acquires blobs row locks in the
+-- SAME global digest order, so the cycle an ABBA deadlock needs cannot form.
+--
+-- FOR NO KEY UPDATE, matching the trigger's own lock mode exactly: neither ever
+-- changes a blobs row's KEY (digest, the primary key), only refcount /
+-- unreferenced_since / updated_at, so FOR UPDATE would be a strictly stronger
+-- lock than either writer needs and would needlessly serialise unrelated
+-- readers (e.g. GetBlobForWrite's own FOR UPDATE on an unrelated digest sharing
+-- no row with this batch) for no correctness benefit.
+--
+-- SELECT 1, not SELECT digest, and :exec, not :many -- same shape as
+-- LockBlobDigest above: this query's only job is the SIDE EFFECT of the lock
+-- acquisition (mirrors the trigger's own `PERFORM 1 FROM blobs ...`), and the
+-- caller already knows which digests it asked to lock and has no use for them
+-- scanned back, regardless of how many (zero or more) rows actually matched.
+--
+-- name: LockBlobDigests :exec
+SELECT 1
+  FROM blobs
+ WHERE digest = ANY(sqlc.arg(digests)::bytea[])
+ ORDER BY digest
+   FOR NO KEY UPDATE;
+
 -- Step 2 of the PUT. Absent, or state = 'pending_delete', means the bytes may
 -- already be gone: MUST upload. state = 'live' means the bytes are durably in
 -- storage.Store (that is what 'live' MEANS) and the write can be elided.

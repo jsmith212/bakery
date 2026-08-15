@@ -67,6 +67,23 @@ type lruShard struct {
 	// it the negative cache permanently 404s an object that exists, and the /ac/
 	// stale-positive pins a digest the GC then reaps into ErrDanglingMetadata.
 	gen uint64
+
+	// marked is how many of this shard's entries currently carry a non-zero
+	// markedAt. It exists so collectMarks is O(marks) instead of O(capacity):
+	// without it the flusher walks EVERY entry of EVERY shard once a minute with
+	// the shard mutex held -- measured at 725us-1.6ms per shard on a full
+	// 500k-entry cache, i.e. tens of milliseconds of lock time per tick spread
+	// across the 64 shards the HEAD storm is trying to use. With it, a shard that
+	// holds no marks is skipped after one integer read, and a shard that holds a
+	// few stops walking as soon as it has seen them all.
+	//
+	// IT IS MAINTAINED BY EVERY PATH THAT CREATES OR DESTROYS A MARK, and it must
+	// be: an undercount silently skips real marks (a lost touch, then a wrongly
+	// swept row), an overcount only costs a full walk. The paths are get and
+	// insertLocked (stamp), clearMarks (flush), and every removal -- the
+	// insertLocked eviction, del and delBatch -- because an entry that leaves the
+	// shard takes its mark with it.
+	marked int
 }
 
 type lruEntry struct {
@@ -162,12 +179,17 @@ func (c *lruCache) get(key []byte) (Meta, bool) {
 	// once per key per flush period, one clock read. See lruEntry.markedAt for why the
 	// stamp is conditional rather than unconditional.
 	//
-	// A negative entry is marked too and it costs nothing to let it: the flusher's
-	// UPDATE is keyed on rows that exist, so a mark for an absent key matches nothing.
-	// Branching on meta.Exists here would put a second load on the hot path to save a
-	// row in an array on a path that is already batched.
-	if e.markedAt == 0 {
+	// ONLY A POSITIVE ENTRY IS MARKED. A negative entry names NO ROW: there is nothing
+	// for TouchObjectsAccessed to update, so flushing it costs an array slot, a
+	// statement's worth of parameter space and a scan of the (backend, namespace, key)
+	// index for a guaranteed zero-row result -- and on the first build against an empty
+	// cache EVERY entry is negative, so that is the whole flush. The guard is FREE
+	// rather than "a second load on the hot path" (what this comment used to claim):
+	// e.meta was already loaded into meta on the line above for the return value, so
+	// meta.Exists is a register test, not a memory access.
+	if meta.Exists && e.markedAt == 0 {
 		e.markedAt = c.nowNano()
+		s.marked++
 	}
 
 	s.mu.Unlock()
@@ -203,8 +225,9 @@ func (s *lruShard) insertLocked(key []byte, meta Meta, markedAt int64) (added, e
 		if e, ok := el.Value.(*lruEntry); ok {
 			e.meta = meta
 
-			if e.markedAt == 0 {
+			if e.markedAt == 0 && markedAt != 0 {
 				e.markedAt = markedAt
+				s.marked++
 			}
 		}
 
@@ -216,12 +239,25 @@ func (s *lruShard) insertLocked(key []byte, meta Meta, markedAt int64) (added, e
 	k := string(key)
 	s.m[k] = s.ll.PushFront(&lruEntry{key: k, meta: meta, markedAt: markedAt})
 
+	if markedAt != 0 {
+		s.marked++
+	}
+
 	if s.ll.Len() > s.cap {
 		if el := s.ll.Back(); el != nil {
 			s.ll.Remove(el)
 
 			if e, ok := el.Value.(*lruEntry); ok {
 				delete(s.m, e.key)
+
+				// An evicted entry takes its pending mark with it -- that is the
+				// bounded-staleness trade spec 6.1 accepts (a mark lost to eviction costs
+				// a touch, never a wrong delete). The COUNTER must follow it out, or the
+				// shard claims marks that no longer exist and collectMarks walks the whole
+				// list looking for them.
+				if e.markedAt != 0 {
+					s.marked--
+				}
 
 				return true, true
 			}
@@ -322,6 +358,10 @@ func (c *lruCache) del(key []byte) {
 		return
 	}
 
+	if e, ok := el.Value.(*lruEntry); ok && e.markedAt != 0 {
+		s.marked--
+	}
+
 	s.ll.Remove(el)
 	delete(s.m, string(key))
 	s.mu.Unlock()
@@ -350,22 +390,52 @@ type touchMark struct {
 // sweep probing in that window would delete a row whose accessed_at write is still in
 // flight. So the mark stays visible until the write has committed, and clearMarks runs
 // after it.
+//
+// WHAT IT COSTS IS THE POINT. This runs every --gc-touch-interval (1m) against a cache
+// the HEAD storm is hammering, so the work under each shard mutex is bounded three
+// ways: a shard with no marks is skipped on an integer compare; the walk stops as soon
+// as it has seen lruShard.marked marked entries rather than reaching the tail; and the
+// results land in a per-shard slice sized from that same counter, appended to dst only
+// AFTER the mutex is released -- growing the shared dst slice (a copy of everything
+// collected so far, once per doubling) is not work to do while holding a lock that a
+// bitbake HEAD is queued behind.
 func (c *lruCache) collectMarks(cutoff int64, dst []touchMark) []touchMark {
 	for i := range c.shards {
 		s := &c.shards[i]
 
 		s.mu.Lock()
 
-		for el := s.ll.Front(); el != nil; el = el.Next() {
+		if s.marked == 0 {
+			s.mu.Unlock()
+
+			continue
+		}
+
+		local := make([]touchMark, 0, s.marked)
+
+		// found counts marked entries SEEN, including ones too young to flush --
+		// otherwise a shard whose marks are all inside the staleness window would walk
+		// to the tail every tick, which is exactly the cost this is removing.
+		found := 0
+
+		for el := s.ll.Front(); el != nil && found < s.marked; el = el.Next() {
 			e, ok := el.Value.(*lruEntry)
-			if !ok || e.markedAt == 0 || e.markedAt > cutoff {
+			if !ok || e.markedAt == 0 {
 				continue
 			}
 
-			dst = append(dst, touchMark{ck: e.key, markedAt: e.markedAt})
+			found++
+
+			if e.markedAt > cutoff {
+				continue
+			}
+
+			local = append(local, touchMark{ck: e.key, markedAt: e.markedAt})
 		}
 
 		s.mu.Unlock()
+
+		dst = append(dst, local...)
 	}
 
 	return dst
@@ -399,6 +469,7 @@ func (c *lruCache) clearMarks(marks []touchMark) {
 
 			if e, ok := el.Value.(*lruEntry); ok && e.markedAt == m.markedAt {
 				e.markedAt = 0
+				s.marked--
 			}
 		}
 
@@ -409,13 +480,20 @@ func (c *lruCache) clearMarks(marks []touchMark) {
 // pendingMark answers "does this key hold an unflushed read?" -- the LRU half of the
 // GC's veto (spec 6.2). See Service.PendingTouch for why an in-memory answer is
 // sufficient.
-func (c *lruCache) pendingMark(ck string) bool {
-	s := &c.shards[c.shardIndex(ck)]
+//
+// IT TAKES []byte, not string, for the same reason get does: `s.m[string(ck)]` is the
+// compiler's no-copy map lookup, so the caller can compose the cache key into a stack
+// buffer and this probe allocates nothing. The sweep calls it once per candidate ROW
+// -- a 1000-row chunk, chunk after chunk, for every backend -- so a string conversion
+// here is one heap allocation per doomed object, which is precisely the shape of
+// garbage the veto has no reason to make.
+func (c *lruCache) pendingMark(ck []byte) bool {
+	s := c.shard(ck)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	el, ok := s.m[ck]
+	el, ok := s.m[string(ck)]
 	if !ok {
 		return false
 	}
@@ -470,6 +548,10 @@ func (c *lruCache) delBatch(keys []string) {
 			el, ok := s.m[k]
 			if !ok {
 				continue
+			}
+
+			if e, ok := el.Value.(*lruEntry); ok && e.markedAt != 0 {
+				s.marked--
 			}
 
 			s.ll.Remove(el)

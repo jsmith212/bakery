@@ -21,8 +21,12 @@ func fakeEngine(t *testing.T, cfg Config) (*Engine, *fakeQueries, *fakeBlobs) {
 
 	q, b := newFakeQueries(), newFakeBlobs()
 
-	eng, err := New(Deps{
+	// No flushers: these tests are about the engine's own scheduling and refusals,
+	// and gc.New tolerates a missing toucher (a fake harness has nothing to flush).
+	// The pre-sweep flush itself is proven against a real database in sweep_test.go.
+	eng, err := New(t.Context(), Deps{
 		DB: q, Blobs: b, Metrics: metrics.New(), Log: slog.New(slog.DiscardHandler),
+		Access: nil, Unihash: nil,
 	}, cfg)
 	if err != nil {
 		t.Fatalf("gc.New() error = %v", err)
@@ -367,29 +371,272 @@ func waitForCondition(t *testing.T, cond func() bool) {
 	t.Fatal("condition was never met")
 }
 
-// The toucher's T RAMPS (spec §6.4), and it ramps on the state the spec's "7 days
-// after migration" was standing in for: how much of the corpus has never been
-// touched. 000012's fillfactor change is catalog-only, so the first touch of every
-// pre-existing row is a non-HOT update -- opening at 24h spreads that one-time spike.
-func TestTouchStalenessRamps(t *testing.T) {
+// The toucher's T RAMPS OFF A REAL CLOCK (spec §6.4, J: R6#7/R7#6/R8#5).
+//
+// 000012 stamps gc_state.touch_ramp_until at now() + 7 days, and that timestamp --
+// not a fraction of untouched rows recomputed per backend, which was
+// last-backend-wins and never converged on a cold corpus -- is what decides whether
+// T is the widened 24h or the configured steady value.
+func TestTouchStalenessRampsOffGCState(t *testing.T) {
 	t.Parallel()
 
-	eng, _, _ := fakeEngine(t, testConfig())
-
-	if got := eng.TouchStaleness(); got != touchStalenessRamped {
-		t.Errorf("TouchStaleness() at boot = %v, want %v: nothing has been measured yet and every "+
-			"row in the database is untouched", got, touchStalenessRamped)
+	tests := []struct {
+		name  string
+		until time.Time
+		err   error
+		want  time.Duration
+	}{
+		{
+			name:  "before the ramp expires",
+			until: time.Now().Add(48 * time.Hour),
+			err:   nil,
+			want:  touchStalenessRamped,
+		},
+		{
+			name:  "after the ramp expires",
+			until: time.Now().Add(-time.Minute),
+			err:   nil,
+			want:  time.Hour,
+		},
+		{
+			// A read failure keeps the CONSERVATIVE end: fewer accessed_at writes than
+			// asked for costs write amplification; the other way round concentrates the
+			// one-time non-HOT first touch of every pre-existing row into one hour.
+			name:  "an unreadable clock stays ramped",
+			until: time.Now().Add(-time.Minute),
+			err:   errors.New("gc_state is on fire"),
+			want:  touchStalenessRamped,
+		},
 	}
 
-	eng.noteTouchRamp(&usage{objects: 100, bytes: 0, nullAccessed: 90, stages: nil})
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	if got := eng.TouchStaleness(); got != touchStalenessRamped {
-		t.Errorf("TouchStaleness() at 90%% untouched = %v, want %v", got, touchStalenessRamped)
+			eng, q, _ := fakeEngine(t, testConfig())
+
+			if got := eng.TouchStaleness(); got != touchStalenessRamped {
+				t.Errorf("TouchStaleness() before LoadTouchRamp = %v, want the ramped %v: an "+
+					"unread clock must not tighten T", got, touchStalenessRamped)
+			}
+
+			q.mu.Lock()
+			q.rampUntil, q.rampErr = tc.until, tc.err
+			q.mu.Unlock()
+
+			err := eng.LoadTouchRamp(t.Context())
+			if (err != nil) != (tc.err != nil) {
+				t.Fatalf("LoadTouchRamp() error = %v, want error presence %v", err, tc.err != nil)
+			}
+
+			if got := eng.TouchStaleness(); got != tc.want {
+				t.Errorf("TouchStaleness() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TriggerAsync IS GATED THE SAME WAY THE LOOP IS (R7#1), and it has to be: the API
+// reaches the engine without going through Loop at all, so a refusal that lives
+// only in Loop lets an operator start by hand precisely the sweep the loop declines
+// to schedule -- process-local LRU invalidation against another instance's cache, a
+// boot reaper that fails a live run, a pending-read veto blind to the other
+// instance's reads.
+func TestTriggerAsyncRefusesDisabledAndMultiInstance(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		cfg  func(Config) Config
+		want error
+	}{
+		{
+			name: "multi-instance",
+			cfg:  func(c Config) Config { c.AllowMultiInstance = true; return c },
+			want: ErrMultiInstance,
+		},
+		{
+			name: "disabled",
+			cfg:  func(c Config) Config { c.Enabled = false; return c },
+			want: ErrDisabled,
+		},
 	}
 
-	eng.noteTouchRamp(&usage{objects: 100, bytes: 0, nullAccessed: 10, stages: nil})
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	if got := eng.TouchStaleness(); got != time.Hour {
-		t.Errorf("TouchStaleness() at 10%% untouched = %v, want the configured steady 1h", got)
+			eng, q, _ := fakeEngine(t, tc.cfg(testConfig()))
+			seedFakeBackend(q, repository.BackendKindDownloads, nsDefault, 5)
+
+			if _, err := eng.TriggerAsync(t.Context(), TriggerAPI, false); !errors.Is(err, tc.want) {
+				t.Errorf("TriggerAsync() error = %v, want %v", err, tc.want)
+			}
+
+			// A DRY run is refused too: the refusal is about this deployment's
+			// configuration, and a dry run still writes a gc_runs row and still reports
+			// what a sweep nobody may run would have done.
+			if _, err := eng.TriggerAsync(t.Context(), TriggerAPI, true); !errors.Is(err, tc.want) {
+				t.Errorf("dry TriggerAsync() error = %v, want %v", err, tc.want)
+			}
+
+			if got := q.count("StartGCRun"); got != 0 {
+				t.Errorf("%d runs were started by a refused trigger, want 0", got)
+			}
+		})
+	}
+}
+
+// THE FIRST SWEEP DOES NOT WAIT A WHOLE INTERVAL (R7#7). At the shipped six-hour
+// interval, a deployment that restarts more often than that would otherwise never
+// sweep at all -- and nothing says so, because a loop that has not run yet emits
+// exactly what a healthy idle one does.
+func TestLoopSweepsOnceAtStartup(t *testing.T) {
+	t.Parallel()
+
+	cfg := testConfig()
+	cfg.Interval = 2 * time.Second
+
+	eng, q, _ := fakeEngine(t, cfg)
+	seedFakeBackend(q, repository.BackendKindDownloads, nsDefault, 1)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+
+	started := time.Now()
+
+	go eng.Loop(ctx)
+
+	waitForCondition(t, func() bool { return q.count("StartGCRun") > 0 })
+
+	// The ticker's first tick is one full interval out, so a first run that lands
+	// before then can only have come from the startup timer.
+	if elapsed := time.Since(started); elapsed >= cfg.Interval {
+		t.Errorf("the first sweep started after %v, want less than the %v interval -- the "+
+			"startup timer is not firing", elapsed, cfg.Interval)
+	}
+}
+
+// The startup delay is jittered so a fleet restarted together does not start every
+// instance's first sweep in the same second, and capped by the interval so a short
+// interval does not spend half of itself waiting.
+func TestFirstSweepDelayIsBoundedAndJittered(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		interval time.Duration
+	}{
+		{name: "production interval", interval: 6 * time.Hour},
+		{name: "interval shorter than the cap", interval: time.Second},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := testConfig()
+			cfg.Interval = tc.interval
+
+			eng, _, _ := fakeEngine(t, cfg)
+
+			bound := min(sweepStartupDelay, tc.interval)
+			seen := map[time.Duration]struct{}{}
+
+			for range 50 {
+				d := eng.firstSweepDelay()
+
+				if d < bound/10 || d > bound/2 {
+					t.Fatalf("firstSweepDelay() = %v, want within [%v, %v]", d, bound/10, bound/2)
+				}
+
+				seen[d] = struct{}{}
+			}
+
+			if len(seen) < 2 {
+				t.Error("firstSweepDelay() never varied over 50 calls: a fleet restarted together " +
+					"would start every instance's first sweep in the same second")
+			}
+		})
+	}
+}
+
+// AN API-TRIGGERED SWEEP IS THE SERVER'S TO CANCEL AND THE SERVER'S TO WAIT FOR
+// (R7#8).
+//
+// It cannot run under the REQUEST's context (that dies with the response, often
+// before the first chunk) and it must not run under context.WithoutCancel of it
+// either: that produced a sweep nothing could cancel and nothing waited for, still
+// deleting rows through a pool that was closing, and leaving its gc_runs row
+// 'running' for the next boot's reaper to clean up. The lifetime context gives
+// both halves -- deaf to the client hanging up, cancelled by shutdown -- and
+// AsyncDone is what lets Boot wait for the terminal FinishGCRun.
+func TestTriggerAsyncRunsUnderTheLifetimeContext(t *testing.T) {
+	t.Parallel()
+
+	q, b := newFakeQueries(), newFakeBlobs()
+	seedFakeBackend(q, repository.BackendKindDownloads, nsDefault, 500)
+
+	lifetime, shutdown := context.WithCancel(t.Context())
+	defer shutdown()
+
+	eng, err := New(lifetime, Deps{
+		DB: q, Blobs: b, Metrics: metrics.New(), Log: slog.New(slog.DiscardHandler),
+		Access: nil, Unihash: nil,
+	}, func() Config { c := testConfig(); c.BatchSize = 50; return c }())
+	if err != nil {
+		t.Fatalf("gc.New() error = %v", err)
+	}
+
+	entered := make(chan struct{})
+
+	var once sync.Once
+
+	q.onScan = func(page int) {
+		if page == 0 {
+			once.Do(func() { close(entered) })
+		}
+	}
+
+	// The REQUEST's context, and it dies immediately -- exactly what an HTTP handler
+	// hands over once the response is written.
+	reqCtx, endRequest := context.WithCancel(t.Context())
+
+	if _, err := eng.TriggerAsync(reqCtx, TriggerAPI, false); err != nil {
+		t.Fatalf("TriggerAsync() error = %v", err)
+	}
+
+	endRequest()
+	<-entered
+
+	// Still sweeping: the dead request context did not take it with it.
+	q.mu.Lock()
+	finished := len(q.finished)
+	q.mu.Unlock()
+
+	if finished != 0 {
+		t.Fatal("the detached sweep finished the moment its request context died")
+	}
+
+	shutdown()
+
+	select {
+	case <-eng.AsyncDone():
+	case <-time.After(10 * time.Second):
+		t.Fatal("AsyncDone never closed: shutdown cannot wait for an API-triggered sweep")
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if len(q.finished) != 1 {
+		t.Fatalf("FinishGCRun called %d times, want 1: a cancelled sweep still writes its "+
+			"terminal row, or it holds the active slot until the next boot", len(q.finished))
+	}
+
+	if q.finished[0].Status != repository.GcRunStatusFailed ||
+		q.finished[0].Error.String != errShutdown {
+		t.Errorf("terminal row = %v/%q, want failed/%q",
+			q.finished[0].Status, q.finished[0].Error.String, errShutdown)
 	}
 }

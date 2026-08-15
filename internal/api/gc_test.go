@@ -398,3 +398,135 @@ func TestGetGCRunInvalidID(t *testing.T) {
 		t.Errorf("status = %d, want 400", w.Code)
 	}
 }
+
+// THE THREE 409s ARE DISTINCT SENTENCES (R7#1). All three are conflicts and all
+// three are CodeConflict, but "wait for the running sweep", "your operator turned
+// gc off" and "this deployment cannot run gc safely" are three different next
+// actions, and a caller that cannot tell them apart retries the third one forever.
+func TestTriggerGCRunConflictsAreDistinguishable(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		err     error
+		wantAny []string
+	}{
+		{name: "already running", err: gc.ErrAlreadyRunning, wantAny: []string{"already running"}},
+		{name: "disabled", err: gc.ErrDisabled, wantAny: []string{"disabled", "--gc-enabled"}},
+		{
+			name: "multi-instance", err: gc.ErrMultiInstance,
+			wantAny: []string{"--allow-multi-instance"},
+		},
+	}
+
+	seen := map[string]struct{}{}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a := testGCAPI(t, fixtureStore(t), &fakeGCTrigger{err: tc.err})
+			admin := principals(t)["site_admin"]
+
+			r := httptest.NewRequest(http.MethodPost, "/api/v1/gc/run", strings.NewReader(`{}`))
+			r.Header.Set("Content-Type", "application/json")
+			r = r.WithContext(withPrincipal(r.Context(), admin))
+
+			w := httptest.NewRecorder()
+			a.guard(AccessSiteAdmin, a.handleTriggerGCRun)(w, r)
+
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409. body: %s", w.Code, w.Body.String())
+			}
+
+			var body ErrorBody
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode error body: %v", err)
+			}
+
+			if body.Error.Code != CodeConflict {
+				t.Errorf("error code = %q, want %q", body.Error.Code, CodeConflict)
+			}
+
+			for _, want := range tc.wantAny {
+				if !strings.Contains(body.Error.Message, want) {
+					t.Errorf("message %q does not mention %q", body.Error.Message, want)
+				}
+			}
+
+			if _, dup := seen[body.Error.Message]; dup {
+				t.Errorf("message %q is shared with another refusal: the three conflicts must "+
+					"not read the same", body.Error.Message)
+			}
+
+			seen[body.Error.Message] = struct{}{}
+		})
+	}
+}
+
+// THE USAGE-MEASUREMENT RUNS ARE HIDDEN BY DEFAULT (R7#12). MeasureUsage mints one
+// gc_runs row every --gc-usage-interval (six hours, forever, whether or not
+// retention is even enabled) purely so the measurement is auditable. Left visible,
+// they bury the sweeps an operator opened the page to look at.
+func TestListGCRunsHidesUsageRunsUnlessAsked(t *testing.T) {
+	t.Parallel()
+
+	store := fixtureStore(t)
+	for id, trigger := range map[int64]string{3: "usage", 2: "api", 1: "interval"} {
+		store.gcRuns = append(store.gcRuns, repository.ListGCRunsRow{
+			ID: id, Status: repository.GcRunStatusSucceeded, Trigger: trigger, DryRun: trigger == "usage",
+			StartedAt: pgtype.Timestamptz{Valid: true}, FinishedAt: pgtype.Timestamptz{Valid: true},
+			Error: pgtype.Text{}, ObjectsDeleted: 0, BlobsMarked: 0, BlobsDeleted: 0,
+			BytesReclaimed: 0, HashservRowsDeleted: 0,
+		})
+	}
+
+	a := testGCAPI(t, store, &fakeGCTrigger{})
+	admin := principals(t)["site_admin"]
+
+	triggersFor := func(query string) []string {
+		t.Helper()
+
+		r := httptest.NewRequest(http.MethodGet, "/api/v1/gc/runs"+query, nil)
+		r = r.WithContext(withPrincipal(r.Context(), admin))
+
+		w := httptest.NewRecorder()
+		a.guard(AccessSiteAdmin, a.handleListGCRuns)(w, r)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200. body: %s", w.Code, w.Body.String())
+		}
+
+		var body GCRunList
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+
+		out := make([]string, 0, len(body.Items))
+		for _, item := range body.Items {
+			out = append(out, item.Trigger)
+		}
+
+		return out
+	}
+
+	for _, query := range []string{"", "?limit=10"} {
+		for _, trigger := range triggersFor(query) {
+			if trigger == string(gc.TriggerUsage) {
+				t.Errorf("GET /gc/runs%s listed a usage-measurement run by default", query)
+			}
+		}
+	}
+
+	for _, query := range []string{"?include_usage=true", "?trigger=usage"} {
+		found := false
+
+		for _, trigger := range triggersFor(query) {
+			if trigger == string(gc.TriggerUsage) {
+				found = true
+			}
+		}
+
+		if !found {
+			t.Errorf("GET /gc/runs%s did not list the usage-measurement run", query)
+		}
+	}
+}

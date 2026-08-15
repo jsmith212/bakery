@@ -45,6 +45,10 @@ type fakeQueries struct {
 	startErr error
 	scanErr  error
 
+	// rampUntil/rampErr drive GetGCState, the touch-staleness ramp clock.
+	rampUntil time.Time
+	rampErr   error
+
 	// onScan runs inside ScanObjectsForGC, before it answers.
 	onScan func(page int)
 }
@@ -58,7 +62,7 @@ func newFakeQueries() *fakeQueries {
 		unihashes: map[int64]map[string]struct{}{},
 		nextRun:   0, startedAt: time.Now(),
 		calls: map[string]int{}, scanLimits: nil, scanAt: nil, finished: nil, usage: nil,
-		startErr: nil, scanErr: nil, onScan: nil,
+		startErr: nil, scanErr: nil, rampUntil: time.Time{}, rampErr: nil, onScan: nil,
 	}
 }
 
@@ -298,27 +302,71 @@ func (f *fakeQueries) InstancePhysicalBytes(_ context.Context) (int64, error) {
 	return 0, nil
 }
 
+func (f *fakeQueries) SweepUnreferencedManifests(
+	_ context.Context, _ repository.SweepUnreferencedManifestsParams,
+) ([]string, error) {
+	f.note("SweepUnreferencedManifests")
+
+	return nil, nil
+}
+
+func (f *fakeQueries) DryRunSweepUnreferencedManifests(
+	_ context.Context, _ repository.DryRunSweepUnreferencedManifestsParams,
+) (int64, error) {
+	f.note("DryRunSweepUnreferencedManifests")
+
+	return 0, nil
+}
+
+func (f *fakeQueries) GetGCState(_ context.Context) (pgtype.Timestamptz, error) {
+	f.note("GetGCState")
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.rampErr != nil {
+		return pgtype.Timestamptz{}, f.rampErr
+	}
+
+	return pgtype.Timestamptz{Time: f.rampUntil, InfinityModifier: 0, Valid: !f.rampUntil.IsZero()}, nil
+}
+
 // fakeBlobs records what the engine asked it to delete and answers the veto from a
 // set the test controls.
 type fakeBlobs struct {
 	mu sync.Mutex
 
 	deleted []blob.DeleteRef
-	reaped  int
-	pending map[string]struct{}
+	// deleteRuns records the run id every DeleteBatch call carried: it is the write
+	// barrier, and a zero here would mean the sweep deleted against no run at all.
+	deleteRuns  []int64
+	invalidated []string
+	reaped      int
+	pending     map[string]struct{}
 }
 
 func newFakeBlobs() *fakeBlobs {
-	return &fakeBlobs{mu: sync.Mutex{}, deleted: nil, reaped: 0, pending: map[string]struct{}{}}
+	return &fakeBlobs{
+		mu: sync.Mutex{}, deleted: nil, deleteRuns: nil, invalidated: nil,
+		reaped: 0, pending: map[string]struct{}{},
+	}
 }
 
-func (f *fakeBlobs) DeleteBatch(_ context.Context, refs []blob.DeleteRef) (int64, error) {
+func (f *fakeBlobs) DeleteBatch(_ context.Context, runID int64, refs []blob.DeleteRef) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	f.deleted = append(f.deleted, refs...)
+	f.deleteRuns = append(f.deleteRuns, runID)
 
 	return int64(len(refs)), nil
+}
+
+func (f *fakeBlobs) InvalidateKeys(_ int64, _ string, keys []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.invalidated = append(f.invalidated, keys...)
 }
 
 func (f *fakeBlobs) ReapDigest(_ context.Context, _ blob.Digest) (bool, error) {

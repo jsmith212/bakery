@@ -187,6 +187,66 @@ func TestToucherFinalFlushOnShutdown(t *testing.T) {
 	}
 }
 
+// A: R6#1/R7#3, blob half. FlushAccessNow must write accessed_at even for a mark
+// taken an instant ago, well inside any staleness window a ramp would set -- that is
+// the entire reason it exists: a GC sweep stage reads accessed_at off the DATABASE
+// row, and staleness=0 is what forces a pending mark there before the sweep runs.
+func TestFlushAccessNowForcesWriteInsideStalenessWindow(t *testing.T) {
+	repo := newFakeReader()
+	repo.add(sstateKey(1), digestOf(1), 4096)
+
+	db := &fakeDBTX{execs: nil, errs: nil, reader: repo, onExec: nil}
+	svc, _ := newToucherService(t, repo, db)
+
+	ref := testRef(sstateKey(1))
+
+	if _, err := svc.Exists(t.Context(), ref); err != nil {
+		t.Fatalf("Exists() error = %v", err)
+	}
+
+	// Sanity check: an ordinary staleness-guarded flush declines this -- the mark is
+	// brand new -- so the contrast with FlushAccessNow below is real.
+	if n, err := svc.flushAccess(t.Context(), time.Hour, false); err != nil || n != 0 {
+		t.Fatalf("staleness-guarded flushAccess() = (%d, %v), want (0, nil)", n, err)
+	}
+
+	if got := len(db.calls("TouchObjectsAccessed")); got != 0 {
+		t.Fatalf("staleness-guarded flush issued %d UPDATEs, want 0", got)
+	}
+
+	n, err := svc.FlushAccessNow(t.Context())
+	if err != nil {
+		t.Fatalf("FlushAccessNow() error = %v", err)
+	}
+
+	if n != 1 {
+		t.Fatalf("FlushAccessNow() touched %d rows, want 1", n)
+	}
+
+	if got := len(db.calls("TouchObjectsAccessed")); got != 1 {
+		t.Fatalf("FlushAccessNow issued %d UPDATEs, want 1", got)
+	}
+
+	if svc.PendingTouch(ref.BackendID, ref.Namespace, ref.Key) {
+		t.Error("PendingTouch() = true after FlushAccessNow durably wrote it")
+	}
+}
+
+// FlushAccessNow on a read-only Service (Config.Tx nil) must no-op rather than panic,
+// exactly as StartAccessToucher already refuses to start one.
+func TestFlushAccessNowReadOnlyService(t *testing.T) {
+	svc := newTestService(t, newFakeReader(), 4096)
+
+	n, err := svc.FlushAccessNow(t.Context())
+	if err != nil {
+		t.Fatalf("FlushAccessNow() on a read-only service error = %v", err)
+	}
+
+	if n != 0 {
+		t.Fatalf("FlushAccessNow() on a read-only service = %d, want 0", n)
+	}
+}
+
 // THE VETO (spec 6.2). A pending touch is invisible to the sweep's SELECT: the row
 // still carries the accessed_at it had ninety days ago, so a key read seconds ago is
 // selected as cold. PendingTouch is the intersection that saves it, and it must answer
@@ -258,6 +318,50 @@ func TestPendingTouchVetoesTheSweep(t *testing.T) {
 		if svc.PendingTouch(ref.BackendID, ref.Namespace, ref.Key) {
 			t.Errorf("PendingTouch(%q) = true after a successful flush", ref.Key)
 		}
+	}
+}
+
+// THE VETO IS ON THE SWEEP'S INNER LOOP, so it must not allocate.
+//
+// The GC probes it ONCE PER CANDIDATE ROW -- 1000 rows per chunk, chunk after chunk,
+// for every namespace of every backend in the instance -- while a build is running.
+// Composing the cache key into a heap string there is one allocation per doomed object,
+// millions of them per sweep, on a path whose entire job is to answer a question about
+// memory. PendingTouch therefore builds the key in a stack buffer and hands it to both
+// probes as a []byte; both do the compiler's no-copy `m[string(ck)]` lookup and neither
+// retains it, so the buffer does not escape. That is invisible in every behavioural
+// test: a string-keyed version answers exactly the same, just with garbage.
+func TestPendingTouchAllocatesNothing(t *testing.T) {
+	repo := newFakeReader()
+	repo.add(sstateKey(1), digestOf(1), 4096)
+
+	db := &fakeDBTX{execs: nil, errs: nil, reader: repo, onExec: nil}
+	svc, _ := newToucherService(t, repo, db)
+
+	marked := testRef(sstateKey(1))
+	if _, err := svc.Exists(t.Context(), marked); err != nil {
+		t.Fatalf("Exists() error = %v", err)
+	}
+
+	// Both answers are measured: a hit walks the LRU shard's map, a miss falls through
+	// to the aux map, and only the second exercises both probes.
+	for _, tc := range []struct {
+		name string
+		key  string
+	}{
+		{name: "pending", key: marked.Key},
+		{name: "not pending", key: sstateKey(2)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			allocs := testing.AllocsPerRun(100, func() {
+				svc.PendingTouch(marked.BackendID, marked.Namespace, tc.key)
+			})
+
+			if allocs != 0 {
+				t.Errorf("PendingTouch() allocated %v times per call, want 0 -- "+
+					"the sweep now makes garbage per doomed row", allocs)
+			}
+		})
 	}
 }
 

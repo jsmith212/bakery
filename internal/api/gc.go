@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -47,7 +48,7 @@ var _ gcTrigger = (*gc.Engine)(nil)
 type GCRun struct {
 	ID      int64  `json:"id"`
 	Status  string `json:"status"`  // running|succeeded|failed
-	Trigger string `json:"trigger"` // interval|api
+	Trigger string `json:"trigger"` // interval|api|usage
 	DryRun  bool   `json:"dry_run"`
 
 	StartedAt  time.Time  `json:"started_at"`
@@ -171,6 +172,27 @@ func gcRunLimit(s string) (int32, error) {
 	return int32(n), nil
 }
 
+// gcIncludeUsage decides whether the lightweight usage-measurement runs appear in
+// the listing (R7#12).
+//
+// THE DEFAULT IS TO HIDE THEM. MeasureUsage mints a gc_runs row on every
+// --gc-usage-interval tick -- every six hours, forever, whether or not retention is
+// even enabled -- purely so the measurement is auditable. They delete nothing and
+// are indistinguishable at a glance from a sweep that found nothing to do, so a
+// default-visible listing would bury real sweeps under bookkeeping within a week.
+//
+// Two spellings, one meaning: ?include_usage=true, and ?trigger=usage for a caller
+// who thinks in terms of the column. There is deliberately NO general ?trigger=
+// filter -- 'usage' is the only value anyone needs to select on, and the other two
+// (interval, api) are already visible and already in every row -- so a
+// ?trigger=api would be a filter that silently did nothing. Anything else is
+// ignored rather than refused, for the same reason ?limit= clamps instead of
+// erroring: it is a display preference, not a validation rule the caller must
+// learn.
+func gcIncludeUsage(q url.Values) bool {
+	return q.Get("include_usage") == "true" || q.Get("trigger") == string(gc.TriggerUsage)
+}
+
 // parseGCRunID parses the {id} path segment: a gc_runs.id, a plain bigint, never a
 // uuid -- unlike every other path identifier in this API.
 func parseGCRunID(s string) (int64, error) {
@@ -209,6 +231,7 @@ func (a *API) handleListGCRuns(w http.ResponseWriter, r *http.Request) error {
 
 	rows, err := a.store.ListGCRuns(ctx, repository.ListGCRunsParams{
 		Status: status, BeforeID: before, PageLimit: limit,
+		IncludeUsage: gcIncludeUsage(r.URL.Query()),
 	})
 	if err != nil {
 		return fmt.Errorf("list gc runs: %w", err)
@@ -286,8 +309,23 @@ func (a *API) handleTriggerGCRun(w http.ResponseWriter, r *http.Request) error {
 
 	id, err := a.gc.TriggerAsync(ctx, gc.TriggerAPI, req.DryRun)
 	if err != nil {
-		if errors.Is(err, gc.ErrAlreadyRunning) {
+		// THREE DISTINCT 409s, and the distinction is the whole value of the response
+		// (R7#1). "Already running" is a wait-and-retry; "gc is disabled" is a flag the
+		// operator can change and probably meant to; "multi-instance" is a refusal that
+		// will not go away until the deployment does, and telling those apart is the
+		// difference between an operator retrying for an hour and one reading the docs.
+		switch {
+		case errors.Is(err, gc.ErrAlreadyRunning):
 			return errConflict(CodeConflict, "a gc sweep is already running")
+		case errors.Is(err, gc.ErrDisabled):
+			return errConflict(CodeConflict,
+				"gc is disabled on this server (--gc-enabled=false): nothing is swept, and a "+
+					"triggered sweep would silently override a deliberate operational state")
+		case errors.Is(err, gc.ErrMultiInstance):
+			return errConflict(CodeConflict,
+				"gc cannot run under --allow-multi-instance: the sweep's LRU invalidation, its "+
+					"boot reaper and its pending-read veto are all process-local, and each of "+
+					"them silently deletes data another instance is still serving")
 		}
 
 		return fmt.Errorf("trigger gc run: %w", err)

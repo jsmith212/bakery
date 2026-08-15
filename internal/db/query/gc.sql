@@ -159,6 +159,28 @@ SELECT cb.id, cb.kind, cb.enabled, cb.retention_window, cb.quota_bytes,
   JOIN organizations o ON o.id = p.org_id
  ORDER BY cb.id;
 
+-- The touch-staleness ramp clock (spec §6.4, 000012's gc_state table). Read ONCE
+-- per toucher flush tick, the same cadence ListBackendsForGC is read once per GC
+-- pass: `now() < touch_ramp_until` selects the widened T = 24h staleness guard
+-- for the first 7 days after the 000012 migration ran (the one-time index-bloat
+-- window fillfactor 85 manages but cannot eliminate, since it is catalog-only and
+-- moves no existing tuple); past that timestamp the toucher tightens back down to
+-- the configured --gc-touch-staleness (default 1h).
+--
+-- This REPLACES the pre-review-fix toucher's last-backend-wins permille proxy
+-- (J: R6#7/R7#6/R8#5) -- an ad-hoc fraction recomputed per backend flush, with no
+-- real notion of "time since upgrade" and a race between whichever backend's
+-- flush happened to run last. gc_state's single row, stamped from THIS
+-- migration's own now() at apply time, is unambiguous and needs no
+-- cross-backend coordination. Stage F4 wires the toucher to this query and
+-- removes the old proxy.
+--
+-- No WHERE clause: the table's own CHECK (id) plus its boolean primary key make
+-- more than one row a schema-level impossibility, so there is nothing to filter.
+--
+-- name: GetGCState :one
+SELECT touch_ramp_until FROM gc_state;
+
 -- ===========================================================================
 -- Layer A, cache_objects: the write-barrier-filtered scan + the keyed batch
 -- delete (spec §3, §9.2).
@@ -185,9 +207,37 @@ SELECT cb.id, cb.kind, cb.enabled, cb.retention_window, cb.quota_bytes,
 -- MarkBlobsPendingDelete -- the frozen values are looked up FROM the row, in SQL,
 -- by id.
 --
+-- run AS MATERIALIZED, snapshot cast to pg_snapshot ONCE (R8#6). Every query in
+-- this file that joins a `run` CTE against a PER-ROW corpus (this one,
+-- SweepUnihashes, SweepOrphanedOuthashes, NullOrphanSiginfo,
+-- SweepUnreferencedManifests, DeleteObjectsByKeys, and each one's dry-run
+-- mirror) shares this exact shape, for the same reason:
+--
+--   1. AS MATERIALIZED forces the single-row `run` lookup to execute ONCE and
+--      be reused as a literal one-row table for every row of the outer scan --
+--      without it, Postgres 12+'s CTE inlining is free (and, for a CTE this
+--      cheap-looking, likely) to fold `run`'s SELECT into the outer plan and
+--      re-evaluate `SELECT started_at, snapshot FROM gc_runs WHERE id = ...`
+--      once per candidate row instead of once per statement. Harmless on a
+--      handful of rows; on a 10^7-row keyset scan (spec §8's own sizing) it is
+--      the same index probe run millions of times for an answer that cannot
+--      change within the statement.
+--   2. `snapshot::pg_snapshot AS snap`, cast ONCE inside the CTE's SELECT list,
+--      not left as `g.snapshot::pg_snapshot` in the outer predicate. Even with
+--      the CTE materialized, a cast written INSIDE the per-row predicate
+--      expression -- `pg_visible_in_snapshot(o.live_xid::text::xid8,
+--      g.snapshot::pg_snapshot)` -- is itself an expression the executor
+--      evaluates once per row it is tested against: it would re-parse the SAME
+--      (potentially long, one entry per concurrently-open transaction) textual
+--      snapshot representation into a pg_snapshot value on every row instead of
+--      once. Casting inside the materialized CTE means the ROW `run` produces
+--      already carries a pg_snapshot-typed column, and the per-row predicate
+--      only ever does the part that must genuinely run per row: testing THAT
+--      row's live_xid against the (now pre-parsed) snapshot.
+--
 -- name: ScanObjectsForGC :many
-WITH run AS (
-    SELECT started_at, snapshot FROM gc_runs WHERE id = sqlc.arg(run_id)
+WITH run AS MATERIALIZED (
+    SELECT started_at, snapshot::pg_snapshot AS snap FROM gc_runs WHERE id = sqlc.arg(run_id)
 )
 SELECT o.namespace, o.key, o.digest, o.size_bytes,
        o.created_at, o.accessed_at, o.updated_at, o.content_type
@@ -195,7 +245,7 @@ SELECT o.namespace, o.key, o.digest, o.size_bytes,
  WHERE o.backend_id = sqlc.arg(backend_id)
    AND (o.namespace, o.key) > (sqlc.arg(after_namespace)::text, sqlc.arg(after_key)::text)
    AND o.created_at < g.started_at
-   AND pg_visible_in_snapshot(o.live_xid::text::xid8, g.snapshot::pg_snapshot)
+   AND pg_visible_in_snapshot(o.live_xid::text::xid8, g.snap)
  ORDER BY o.namespace, o.key
  LIMIT sqlc.arg(scan_limit);
 
@@ -203,6 +253,34 @@ SELECT o.namespace, o.key, o.digest, o.size_bytes,
 -- is the only caller). Scoped to ONE (backend_id, namespace) -- every GC stage
 -- already operates one namespace at a time -- with the doomed set's keys and
 -- digests passed as parallel arrays.
+--
+-- CARRIES THE WRITE BARRIER, BOTH HALVES (R7#5 CRITICAL). Every other Layer-A
+-- sweep (SweepUnihashes, SweepOrphanedOuthashes, SweepUnreferencedManifests,
+-- NullOrphanSiginfo) re-derives `created_at < run.started_at AND
+-- pg_visible_in_snapshot(...)` INSIDE its own DELETE/UPDATE, against the row as
+-- it stands AT DELETE TIME -- this query used to be the one exception, trusting
+-- the caller's doomed set (built from an EARLIER ScanObjectsForGC pass) as if it
+-- were still true. It is not, in general: the doomed set is computed from a scan
+-- taken before this statement runs, and in the gap a concurrent /ac/ overwrite
+-- (PutObjectOverwritable) can repoint the SAME (backend_id, namespace, key) at a
+-- new digest -- which refreshes created_at and live_xid via the ordinary UPDATE
+-- path (there is no separate "this row was overwritten" column; the row's own
+-- creation columns move). `o.key = doomed.key` alone does not care when the row
+-- was last (re)written, so without re-checking the barrier HERE, a doomed set
+-- built from stale evidence deletes a key a build just resurrected -- the exact
+-- failure TestGCWriteBarrierSparesAConcurrentBuild (db_test.go) and its per-stage
+-- replicas (gc_retention_test.go) exist to catch, reproduced one layer up in the
+-- one stage that skipped it. A key that raced past the barrier is simply left
+-- alone; the caller's :execrows already treats "deleted fewer rows than
+-- requested" as ordinary (ScanObjectsForGC's own snapshot can be stale by the
+-- time the delete lands), so this costs nothing at the call site.
+--
+-- run AS MATERIALIZED, snapshot cast to pg_snapshot ONCE (R8#6): see
+-- ScanObjectsForGC above for the full rationale -- identical here, this DELETE
+-- evaluates pg_visible_in_snapshot() once per row of the doomed set, and without
+-- a materialized, pre-cast CTE the planner is free to inline the
+-- text->pg_snapshot cast into that per-row expression and re-parse the (long)
+-- textual snapshot on every row instead of once for the whole statement.
 --
 -- DIGEST-ORDERED, not caller-ordered (finding 3): the refcount trigger's /ac/
 -- overwrite branch takes its paired blob locks in ascending digest order
@@ -215,10 +293,16 @@ SELECT o.namespace, o.key, o.digest, o.size_bytes,
 -- DeleteObjectsChunk's existing subquery-then-DELETE shape -- makes every writer
 -- that deletes in digest order (this query) or locks in digest order (the
 -- trigger) acquire blobs row locks in the SAME global order, so the cycle cannot
--- form. The caller retries bounded on 40P01 regardless, for the residual case of
--- two batches racing each other.
+-- form. An ORDER BY inside this USING subquery is a row-order hint, not a lock-
+-- order guarantee (R7#11) -- LockBlobDigests (query/objects.sql) is the actual
+-- guarantee, and blob.Service.DeleteBatch calls it, in the same transaction,
+-- BEFORE this DELETE. The caller retries bounded on 40P01 regardless, for the
+-- residual case of two batches racing each other.
 --
 -- name: DeleteObjectsByKeys :execrows
+WITH run AS MATERIALIZED (
+    SELECT started_at, snapshot::pg_snapshot AS snap FROM gc_runs WHERE id = sqlc.arg(run_id)
+)
 DELETE FROM cache_objects o
  USING (
      SELECT k.key, d.digest
@@ -226,10 +310,12 @@ DELETE FROM cache_objects o
        JOIN unnest(sqlc.arg(digests)::bytea[]) WITH ORDINALITY AS d(digest, ord)
          ON k.ord = d.ord
       ORDER BY d.digest
- ) doomed
- WHERE o.backend_id = sqlc.arg(backend_id)
-   AND o.namespace   = sqlc.arg(namespace)
-   AND o.key         = doomed.key;
+ ) doomed, run g
+ WHERE o.backend_id  = sqlc.arg(backend_id)
+   AND o.namespace    = sqlc.arg(namespace)
+   AND o.key          = doomed.key
+   AND o.created_at   < g.started_at
+   AND pg_visible_in_snapshot(o.live_xid::text::xid8, g.snap);
 
 -- Batched, staleness-guarded write of accessed_at = now() (spec §6.1): the
 -- toucher flusher's ONLY write. `touchKeysSQL` shape -- ONE UPDATE per flush tick
@@ -292,15 +378,18 @@ UPDATE hashserv_unihashes u
 -- Both write-barrier halves, exactly as MarkBlobsPendingDelete carries them, via
 -- the same run_id-scoped CTE.
 --
+-- run AS MATERIALIZED, snapshot cast ONCE (R8#6): see ScanObjectsForGC
+-- (above) for the full rationale.
+--
 -- name: SweepUnihashes :execrows
-WITH run AS (
-    SELECT started_at, snapshot FROM gc_runs WHERE id = sqlc.arg(run_id)
+WITH run AS MATERIALIZED (
+    SELECT started_at, snapshot::pg_snapshot AS snap FROM gc_runs WHERE id = sqlc.arg(run_id)
 )
 DELETE FROM hashserv_unihashes u
  USING run g
  WHERE u.backend_id = sqlc.arg(backend_id)
    AND u.created_at < g.started_at
-   AND pg_visible_in_snapshot(u.live_xid::text::xid8, g.snapshot::pg_snapshot)
+   AND pg_visible_in_snapshot(u.live_xid::text::xid8, g.snap)
    AND coalesce(u.accessed_at, u.created_at) < now() - sqlc.arg(retention_window)::interval;
 
 -- Dry-run mirror of SweepUnihashes: identical predicate, COUNT instead of DELETE.
@@ -308,14 +397,14 @@ DELETE FROM hashserv_unihashes u
 -- row (dry_run = true) is genuinely read-only and performs no delete anywhere.
 --
 -- name: DryRunSweepUnihashes :one
-WITH run AS (
-    SELECT started_at, snapshot FROM gc_runs WHERE id = sqlc.arg(run_id)
+WITH run AS MATERIALIZED (
+    SELECT started_at, snapshot::pg_snapshot AS snap FROM gc_runs WHERE id = sqlc.arg(run_id)
 )
 SELECT count(*)::bigint AS would_delete
   FROM hashserv_unihashes u, run g
  WHERE u.backend_id = sqlc.arg(backend_id)
    AND u.created_at < g.started_at
-   AND pg_visible_in_snapshot(u.live_xid::text::xid8, g.snapshot::pg_snapshot)
+   AND pg_visible_in_snapshot(u.live_xid::text::xid8, g.snap)
    AND coalesce(u.accessed_at, u.created_at) < now() - sqlc.arg(retention_window)::interval;
 
 -- Batch existence probe for the sstate unihash-root derivation (spec §5 step 4):
@@ -371,15 +460,18 @@ SELECT EXISTS (
 -- created_at < now() - window rather than a coalesce: there is no second timestamp
 -- to prefer.
 --
+-- run AS MATERIALIZED, snapshot cast ONCE (R8#6): see ScanObjectsForGC
+-- (above) for the full rationale.
+--
 -- name: SweepOrphanedOuthashes :execrows
-WITH run AS (
-    SELECT started_at, snapshot FROM gc_runs WHERE id = sqlc.arg(run_id)
+WITH run AS MATERIALIZED (
+    SELECT started_at, snapshot::pg_snapshot AS snap FROM gc_runs WHERE id = sqlc.arg(run_id)
 )
 DELETE FROM hashserv_outhashes o
  USING run g
  WHERE o.backend_id = sqlc.arg(backend_id)
    AND o.created_at < g.started_at
-   AND pg_visible_in_snapshot(o.live_xid::text::xid8, g.snapshot::pg_snapshot)
+   AND pg_visible_in_snapshot(o.live_xid::text::xid8, g.snap)
    AND o.created_at < now() - sqlc.arg(retention_window)::interval
    AND NOT EXISTS (
        SELECT 1 FROM hashserv_unihashes u
@@ -389,14 +481,14 @@ DELETE FROM hashserv_outhashes o
    );
 
 -- name: DryRunSweepOrphanedOuthashes :one
-WITH run AS (
-    SELECT started_at, snapshot FROM gc_runs WHERE id = sqlc.arg(run_id)
+WITH run AS MATERIALIZED (
+    SELECT started_at, snapshot::pg_snapshot AS snap FROM gc_runs WHERE id = sqlc.arg(run_id)
 )
 SELECT count(*)::bigint AS would_delete
   FROM hashserv_outhashes o, run g
  WHERE o.backend_id = sqlc.arg(backend_id)
    AND o.created_at < g.started_at
-   AND pg_visible_in_snapshot(o.live_xid::text::xid8, g.snapshot::pg_snapshot)
+   AND pg_visible_in_snapshot(o.live_xid::text::xid8, g.snap)
    AND o.created_at < now() - sqlc.arg(retention_window)::interval
    AND NOT EXISTS (
        SELECT 1 FROM hashserv_unihashes u
@@ -416,9 +508,12 @@ SELECT count(*)::bigint AS would_delete
 -- a write for a row it already cleared (cheap, and keeps this idempotent at the
 -- statement level as well as the data level).
 --
+-- run AS MATERIALIZED, snapshot cast ONCE (R8#6): see ScanObjectsForGC
+-- (above) for the full rationale.
+--
 -- name: NullOrphanSiginfo :execrows
-WITH run AS (
-    SELECT started_at, snapshot FROM gc_runs WHERE id = sqlc.arg(run_id)
+WITH run AS MATERIALIZED (
+    SELECT started_at, snapshot::pg_snapshot AS snap FROM gc_runs WHERE id = sqlc.arg(run_id)
 )
 UPDATE hashserv_outhashes o
    SET outhash_siginfo = NULL
@@ -426,19 +521,19 @@ UPDATE hashserv_outhashes o
  WHERE o.backend_id = sqlc.arg(backend_id)
    AND o.outhash_siginfo IS NOT NULL
    AND o.created_at < g.started_at
-   AND pg_visible_in_snapshot(o.live_xid::text::xid8, g.snapshot::pg_snapshot)
+   AND pg_visible_in_snapshot(o.live_xid::text::xid8, g.snap)
    AND o.created_at < now() - sqlc.arg(retention_window)::interval;
 
 -- name: DryRunNullOrphanSiginfo :one
-WITH run AS (
-    SELECT started_at, snapshot FROM gc_runs WHERE id = sqlc.arg(run_id)
+WITH run AS MATERIALIZED (
+    SELECT started_at, snapshot::pg_snapshot AS snap FROM gc_runs WHERE id = sqlc.arg(run_id)
 )
 SELECT count(*)::bigint AS would_null
   FROM hashserv_outhashes o, run g
  WHERE o.backend_id = sqlc.arg(backend_id)
    AND o.outhash_siginfo IS NOT NULL
    AND o.created_at < g.started_at
-   AND pg_visible_in_snapshot(o.live_xid::text::xid8, g.snapshot::pg_snapshot)
+   AND pg_visible_in_snapshot(o.live_xid::text::xid8, g.snap)
    AND o.created_at < now() - sqlc.arg(retention_window)::interval;
 
 -- ===========================================================================
@@ -472,34 +567,59 @@ SELECT count(*)::bigint AS would_null
 -- exactly one blobs row lock -- the paired-lock UPDATE branch that motivates
 -- digest ordering never fires here.
 --
--- name: SweepUnreferencedManifests :execrows
-WITH run AS (
-    SELECT started_at, snapshot FROM gc_runs WHERE id = sqlc.arg(run_id)
+-- THIS IS THE ONLY DELETION PATH FOR THE manifests NAMESPACE (E: R6#4/R7#9). The
+-- pre-review-fix engine decided manifest deletions in Go, from a `tagDigests` set
+-- that stage 7 accumulated as it scanned the tags namespace, and then deleted
+-- through DeleteObjectsByKeys. That set is a snapshot of the tags namespace taken
+-- BEFORE the manifests scan begins and page by page, so it answers "was this
+-- digest tagged when stage 7 read that page" -- not "is it tagged now, at the
+-- instant the DELETE runs". A `docker pull` that writes a tag between the two
+-- (the ordinary case: SWR revalidation writes tags constantly) leaves a live tag
+-- pointing at a manifest this sweep has already decided is unreferenced. Doing
+-- the anti-join HERE, in the same statement as the DELETE and under the same
+-- write barrier, closes that gap by construction: there is no window between the
+-- decision and the delete because they are one statement.
+--
+-- RETURNS THE DELETED KEYS, and the caller MUST invalidate them from the LRU
+-- (blob.Service.InvalidateKeys). Manifests are served through blob.Get, so a
+-- positive LRU entry outlives a raw SQL delete and answers "present" for an
+-- object whose row is gone -- which the byte reap then turns into a dangling
+-- metadata 500. This is the same obligation DeleteObjectsByKeys discharges via
+-- blob.Service.DeleteBatch's own delBatch call; the difference is only that the
+-- keys come back from the statement instead of going into it.
+--
+-- run AS MATERIALIZED, snapshot cast ONCE (R8#6): see ScanObjectsForGC
+-- (above) for the full rationale.
+--
+-- name: SweepUnreferencedManifests :many
+WITH run AS MATERIALIZED (
+    SELECT started_at, snapshot::pg_snapshot AS snap FROM gc_runs WHERE id = sqlc.arg(run_id)
 )
 DELETE FROM cache_objects m
  USING run g
  WHERE m.backend_id = sqlc.arg(backend_id)
    AND m.namespace   = 'manifests'
    AND m.created_at  < g.started_at
-   AND pg_visible_in_snapshot(m.live_xid::text::xid8, g.snapshot::pg_snapshot)
+   AND pg_visible_in_snapshot(m.live_xid::text::xid8, g.snap)
    AND coalesce(m.accessed_at, m.created_at) < now() - sqlc.arg(retention_window)::interval
    AND NOT EXISTS (
        SELECT 1 FROM cache_objects t
         WHERE t.backend_id = m.backend_id
           AND t.namespace  = 'tags'
           AND t.digest     = m.digest
-   );
+   )
+RETURNING m.key;
 
 -- name: DryRunSweepUnreferencedManifests :one
-WITH run AS (
-    SELECT started_at, snapshot FROM gc_runs WHERE id = sqlc.arg(run_id)
+WITH run AS MATERIALIZED (
+    SELECT started_at, snapshot::pg_snapshot AS snap FROM gc_runs WHERE id = sqlc.arg(run_id)
 )
 SELECT count(*)::bigint AS would_delete
   FROM cache_objects m, run g
  WHERE m.backend_id = sqlc.arg(backend_id)
    AND m.namespace   = 'manifests'
    AND m.created_at  < g.started_at
-   AND pg_visible_in_snapshot(m.live_xid::text::xid8, g.snapshot::pg_snapshot)
+   AND pg_visible_in_snapshot(m.live_xid::text::xid8, g.snap)
    AND coalesce(m.accessed_at, m.created_at) < now() - sqlc.arg(retention_window)::interval
    AND NOT EXISTS (
        SELECT 1 FROM cache_objects t
@@ -556,12 +676,24 @@ SELECT coalesce(sum(size_bytes), 0)::bigint AS physical_bytes
 -- newest row", which is how the API's optional ?status= and a first page both
 -- read -- no separate "list everything" query to keep in sync with this one.
 --
+-- include_usage EXCLUDES trigger = 'usage' rows BY DEFAULT (R7#12). MeasureUsage's
+-- --gc-usage-interval pass (spec §8, findings 7b/13) mints its own gc_runs row on
+-- every tick -- every 6h, forever, independent of whether retention is even
+-- enabled -- purely so the measurement itself is auditable. A console operator
+-- watching /api/v1/gc/runs for SWEEP activity does not want that list drowned in
+-- one lightweight measurement row every 6h forever; sqlc.arg(include_usage),
+-- rather than a NULL-means-no-filter narg like the two above, is a plain boolean
+-- because there is no "unset" state for it that means anything different from
+-- false -- the API defaults it to false and a caller must opt IN with
+-- ?include_usage=true to see them.
+--
 -- name: ListGCRuns :many
 SELECT id, started_at, finished_at, status, error, trigger, dry_run,
        objects_deleted, blobs_marked, blobs_deleted, bytes_reclaimed, hashserv_rows_deleted
   FROM gc_runs
  WHERE (sqlc.narg(status)::gc_run_status IS NULL OR status = sqlc.narg(status)::gc_run_status)
    AND (sqlc.narg(before_id)::bigint IS NULL OR id < sqlc.narg(before_id)::bigint)
+   AND (sqlc.arg(include_usage)::boolean OR trigger <> 'usage')
  ORDER BY id DESC
  LIMIT sqlc.arg(page_limit);
 

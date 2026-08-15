@@ -1,9 +1,11 @@
 package blob
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgerrcode"
@@ -52,7 +54,16 @@ type DeleteRef struct {
 // taken before the rows are gone would let a fill started after it read the still-live
 // row and land a stale POSITIVE entry -- a cached digest for an object that no longer
 // exists, which the byte reap then turns into ErrDanglingMetadata.
-func (s *Service) DeleteBatch(ctx context.Context, refs []DeleteRef) (int64, error) {
+//
+// runID IS THE WRITE BARRIER and it is a REQUIRED argument, not an option:
+// DeleteObjectsByKeys re-derives `created_at < run.started_at AND
+// pg_visible_in_snapshot(live_xid, run.snapshot)` FROM THE gc_runs ROW, in SQL, at
+// delete time (CLAUDE.md: never select `snapshot` back into Go). The doomed set was
+// computed by an EARLIER ScanObjectsForGC pass, and in the gap a build can overwrite
+// or re-create any key in it; without the barrier this method would delete a row a
+// build just resurrected. A caller with no run has no business deleting in bulk --
+// which is why there is no runID-less overload and why the GC is the only caller.
+func (s *Service) DeleteBatch(ctx context.Context, runID int64, refs []DeleteRef) (int64, error) {
 	if len(refs) == 0 {
 		return 0, nil
 	}
@@ -84,7 +95,7 @@ func (s *Service) DeleteBatch(ctx context.Context, refs []DeleteRef) (int64, err
 		cks = append(cks, string(r.appendCacheKey(buf[:0])))
 	}
 
-	n, err := s.deleteBatchTx(ctx, backendID, namespace, keys, digests)
+	n, err := s.deleteBatchTx(ctx, runID, backendID, namespace, keys, digests)
 	if err != nil {
 		return 0, err
 	}
@@ -94,22 +105,88 @@ func (s *Service) DeleteBatch(ctx context.Context, refs []DeleteRef) (int64, err
 	return n, nil
 }
 
-// deleteBatchTx runs the batch DELETE with the bounded 40P01 retry.
+// InvalidateKeys drops the LRU entries for rows some OTHER statement deleted.
+//
+// It exists for exactly one caller: the GC's stage 8 (SweepUnreferencedManifests),
+// whose tag anti-join has to be evaluated in SQL at delete time and which therefore
+// REPORTS the keys it deleted instead of being handed them. Everything else deletes
+// through DeleteBatch or Delete, both of which invalidate for themselves.
+//
+// It is deliberately NOT a general "delete these rows" API and takes no digests: it
+// touches no database and no bytes, it only forgets. Calling it for rows that still
+// exist is safe (the next read re-fills from Postgres) and costs a cache miss;
+// NOT calling it after a raw SQL delete is not safe at all -- the LRU serves
+// POSITIVE answers with zero database contact, so a stale entry answers "present"
+// for a row that is gone until the process restarts, and the byte reap then turns
+// that answer into a permanent dangling-metadata 500.
+//
+// It uses the same shard-grouped, one-bump-per-shard delBatch the GC's own batch
+// delete uses, for the same reason (finding 16): a per-key generation bump would
+// suppress concurrent cold-HEAD fills process-wide for the whole chunk.
+func (s *Service) InvalidateKeys(backendID int64, namespace string, keys []string) {
+	if len(keys) == 0 {
+		return
+	}
+
+	var buf [512]byte
+
+	cks := make([]string, 0, len(keys))
+
+	for _, k := range keys {
+		ref := Ref{
+			BackendID: backendID,
+			Org:       "", Project: "", Backend: "", Kind: "",
+			Namespace: namespace, Key: k,
+		}
+
+		cks = append(cks, string(ref.appendCacheKey(buf[:0])))
+	}
+
+	s.lru.delBatch(cks)
+}
+
+// deleteBatchTx runs the pre-lock and the batch DELETE in ONE transaction, with the
+// bounded 40P01 retry.
+//
+// THE PRE-LOCK IS THE ABBA GUARANTEE (spec 6.2/9.2, R7#11). DeleteObjectsByKeys sorts
+// its driving set `ORDER BY d.digest` inside a USING subquery, and the refcount
+// trigger sorts its paired blob locks the same way -- but an ORDER BY in a subquery is
+// a hint about ROW order, not a promise about the order the executor acquires the blobs
+// row locks that the DELETE's cascading trigger takes. LockBlobDigests takes them
+// explicitly, ordered, in the same transaction and BEFORE the DELETE, so the lock order
+// is deterministic by construction instead of by planner accident. It has to be the
+// SAME transaction: a lock taken in another one is released before the DELETE begins
+// and protects nothing (the same reason Put's advisory lock lives inside its tx).
+//
+// The digests are sorted in Go as well. The query's own ORDER BY is what Postgres
+// obeys, so this is belt -- but it costs one sort per chunk, makes the parameter array
+// deterministic, and means a future edit that loses the SQL ORDER BY degrades to a
+// still-ordered lock acquisition rather than to a deadlock under load.
 func (s *Service) deleteBatchTx(
-	ctx context.Context, backendID int64, namespace string, keys []string, digests [][]byte,
+	ctx context.Context, runID, backendID int64, namespace string, keys []string, digests [][]byte,
 ) (int64, error) {
+	locks := make([][]byte, len(digests))
+	copy(locks, digests)
+	slices.SortFunc(locks, bytes.Compare)
+
 	var lastErr error
 
 	for attempt := range deleteBatchAttempts {
 		var n int64
 
 		err := s.tx.Tx(ctx, func(q *repository.Queries) error {
+			s.qLockDigests.Inc()
+
+			if err := q.LockBlobDigests(ctx, locks); err != nil {
+				return fmt.Errorf("lock blob digests: %w", err)
+			}
+
 			s.qDeleteByKeys.Inc()
 
 			var err error
 
 			n, err = q.DeleteObjectsByKeys(ctx, repository.DeleteObjectsByKeysParams{
-				Keys: keys, Digests: digests, BackendID: backendID, Namespace: namespace,
+				Keys: keys, Digests: digests, BackendID: backendID, Namespace: namespace, RunID: runID,
 			})
 			if err != nil {
 				return fmt.Errorf("delete objects by keys: %w", err)

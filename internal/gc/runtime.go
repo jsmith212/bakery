@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -24,27 +25,25 @@ const (
 	// hour of the first sweep.
 	touchStalenessRamped = 24 * time.Hour
 
-	// rampThresholdPermille is where T tightens from touchStalenessRamped to the
-	// configured steady value: when fewer than half the scanned rows still have a NULL
-	// accessed_at.
-	//
-	// THE SPEC SAYS "24h FOR THE FIRST 7 DAYS AFTER MIGRATION". This is that rule,
-	// driven by the state it is a proxy for instead of by a wall clock, and the reason
-	// is that the wall clock is not available: golang-migrate records a version and a
-	// dirty flag, no timestamp, and neither 000012 nor any table carries one either.
-	// The alternatives were a new schema marker (the migration has landed) or the
-	// process's own uptime (a weekly-restarting deployment would never tighten). The
-	// NULL fraction is measured for free by a pass that already reads accessed_at, it
-	// falls monotonically as the toucher does its work, and it answers the question
-	// the 7 days were standing in for: "are we still paying for the first touch of
-	// pre-existing rows?"
-	rampThresholdPermille = 500
-
 	// usageStartupDelay is how long the usage pass waits before its first measurement.
 	// Boot is the busiest moment in the process's life -- migrations have just run,
 	// every route cache is cold -- and a full scan of every backend is not what it
 	// needs from its first second.
 	usageStartupDelay = 30 * time.Second
+
+	// sweepStartupDelay is the CEILING on how long the sweep loop waits before its
+	// FIRST run (R7#7), mirroring usageStartupDelay. Without it the first sweep of a
+	// process's life happens one whole --gc-interval (six hours, shipped) after boot,
+	// so a deployment that restarts more often than that never sweeps at all -- and
+	// nothing in any metric says so, because a loop that has not run yet emits
+	// exactly what a healthy idle one does.
+	//
+	// It is a ceiling rather than the delay itself: the real delay is
+	// min(this, --gc-interval), jittered, so a test (or an operator) that configures
+	// a one-minute interval does not wait half of it on a constant, and so a fleet
+	// restarted together does not start every instance's first sweep in the same
+	// second.
+	sweepStartupDelay = 30 * time.Second
 )
 
 // Loop runs a sweep every --gc-interval until ctx is cancelled.
@@ -72,10 +71,27 @@ func (e *Engine) Loop(ctx context.Context) {
 		return
 	}
 
+	first := e.firstSweepDelay()
+
 	e.log.InfoContext(ctx, "gc loop started",
 		slog.Duration("interval", e.cfg.Interval),
+		slog.Duration("first_run_in", first),
 		slog.Duration("grace_period", e.cfg.GracePeriod),
 		slog.Bool("retention", !e.cfg.DisableRetention))
+
+	// THE FIRST SWEEP DOES NOT WAIT A WHOLE INTERVAL (R7#7). A ticker alone means a
+	// process that restarts more often than --gc-interval (six hours) never sweeps,
+	// silently; the startup timer is what makes a boot a sweep opportunity rather
+	// than a reset of the clock.
+	startup := time.NewTimer(first)
+	defer startup.Stop()
+
+	select {
+	case <-ctx.Done():
+		return
+	case <-startup.C:
+		e.runOnce(ctx)
+	}
 
 	t := time.NewTicker(e.cfg.Interval)
 	defer t.Stop()
@@ -85,15 +101,46 @@ func (e *Engine) Loop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			// A sweep that loses its context finishes the CHUNK it is in, writes its
-			// terminal gc_runs row under context.WithoutCancel, and returns; the error
-			// here is that shutdown, not a failure to report twice.
-			if _, err := e.Run(ctx, TriggerInterval, false); err != nil &&
-				!errors.Is(err, context.Canceled) && !errors.Is(err, ErrAlreadyRunning) {
-				e.log.ErrorContext(ctx, "gc run failed", slog.Any("error", err))
-			}
+			e.runOnce(ctx)
 		}
 	}
+}
+
+// runOnce is one scheduled sweep plus its error reporting.
+//
+// A sweep that loses its context finishes the CHUNK it is in, writes its terminal
+// gc_runs row under context.WithoutCancel, and returns; the error here is that
+// shutdown, not a failure to report twice. ErrAlreadyRunning is likewise ordinary
+// -- an operator's API trigger can legitimately still be running when the tick
+// lands.
+func (e *Engine) runOnce(ctx context.Context) {
+	if _, err := e.Run(ctx, TriggerInterval, false); err != nil &&
+		!errors.Is(err, context.Canceled) && !errors.Is(err, ErrAlreadyRunning) {
+		e.log.ErrorContext(ctx, "gc run failed", slog.Any("error", err))
+	}
+}
+
+// firstSweepDelay is min(sweepStartupDelay, --gc-interval), jittered into
+// [d/10, d/2].
+//
+// The jitter is not decoration: a fleet restarted together (a rolling deploy, a
+// node pool replacement) would otherwise start every instance's first sweep in the
+// same second, against the same database. The floor at d/10 keeps boot's busiest
+// moment -- migrations just finished, every route cache is cold -- clear of a full
+// scan of every backend, which is the same reason usageStartupDelay exists.
+func (e *Engine) firstSweepDelay() time.Duration {
+	d := min(sweepStartupDelay, e.cfg.Interval)
+	if d <= 0 {
+		return 0
+	}
+
+	span := d/2 - d/10
+	if span <= 0 {
+		return d / 10
+	}
+
+	//nolint:gosec // jitter, not a secret
+	return d/10 + time.Duration(rand.Int64N(int64(span)))
 }
 
 // UsageLoop measures every backend's usage on --gc-usage-interval.
@@ -147,6 +194,12 @@ func (e *Engine) UsageLoop(ctx context.Context) {
 // dry run. That keeps CLAUDE.md's rule ("never select snapshot back into Go") intact
 // and costs one row per pass, which is also the audit trail for when a measurement
 // happened.
+//
+// THAT ROW'S TRIGGER IS 'usage', NOT 'interval' (R7#12). It is minted every six
+// hours forever, whether or not retention is enabled, and mislabelling it as an
+// interval sweep would put a permanent stream of zero-delete rows in the list an
+// operator reads to see what the sweep did. GET /api/v1/gc/runs filters them out
+// unless asked.
 func (e *Engine) MeasureUsage(ctx context.Context) error {
 	rows, err := e.db.ListBackendsForGC(ctx)
 	if err != nil {
@@ -179,14 +232,14 @@ func (e *Engine) MeasureUsage(ctx context.Context) error {
 	}
 
 	run, err := e.db.StartGCRun(ctx, repository.StartGCRunParams{
-		GracePeriod: interval(e.cfg.GracePeriod), Trigger: string(TriggerInterval), DryRun: true,
+		GracePeriod: interval(e.cfg.GracePeriod), Trigger: string(TriggerUsage), DryRun: true,
 	})
 	if err != nil {
 		return fmt.Errorf("start usage measurement run: %w", err)
 	}
 
 	sum := Summary{
-		RunID: run.ID, Trigger: TriggerInterval, DryRun: true,
+		RunID: run.ID, Trigger: TriggerUsage, DryRun: true,
 		ObjectsDeleted: 0, HashservRows: 0, BlobsMarked: 0, BlobsDeleted: 0,
 		BytesReclaimed: 0, BackendsRefused: 0,
 	}
@@ -240,25 +293,57 @@ func (e *Engine) measureAll(
 	return nil
 }
 
-// noteTouchRamp folds one pass's NULL-accessed_at fraction into the ramp signal.
-func (e *Engine) noteTouchRamp(u *usage) {
-	if u.objects == 0 {
-		return
-	}
-
-	e.nullPermille.Store(u.nullAccessed * 1000 / u.objects)
-}
-
 // TouchInterval is F for blob.Service.StartAccessToucher, normalized.
 func (e *Engine) TouchInterval() time.Duration { return e.cfg.TouchInterval }
 
-// TouchStaleness is T for blob.Service.StartAccessToucher, and it RAMPS (spec §6.4).
+// LoadTouchRamp reads gc_state.touch_ramp_until ONCE, at boot, and is what makes
+// TouchStaleness a real clock (J: R6#7/R7#6/R8#5).
 //
-// Pass it as the staleness function: the toucher asks on every tick, so the ramp
-// tightens the moment a measurement says the corpus has been touched, with no
-// restart.
+// It REPLACES the pre-review-fix proxy: a per-mille fraction of scanned rows whose
+// accessed_at was still NULL, recomputed on every backend's usage publish and
+// therefore last-backend-wins -- one small, cold backend measured last could hold
+// the whole instance at the ramped T forever, and on a mostly-cold corpus (an
+// archive, a downloads mirror) the fraction never converges at all. 000012 stamps
+// a real timestamp from its own now(), which needs no coordination between
+// backends and answers the actual question: how long since the fillfactor
+// transition began.
+//
+// ONCE, not per tick: the value cannot change (nothing writes gc_state after the
+// migration), so re-reading it on every flush would be a query per minute forever
+// for an answer that is fixed at boot. A read failure is not fatal -- the caller
+// logs it and the ramp stays at its conservative end (see TouchStaleness), which
+// costs write amplification, never correctness.
+func (e *Engine) LoadTouchRamp(ctx context.Context) error {
+	until, err := e.db.GetGCState(ctx)
+	if err != nil {
+		return fmt.Errorf("read gc state: %w", err)
+	}
+
+	if !until.Valid {
+		return nil
+	}
+
+	e.rampUntil.Store(until.Time.UnixNano())
+
+	return nil
+}
+
+// TouchStaleness is T for blob.Service.StartAccessToucher and for hashserv's
+// unihash toucher, and it RAMPS (spec §6.4).
+//
+// Pass it as the staleness FUNCTION, not a duration: the touchers ask on every
+// tick, so the ramp tightens the moment gc_state.touch_ramp_until passes, with no
+// restart and no second source of truth.
+//
+// A zero rampUntil -- LoadTouchRamp never ran, or its read failed -- resolves to
+// the RAMPED end on purpose. Being wrong that way costs a longer staleness guard
+// (fewer accessed_at writes than necessary, bounded by T against windows of days);
+// being wrong the other way concentrates the one-time non-HOT first-touch of every
+// pre-existing row into the first hour of the first sweep, which is the spike the
+// ramp exists to spread.
 func (e *Engine) TouchStaleness() time.Duration {
-	if e.nullPermille.Load() > rampThresholdPermille {
+	until := e.rampUntil.Load()
+	if until == 0 || time.Now().UnixNano() < until {
 		return max(touchStalenessRamped, e.cfg.TouchStaleness)
 	}
 

@@ -53,7 +53,7 @@ func New(deps cache.Deps, routes RouteResolver, authn Authenticator, q Queries, 
 	b := &Backend{deps: deps, routes: routes, authn: authn, q: q, upstreams: upstreams}
 
 	if q != nil {
-		b.touch = newUnihashToucher(q)
+		b.touch = newUnihashToucher(q, deps.Metrics.GC())
 	}
 
 	return b

@@ -86,6 +86,15 @@ func Boot(ctx context.Context, p BootParams) error {
 	cmd := p.Cmd
 	log := slog.Default()
 
+	// THE SERVER LIFETIME CONTEXT, and it is cancellable from inside Boot for one
+	// reason: losing the boot advisory lock is a fatal condition this process has to
+	// act on itself (M: R7#2, watchBootLock below). Everything downstream -- the
+	// listeners, the GC engine, every background loop -- hangs off this rather than
+	// off the caller's context, so that one cancellation brings the whole process
+	// down in the ordinary shutdown order instead of leaving a half-live server.
+	ctx, stopServing := context.WithCancel(ctx)
+	defer stopServing()
+
 	// The BOOTSTRAP pool: no enum type registration, because on a fresh database
 	// the enum types do not exist yet. A pool that registered them would fail its
 	// own Ping here and the migrations that create them could never run.
@@ -113,6 +122,15 @@ func Boot(ctx context.Context, p BootParams) error {
 		return fmt.Errorf("acquire boot lock: %w", err)
 	default:
 		defer lock.Release()
+
+		// The lock's own contract (internal/db/bootlock.go, BootLock.Lost): "The server
+		// MUST select on this and shut down: continuing to serve past it is the
+		// two-writers state the lock exists to forbid." Nothing consumed it before
+		// (R7#2), so a process that lost its lock to a second instance kept serving
+		// with a stale route cache, a stale LRU and a GC that believes its pending-read
+		// set is complete -- silently, because the only sign was one ERROR line from
+		// the watcher.
+		go watchBootLock(ctx, lock.Lost(), stopServing, log)
 	}
 
 	if err := db.Migrate(bootPool); err != nil {
@@ -193,6 +211,54 @@ func Boot(ctx context.Context, p BootParams) error {
 		return fmt.Errorf("build blob service: %w", err)
 	}
 
+	// The M2+ cache backends' shared wiring: the route resolver (ResolveRoute +
+	// GetBackend behind the in-process cache the boot advisory lock makes sound) and
+	// the auth adapter that widens auth.Principal to each backend's narrow capability
+	// interface.
+	//
+	// It is built HERE, before the GC engine, because gc.Deps needs the hashserv
+	// backend: hashserv owns the unihash toucher, and the sweep force-flushes it
+	// before touching the GC root (spec §6.2's first mechanism). Nothing in this
+	// block talks to the network or the database -- routes is a lazy cache and
+	// upstreams dials nothing until a backend takes its first miss -- so moving it
+	// ahead of the engine costs nothing and changes no boot-order invariant.
+	cacheDeps := cache.Deps{Blobs: blobs, Metrics: m, Logger: log}
+	if err := cacheDeps.Validate(); err != nil {
+		return fmt.Errorf("build cache deps: %w", err)
+	}
+
+	routes := httpblob.NewCachedResolver(store, log)
+	authn := cacheAuth{svc: authSvc}
+
+	// M3: hashserv. It shares the route resolver and the auth service with the M2
+	// backends, but nothing else -- it is the one backend that does not route through
+	// blob.Service, so it takes the Store directly (a narrow, hashserv-only Queries
+	// surface) and owns its own metrics.
+	//
+	// Upstreams is lazy: no upstream is dialled until a backend that configures one takes
+	// its first miss, so a dead or slow third party can never stall boot. Its Close tears
+	// down the pooled upstream connections and the backfill workers.
+	upstreams := hashserv.NewUpstreams(store, m, log, cmd.HashservDisableUpstream)
+
+	// Run below BLOCKS until both listeners have drained, so this defer really does fire
+	// at shutdown rather than at the top of a still-serving process.
+	defer func() {
+		if err := upstreams.Close(); err != nil {
+			log.Warn("closing hashserv upstreams", "error", err)
+		}
+	}()
+
+	if cmd.HashservDisableUpstream {
+		log.Warn("hashserv upstream chaining is disabled server-wide: every backend's configured " +
+			"upstream is ignored")
+	}
+
+	// Captured in a named var, not inlined into cacheBackends below, so boot can also
+	// hand its access-toucher loop (M6 spec 6.1's hashserv paragraph) a starting
+	// point beside blobs.StartAccessToucher -- and so gc.Deps can force-flush it
+	// before stage 1.
+	hashservBackend := hashserv.New(cacheDeps, routes, hashservAuth{svc: authSvc}, store, upstreams)
+
 	// M6: the garbage collector. It is constructed unconditionally -- the boot reaper
 	// below and the toucher's T ramp are its responsibilities whether or not the sweep
 	// itself runs -- and its loops decide for themselves whether to start.
@@ -200,7 +266,14 @@ func Boot(ctx context.Context, p BootParams) error {
 	// Built BEFORE apiSrv (M6 stage 5): POST /api/v1/gc/run needs the engine
 	// itself, not just Store, to answer 409 the instant a second real run is
 	// attempted -- see api.Config.GC.
-	gcEngine, err := gc.New(gc.Deps{DB: store, Blobs: blobs, Metrics: m, Log: log}, gc.Config{
+	//
+	// ctx is the SERVER LIFETIME (R7#8): an API-triggered sweep runs under it, so it
+	// is cancelled by shutdown and waited for below, instead of being detached from
+	// the request with context.WithoutCancel and outliving everything.
+	gcEngine, err := gc.New(ctx, gc.Deps{
+		DB: store, Blobs: blobs, Metrics: m, Log: log,
+		Access: blobs, Unihash: hashservBackend,
+	}, gc.Config{
 		Enabled:            cmd.GC.GCEnabled,
 		AllowMultiInstance: cmd.AllowMultiInstance,
 		Interval:           cmd.GC.GCInterval,
@@ -237,39 +310,16 @@ func Boot(ctx context.Context, p BootParams) error {
 		}
 	}
 
-	// The M2 cache backends: sstate and downloads, both the shared httpblob handler
-	// with different Policy. The route resolver fronts ResolveRoute + GetBackend with
-	// the in-process cache the boot advisory lock makes sound; the auth adapter widens
-	// auth.Principal to httpblob's narrow capability interface.
-	cacheDeps := cache.Deps{Blobs: blobs, Metrics: m, Logger: log}
-	if err := cacheDeps.Validate(); err != nil {
-		return fmt.Errorf("build cache deps: %w", err)
-	}
-
-	routes := httpblob.NewCachedResolver(store, log)
-	authn := cacheAuth{svc: authSvc}
-
-	// M3: hashserv. It shares the route resolver and the auth service with the M2
-	// backends, but nothing else -- it is the one backend that does not route through
-	// blob.Service, so it takes the Store directly (a narrow, hashserv-only Queries
-	// surface) and owns its own metrics.
-	//
-	// Upstreams is lazy: no upstream is dialled until a backend that configures one takes
-	// its first miss, so a dead or slow third party can never stall boot. Its Close tears
-	// down the pooled upstream connections and the backfill workers.
-	upstreams := hashserv.NewUpstreams(store, m, log, cmd.HashservDisableUpstream)
-
-	// Run below BLOCKS until both listeners have drained, so this defer really does fire
-	// at shutdown rather than at the top of a still-serving process.
-	defer func() {
-		if err := upstreams.Close(); err != nil {
-			log.Warn("closing hashserv upstreams", "error", err)
-		}
-	}()
-
-	if cmd.HashservDisableUpstream {
-		log.Warn("hashserv upstream chaining is disabled server-wide: every backend's configured " +
-			"upstream is ignored")
+	// The touch-staleness ramp clock (spec §6.4), read ONCE, here, because it cannot
+	// change: 000012 stamps gc_state.touch_ramp_until at migration time and nothing
+	// writes it afterwards. A read failure is deliberately NOT fatal -- the ramp
+	// stays at its conservative 24h end, which costs write amplification and nothing
+	// else -- but it is loud, because a server whose toucher never tightens to the
+	// configured staleness is a server writing accessed_at less often than its
+	// operator asked for, forever.
+	if err := gcEngine.LoadTouchRamp(ctx); err != nil {
+		log.Warn("could not read the gc touch-staleness ramp clock; staying at the ramped "+
+			"(24h) staleness guard for this process's lifetime", "error", err)
 	}
 
 	// M5: the OCI pull-through proxy. Credentials for the upstream registries are
@@ -320,11 +370,6 @@ func Boot(ctx context.Context, p BootParams) error {
 		grpc.MaxRecvMsgSize(grpcMaxMsgSize),
 		grpc.MaxSendMsgSize(grpcMaxMsgSize),
 	)
-
-	// Captured in a named var, not inlined into cacheBackends below, so boot can also
-	// hand its access-toucher loop (M6 spec 6.1's hashserv paragraph) a starting
-	// point beside blobs.StartAccessToucher.
-	hashservBackend := hashserv.New(cacheDeps, routes, hashservAuth{svc: authSvc}, store, upstreams)
 
 	cacheBackends := []cache.Backend{
 		httpblob.NewSstate(cacheDeps, routes, authn),
@@ -426,9 +471,44 @@ func Boot(ctx context.Context, p BootParams) error {
 	// context.WithoutCancel. It is bounded because a wedged pool must not hold the
 	// process open: the boot reaper covers a lost FinishGCRun, and a lost final flush
 	// costs one interval of read records.
-	waitForBackground(log, backgroundDrainTimeout, gcDone, touchDone, hashservTouchDone)
+	//
+	// AsyncDone is taken HERE, not earlier (R7#8): it snapshots the in-flight set as
+	// it stands, and no new API-triggered sweep can begin now that the public
+	// listener has drained. A channel taken at wiring time would have closed
+	// immediately, waiting for nothing.
+	waitForBackground(log, backgroundDrainTimeout,
+		gcDone, gcEngine.AsyncDone(), touchDone, hashservTouchDone)
 
 	return serveErr
+}
+
+// watchBootLock turns a lost boot lock into a shutdown (M: R7#2).
+//
+// BootLock's own contract makes this the caller's job: the watcher inside
+// internal/db can detect that another instance has taken the lock, but it cannot
+// decide what a server does about it, so it closes Lost() and stops. Everything
+// this process's correctness rests on -- the in-process route cache, the blob LRU,
+// the GC's claim that its pending-read set is complete -- is only true while it is
+// the sole writer, and past this point it is not. There is no degraded mode to fall
+// back to: the only safe action is to stop serving.
+//
+// It returns on ctx.Done() so an ordinary shutdown does not leave it behind, and it
+// is a no-op for a nil channel, which is what a --allow-multi-instance boot (no
+// lock, no watcher) hands it.
+func watchBootLock(ctx context.Context, lost <-chan struct{}, stop context.CancelFunc, log *slog.Logger) {
+	if lost == nil {
+		return
+	}
+
+	select {
+	case <-ctx.Done():
+		return
+	case <-lost:
+		log.Error("boot lock lost: another instance now holds it, so this process is no longer " +
+			"the sole writer and its route cache, object LRU and GC pending-read set are all " +
+			"stale. Shutting down.")
+		stop()
+	}
 }
 
 // backgroundDrainTimeout bounds the wait for the GC sweep and the access toucher to

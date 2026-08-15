@@ -142,16 +142,51 @@ CREATE TABLE cache_backend_usage (
 );
 
 -- ---------------------------------------------------------------------------
+-- gc_state: the touch-staleness ramp clock (spec §6.4)
+-- ---------------------------------------------------------------------------
+--
+-- A SINGLETON row (not a config knob per backend, not per-run): the fillfactor
+-- transition it governs is a property of the WHOLE cache_objects /
+-- hashserv_unihashes corpus's first-touch bloat, not of any one backend, so there
+-- is exactly one clock for the whole instance. The boolean primary key defaulting
+-- to `true`, guarded by a CHECK that it can never be anything else, is what makes
+-- "more than one row" a schema-level impossibility rather than a convention a
+-- future INSERT could violate.
+--
+-- touch_ramp_until is stamped from THIS MIGRATION's own now() + 7 days
+-- (spec §6.4): "T starts at 24h for the first 7 days after migration ... before
+-- tightening to 1h". This REPLACES the last-backend-wins permille proxy the
+-- pre-review-fix toucher used to approximate "how long since upgrade" -- that
+-- proxy had no real clock at all, just an ad-hoc fraction recomputed per backend
+-- (and clobbered by whichever backend's flush ran last). A real, one-time
+-- timestamp read from a real row is unambiguous, requires no coordination
+-- between backends, and needs no per-backend state. The toucher reads it once per
+-- flush tick via GetGCState and compares against now(); stage F4 removes the old
+-- proxy and wires the toucher to this column.
+CREATE TABLE gc_state (
+    id                bool PRIMARY KEY DEFAULT true,
+    touch_ramp_until  timestamptz NOT NULL,
+    CONSTRAINT gc_state_singleton CHECK (id)
+);
+
+INSERT INTO gc_state (touch_ramp_until) VALUES (now() + interval '7 days');
+
+-- ---------------------------------------------------------------------------
 -- gc_runs: trigger, dry_run, hashserv_rows_deleted
 -- ---------------------------------------------------------------------------
 
 ALTER TABLE gc_runs
-    -- Who started this run. Only two sources exist today (spec §9.1/§9.10): the
-    -- in-process interval loop, and POST /api/v1/gc/run. Neither the boot reaper
-    -- nor the shutdown finisher START a run, so neither needs a trigger value of
-    -- its own.
+    -- Who started this run. Three sources exist (spec §9.1/§9.10, extended by
+    -- finding R7#12): the in-process interval loop, POST /api/v1/gc/run, and the
+    -- lightweight --gc-usage-interval measurement pass (spec §8, findings 7b/13)
+    -- that MeasureUsage runs even with retention disabled. That pass mints its
+    -- own gc_runs row too -- an auditable, list-able record of "did the usage
+    -- gauges get refreshed" -- so its trigger value needs a THIRD name distinct
+    -- from an interval sweep or an API-triggered one. Neither the boot reaper nor
+    -- the shutdown finisher START a run, so neither needs a trigger value of its
+    -- own.
     ADD COLUMN trigger text NOT NULL DEFAULT 'interval'
-        CONSTRAINT gc_runs_trigger_known CHECK (trigger IN ('interval', 'api')),
+        CONSTRAINT gc_runs_trigger_known CHECK (trigger IN ('interval', 'api', 'usage')),
     -- A dry run writes this row (auditable, list-able) but performs no delete --
     -- every sweep query below has a read-only mirror. dry_run is frozen at start,
     -- same as grace_period, so it cannot flip mid-run.

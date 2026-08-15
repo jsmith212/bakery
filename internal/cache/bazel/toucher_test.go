@@ -9,6 +9,7 @@ import (
 	repb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -103,7 +104,13 @@ func newACFixture(t *testing.T, readAuthRequired bool) *acFixture {
 func (f *acFixture) putCASBlob(content string) string {
 	f.t.Helper()
 
-	data := []byte(content)
+	return f.putCASBytes([]byte(content))
+}
+
+// putCASBytes is putCASBlob for content that is not text -- a marshalled Tree.
+func (f *acFixture) putCASBytes(data []byte) string {
+	f.t.Helper()
+
 	key := storage.KeyOf(data)
 	ref := f.route.Ref(casNamespace, casKind, key.String())
 
@@ -169,18 +176,56 @@ func (f *acFixture) flushNow() {
 // digests' accessed_at fresh even though this test never reads them through any
 // other RPC -- exactly the --remote_download_minimal steady state the spec section
 // exists to cover.
+// TREE CONTENTS ARE THE CASE THIS EXISTS FOR. A tree output names ONE digest in the
+// ActionResult -- the Tree blob -- and the files it indexes are named only inside that
+// blob, which under --remote_download_minimal Bazel never fetches: it injectRemoteFiles
+// the contents straight out of the Tree's metadata. Touching the Tree alone would keep
+// the index hot and let everything it indexes age out, which is a build abort and
+// rewind rather than a miss.
 func TestACHitTouchesItsOutputs(t *testing.T) {
 	f := newACFixture(t, false) // ReadAuthRequired=false: GetActionResult needs no credential
 
+	const (
+		rootFileContent  = "a file at the root of the output tree"
+		childFileContent = "a file in a child directory of the output tree"
+	)
+
 	fileDigest := f.putCASBlob("output file contents")
-	treeDigest := f.putCASBlob("encoded Tree proto contents")
 	stdoutDigest := f.putCASBlob("stdout contents")
 	untouchedDigest := f.putCASBlob("never named by any ActionResult")
+
+	// The tree's own contents: reachable ONLY through the Tree blob's bytes.
+	rootFileDigest := f.putCASBlob(rootFileContent)
+	childFileDigest := f.putCASBlob(childFileContent)
+
+	child := &repb.Directory{
+		Files: []*repb.FileNode{
+			{Name: "child.txt", Digest: &repb.Digest{
+				Hash: childFileDigest, SizeBytes: int64(len(childFileContent)),
+			}, IsExecutable: false},
+		},
+	}
+
+	treeBytes, err := proto.Marshal(&repb.Tree{
+		Root: &repb.Directory{
+			Files: []*repb.FileNode{
+				{Name: "root.txt", Digest: &repb.Digest{
+					Hash: rootFileDigest, SizeBytes: int64(len(rootFileContent)),
+				}, IsExecutable: false},
+			},
+		},
+		Children: []*repb.Directory{child},
+	})
+	if err != nil {
+		t.Fatalf("marshal Tree: %v", err)
+	}
+
+	treeDigest := f.putCASBytes(treeBytes)
 
 	// Freshly Put blobs are unmarked: Put's LRU fill is UNSTAMPED (only a cold-read
 	// FILL or an LRU HIT stamps markedAt). This is the test's own sanity check that
 	// what follows is caused by GetActionResult, not by the seeding Put calls.
-	for _, d := range []string{fileDigest, treeDigest, stdoutDigest} {
+	for _, d := range []string{fileDigest, treeDigest, stdoutDigest, rootFileDigest, childFileDigest} {
 		if f.pendingCAS(d) {
 			t.Fatalf("PendingTouch(%q) = true before any ActionResult was read", d)
 		}
@@ -192,7 +237,9 @@ func TestACHitTouchesItsOutputs(t *testing.T) {
 			{Path: "out.bin", Digest: &repb.Digest{Hash: fileDigest, SizeBytes: 21}},
 		},
 		OutputDirectories: []*repb.OutputDirectory{
-			{Path: "outdir", TreeDigest: &repb.Digest{Hash: treeDigest, SizeBytes: 28}},
+			{Path: "outdir", TreeDigest: &repb.Digest{
+				Hash: treeDigest, SizeBytes: int64(len(treeBytes)),
+			}},
 		},
 		StdoutDigest: &repb.Digest{Hash: stdoutDigest, SizeBytes: 14},
 	}
@@ -206,8 +253,9 @@ func TestACHitTouchesItsOutputs(t *testing.T) {
 	}
 
 	// The HIT. Zero output reads: no BatchReadBlobs, no ByteStream.Read, on any of
-	// fileDigest/treeDigest/stdoutDigest -- GetActionResult alone is what must mark
-	// them.
+	// these digests -- GetActionResult alone is what must mark them. (It does read the
+	// Tree blob itself, internally and by design: that read is how the contents are
+	// discovered, and it is local, hot and best-effort.)
 	got, err := f.b.GetActionResult(context.Background(), &repb.GetActionResultRequest{
 		InstanceName: "acme/widget",
 		ActionDigest: &repb.Digest{Hash: storage.KeyOf([]byte("action-1")).String(), SizeBytes: 1},
@@ -221,8 +269,10 @@ func TestACHitTouchesItsOutputs(t *testing.T) {
 	}
 
 	// Marked IMMEDIATELY: the veto must answer true before any flush ever runs, or a
-	// sweep racing this RPC would delete outputs a HIT just named.
-	for _, d := range []string{fileDigest, treeDigest, stdoutDigest} {
+	// sweep racing this RPC would delete outputs a HIT just named. rootFileDigest and
+	// childFileDigest are named NOWHERE in the ActionResult -- only inside the Tree
+	// blob's bytes -- so they are the assertion that the touch descends.
+	for _, d := range []string{fileDigest, treeDigest, stdoutDigest, rootFileDigest, childFileDigest} {
 		if !f.pendingCAS(d) {
 			t.Errorf("PendingTouch(%q) = false after an ActionResult HIT named it", d)
 		}
@@ -237,7 +287,7 @@ func TestACHitTouchesItsOutputs(t *testing.T) {
 	// these rows instead of reaping them on created_at alone.
 	f.flushNow()
 
-	for _, d := range []string{fileDigest, treeDigest, stdoutDigest} {
+	for _, d := range []string{fileDigest, treeDigest, stdoutDigest, rootFileDigest, childFileDigest} {
 		ts, ok := f.accessedAt(d)
 		if !ok {
 			t.Fatalf("accessed_at row for %q vanished", d)

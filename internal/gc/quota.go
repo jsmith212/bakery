@@ -64,19 +64,20 @@ type stageUsage struct {
 }
 
 // usage is a backend's measured state after a sweep pass: what SURVIVED it.
+//
+// It carries no NULL-accessed_at counter any more (J: R6#7/R7#6/R8#5). One lived
+// here to drive the toucher's T ramp; the ramp now reads a real timestamp from
+// gc_state (Engine.LoadTouchRamp), and a per-backend fraction recomputed on every
+// publish was last-backend-wins and never converged on a mostly-cold corpus.
 type usage struct {
 	objects int64
 	bytes   int64
-
-	// nullAccessed counts rows that have never been touched. It feeds the toucher's
-	// T ramp (spec §6.4) -- see Engine.TouchStaleness.
-	nullAccessed int64
 
 	stages []stageUsage
 }
 
 func newUsage(stages int) *usage {
-	u := &usage{objects: 0, bytes: 0, nullAccessed: 0, stages: make([]stageUsage, stages)}
+	u := &usage{objects: 0, bytes: 0, stages: make([]stageUsage, stages)}
 
 	for i := range u.stages {
 		u.stages[i] = stageUsage{objects: 0, bytes: 0, bucketBytes: make([]int64, len(ageBuckets))}
@@ -94,10 +95,6 @@ func newUsage(stages int) *usage {
 func (u *usage) observe(stageIdx int, row repository.ScanObjectsForGCRow, now time.Time) {
 	u.objects++
 	u.bytes += row.SizeBytes
-
-	if !row.AccessedAt.Valid {
-		u.nullAccessed++
-	}
 
 	if stageIdx < 0 || stageIdx >= len(u.stages) {
 		return

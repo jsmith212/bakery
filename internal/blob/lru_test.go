@@ -118,6 +118,166 @@ func TestLRU_IsBounded(t *testing.T) {
 	}
 }
 
+// countMarked walks every shard and reports (entries actually carrying a mark, the sum
+// of the shards' own counters). They must agree.
+func (c *lruCache) countMarked() (actual, claimed int) {
+	for i := range c.shards {
+		s := &c.shards[i]
+
+		s.mu.Lock()
+
+		claimed += s.marked
+
+		for el := s.ll.Front(); el != nil; el = el.Next() {
+			if e, ok := el.Value.(*lruEntry); ok && e.markedAt != 0 {
+				actual++
+			}
+		}
+
+		s.mu.Unlock()
+	}
+
+	return actual, claimed
+}
+
+// THE MARK COUNTER MUST NOT DRIFT.
+//
+// collectMarks skips a shard whose counter reads zero and stops walking once it has
+// seen that many marks, which is what keeps the flusher off an O(capacity) walk of a
+// half-million-entry cache with the shard mutex held. That optimisation is only sound
+// while the counter is exact: an UNDERCOUNT silently abandons real marks -- a lost
+// accessed_at, then a row the sweep deletes as cold that a build read minutes ago --
+// and it drifts from the paths that are easy to forget, which is why this exercises
+// every one of them (stamp on hit, stamp on cold fill, clear on flush, eviction, del,
+// delBatch) rather than just the happy path.
+func TestLRU_MarkedCounterTracksEveryPath(t *testing.T) {
+	// Roomy enough that the first phases cannot evict (the removals must act on LIVE,
+	// marked entries), and small enough that the flood at the end certainly does.
+	const capacity = lruShards * 16
+
+	c := newLRU(metrics.New(), capacity)
+	c.nowNano = func() int64 { return 1 }
+
+	hit := Meta{Exists: true, Digest: Digest{9}, Size: 1, UpdatedAt: time.Time{}}
+	miss := Meta{Exists: false, Digest: Digest{}, Size: 0, UpdatedAt: time.Time{}}
+
+	keys := make([][]byte, 64)
+	for i := range keys {
+		keys[i] = fmt.Appendf(nil, "marked-key-%03d", i)
+	}
+
+	assert := func(step string) {
+		t.Helper()
+
+		actual, claimed := c.countMarked()
+		if actual != claimed {
+			t.Fatalf("after %s: %d entries carry a mark but the shard counters claim %d", step, actual, claimed)
+		}
+	}
+
+	// Stamped by a HIT (positive only), and by a cold POSITIVE fill.
+	for _, k := range keys {
+		c.put(k, hit)
+		c.get(k)
+	}
+
+	assert("hits")
+
+	for i, k := range keys {
+		if i%2 == 0 {
+			c.putIfUnchanged(k, hit, c.seq(k))
+		} else {
+			c.putIfUnchanged(k, miss, c.seq(k))
+		}
+	}
+
+	assert("cold fills")
+
+	// Cleared by a flush.
+	c.clearMarks(c.collectMarks(1, nil))
+	assert("clearMarks")
+
+	if actual, _ := c.countMarked(); actual != 0 {
+		t.Errorf("%d marks survived a flush that collected every one of them", actual)
+	}
+
+	// Re-marked, then REMOVED WHILE STILL MARKED -- which is the case each removal path
+	// has to account for, and the one an unlucky test misses by deleting keys that were
+	// already evicted.
+	// The odd keys were re-filled NEGATIVE above and a negative entry is never marked,
+	// so republish them positive first -- the subject here is the counter, not the
+	// Exists guard (TestLRU_NegativeEntriesAreNotMarked owns that).
+	for _, k := range keys {
+		c.put(k, hit)
+		c.get(k)
+	}
+
+	if actual, _ := c.countMarked(); actual != len(keys) {
+		t.Fatalf("%d entries carry a mark before the removals, want %d", actual, len(keys))
+	}
+
+	for _, k := range keys[:len(keys)/2] {
+		c.del(k)
+	}
+
+	assert("del")
+
+	batch := make([]string, 0, len(keys)/2)
+	for _, k := range keys[len(keys)/2:] {
+		batch = append(batch, string(k))
+	}
+
+	c.delBatch(batch)
+	assert("delBatch")
+
+	if _, claimed := c.countMarked(); claimed != 0 {
+		t.Fatalf("the shard counters claim %d marks after every marked entry was removed", claimed)
+	}
+
+	// Eviction: each shard holds capacity/lruShards entries, so this overflows all of
+	// them with marked entries, and every evicted mark must leave the counter with it.
+	for i := range 20 * capacity {
+		k := fmt.Appendf(nil, "flood-%04d", i)
+		c.put(k, hit)
+		c.get(k)
+	}
+
+	assert("eviction")
+
+	if actual, _ := c.countMarked(); actual == 0 {
+		t.Error("the eviction flood left no marks at all -- the step asserted nothing")
+	}
+}
+
+// A NEGATIVE ENTRY NAMES NO ROW, so it must never be marked (R8#4). On the first build
+// against an empty cache EVERY entry is negative, so a toucher that flushed them would
+// spend its entire first hour issuing UPDATEs guaranteed to match zero rows -- one
+// index probe per absent key, on the database the HEAD storm is already saturating.
+func TestLRU_NegativeEntriesAreNotMarked(t *testing.T) {
+	c := newLRU(metrics.New(), 1024)
+	c.nowNano = func() int64 { return 1 }
+
+	absent := []byte("1\x00\x00absent")
+	present := []byte("1\x00\x00present")
+
+	c.put(absent, Meta{Exists: false, Digest: Digest{}, Size: 0, UpdatedAt: time.Time{}})
+	c.put(present, Meta{Exists: true, Digest: Digest{1}, Size: 1, UpdatedAt: time.Time{}})
+
+	for range 5 {
+		c.get(absent)
+		c.get(present)
+	}
+
+	marks := c.collectMarks(1, nil)
+	if len(marks) != 1 {
+		t.Fatalf("collectMarks() returned %d marks, want 1 (the positive entry only)", len(marks))
+	}
+
+	if marks[0].ck != string(present) {
+		t.Errorf("collectMarks() marked %q, want the positive entry %q", marks[0].ck, present)
+	}
+}
+
 func TestLRU_ConcurrentAccessIsRaceFree(t *testing.T) {
 	c := newLRU(metrics.New(), 4096)
 

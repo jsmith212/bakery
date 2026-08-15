@@ -53,6 +53,10 @@ const coverageProbePages = 8
 // filters against them by run id. That pair IS the write barrier, and it is why a
 // build that began before this run and commits during it is spared.
 func (e *Engine) Run(ctx context.Context, trigger Trigger, dryRun bool) (Summary, error) {
+	if err := e.mayRun(); err != nil {
+		return Summary{}, err //nolint:exhaustruct // a refused run has no results
+	}
+
 	if !dryRun {
 		if !e.running.CompareAndSwap(false, true) {
 			return Summary{}, ErrAlreadyRunning //nolint:exhaustruct // a refused run has no results
@@ -83,14 +87,27 @@ func (e *Engine) Run(ctx context.Context, trigger Trigger, dryRun bool) (Summary
 // CompareAndSwap Run uses: the caller never observes a 202 that turns out to have
 // started nothing, and ErrAlreadyRunning renders 409 exactly as it does from Run.
 //
-// The sweep itself runs under context.WithoutCancel(ctx): the caller is an HTTP
-// handler whose request context dies with the response, on some servers the
-// instant this function returns, and a sweep tied to it would be cancelled before
-// its first chunk. If this process exits before an async sweep finishes, it leaves
-// its gc_runs row 'running' -- exactly the state the boot reaper
-// (MarkOrphanedGCRunsFailed / ReapOrphanedRuns) exists to clean up on next start,
-// the same as a sweep killed by a hard process exit ever would.
+// SO ARE THE DISABLED AND MULTI-INSTANCE REFUSALS (R7#1). Loop's refusal is not
+// the invariant it looks like: this method is reachable from an HTTP handler
+// without going through Loop at all, so before this gate an operator running
+// --allow-multi-instance could start by hand precisely the sweep the loop refuses
+// to schedule -- process-local LRU invalidation against another instance's cache,
+// a boot reaper that fails a live run, and a pending-touch veto that cannot see
+// the other instance's reads.
+//
+// The sweep itself runs under the ENGINE'S LIFETIME context, not the request's and
+// not context.WithoutCancel(request) (R7#8). The request's context dies with the
+// response -- on some servers the instant this function returns -- so it cannot
+// carry the sweep; WithoutCancel fixed that and broke shutdown, producing a sweep
+// nothing could cancel and nothing waited for, still deleting rows through a pool
+// that was closing. The lifetime context gives both: cancellable at shutdown,
+// deaf to the client hanging up. asyncDone() is how Boot waits for the terminal
+// FinishGCRun that cancellation triggers.
 func (e *Engine) TriggerAsync(ctx context.Context, trigger Trigger, dryRun bool) (int64, error) {
+	if err := e.mayRun(); err != nil {
+		return 0, err
+	}
+
 	if !dryRun {
 		if !e.running.CompareAndSwap(false, true) {
 			return 0, ErrAlreadyRunning
@@ -110,9 +127,13 @@ func (e *Engine) TriggerAsync(ctx context.Context, trigger Trigger, dryRun bool)
 		return 0, fmt.Errorf("start gc run: %w", err)
 	}
 
-	bg := context.WithoutCancel(ctx)
+	bg := e.lifetime
+
+	e.async.Add(1)
 
 	go func() {
+		defer e.async.Done()
+
 		if !dryRun {
 			defer e.running.Store(false)
 		}
@@ -125,6 +146,42 @@ func (e *Engine) TriggerAsync(ctx context.Context, trigger Trigger, dryRun bool)
 	}()
 
 	return run.ID, nil
+}
+
+// mayRun is the configuration gate both entry points share (R7#1): a sweep is
+// refused outright when GC is disabled or when this process cannot prove it is the
+// only writer. Keeping it in ONE place is the point -- two guards that could
+// disagree is how the loop came to refuse what the API happily started.
+func (e *Engine) mayRun() error {
+	switch {
+	case !e.cfg.Enabled:
+		return ErrDisabled
+	case e.cfg.AllowMultiInstance:
+		return ErrMultiInstance
+	default:
+		return nil
+	}
+}
+
+// AsyncDone reports when every detached (TriggerAsync) sweep has finished,
+// including the terminal gc_runs write each one makes under context.WithoutCancel
+// after the lifetime context is cancelled.
+//
+// CALL IT AFTER THE LISTENERS HAVE DRAINED, never before: it snapshots the wait
+// group as it stands, so a channel taken while nothing is in flight closes
+// immediately and would wait for nothing at all. Boot takes it once its
+// server.Run has returned, which is the point after which no new HTTP request can
+// trigger one.
+func (e *Engine) AsyncDone() <-chan struct{} {
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		e.async.Wait()
+	}()
+
+	return done
 }
 
 // runFrom drives an ALREADY-STARTED run's sweep through to a terminal gc_runs
@@ -235,6 +292,10 @@ func (e *Engine) sweep(ctx context.Context, run repository.StartGCRunRow, sum *S
 	now := run.StartedAt.Time
 
 	// STAGES 1-2 -- hashserv, THE GC ROOT, before anything that is reachable from it.
+	if err := e.flushUnihashMarks(ctx, sum.DryRun); err != nil {
+		return err
+	}
+
 	for _, p := range plans {
 		if p.kind != repository.BackendKindHashserv {
 			continue
@@ -260,6 +321,10 @@ func (e *Engine) sweep(ctx context.Context, run repository.StartGCRunRow, sum *S
 		e.republishCached(plans)
 	}
 
+	if err := e.flushAccessMarks(ctx, sum.DryRun); err != nil {
+		return err
+	}
+
 	for _, p := range plans {
 		if err := e.sweepBackend(ctx, run.ID, now, p, sum); err != nil {
 			return err
@@ -279,6 +344,84 @@ func (e *Engine) sweep(ctx context.Context, run repository.StartGCRunRow, sum *S
 	}
 
 	return e.publishPhysical(ctx)
+}
+
+// flushUnihashMarks is §6.2 mechanism 1 for the GC ROOT, and it runs IMMEDIATELY
+// BEFORE STAGE 1 (A: R6#1/R7#3).
+//
+// WHY BEFORE, AND WHAT WINDOW IS LEFT. hashserv marks a unihash read in memory and
+// writes accessed_at at most once per T (--gc-touch-staleness, 1h steady, 24h
+// ramped); until that write lands, SweepUnihashes' `coalesce(accessed_at,
+// created_at)` sees only the OLD value, so a unihash a build read minutes ago is
+// selected as ninety days cold -- and deleting it is not a cache miss, it is the
+// GC root going away under the sstate objects it names. Stage 1 is a single
+// self-contained SQL DELETE: there is no Go-side pass over its candidate rows, so
+// the per-chunk PendingTouch veto that protects the cache_objects stages has no
+// equivalent here and cannot be given one without reading every candidate back
+// into Go. Forcing the flush first replaces an up-to-T exposure with one bounded
+// by the STAGE'S OWN DURATION: a mark that arrives after this returns and before
+// the DELETE commits is still invisible. That residual is seconds to minutes
+// against windows of ninety days, and it is the same shape the spec accepts for
+// the cache_objects stages.
+//
+// A FAILURE FAILS THE RUN. It is a database error like any other, and the
+// alternative -- sweep anyway -- is precisely "delete the GC root on the strength
+// of a read record we know we did not write".
+//
+// A DRY RUN FLUSHES NOTHING: it is genuinely read-only (spec §9.7), and
+// accessed_at is a write. Its counts are therefore computed against the same
+// slightly-stale accessed_at a sweep would have seen without this mechanism, which
+// is the conservative direction for a report (it over-reports what would be
+// deleted, never under-reports what would survive).
+func (e *Engine) flushUnihashMarks(ctx context.Context, dryRun bool) error {
+	if dryRun || e.unihash == nil {
+		return nil
+	}
+
+	stmtCtx, cancel := chunkCtx(ctx)
+	defer cancel()
+
+	rows, err := e.unihash.FlushNow(stmtCtx)
+	if err != nil {
+		return fmt.Errorf("pre-sweep unihash accessed_at flush: %w", err)
+	}
+
+	if rows > 0 {
+		e.log.InfoContext(ctx, "flushed pending unihash reads before the hashserv sweep",
+			slog.Int64("rows", rows))
+	}
+
+	return nil
+}
+
+// flushAccessMarks is flushUnihashMarks' cache_objects twin and runs ONCE per run,
+// immediately before the first cache_objects stage.
+//
+// Once per run, not once per stage: the flusher's unit is the whole pending set,
+// not a namespace, so a second call a stage later would find whatever arrived in
+// between -- exactly the residual window this cannot close -- at the cost of a
+// round trip per stage per backend. The per-chunk PendingTouch veto (§6.2
+// mechanism 2) is what covers that residual on this side, which is why the
+// cache_objects stages can afford one flush where stage 1 could not.
+func (e *Engine) flushAccessMarks(ctx context.Context, dryRun bool) error {
+	if dryRun || e.access == nil {
+		return nil
+	}
+
+	stmtCtx, cancel := chunkCtx(ctx)
+	defer cancel()
+
+	rows, err := e.access.FlushAccessNow(stmtCtx)
+	if err != nil {
+		return fmt.Errorf("pre-sweep accessed_at flush: %w", err)
+	}
+
+	if rows > 0 {
+		e.log.InfoContext(ctx, "flushed pending object reads before the retention stages",
+			slog.Int64("rows", rows))
+	}
+
+	return nil
 }
 
 // sweepHashserv runs stages 1 and 2: the unihash root, then the orphaned outhashes
@@ -372,22 +515,39 @@ func (e *Engine) sweepBackend(
 		sum.BackendsRefused++
 		e.rec.SstateCoverage(p.org, p.project, 0)
 
+		// A REFUSED BACKEND MUST NOT VANISH FROM THE GAUGES (P: R6#8). The reset above
+		// dropped every storage series; republishCached deliberately skipped this
+		// backend because a managed backend with stages is one the sweep was ABOUT to
+		// measure. Returning here without republishing makes a broken-derivation sstate
+		// backend disappear from bakery_storage_objects/_bytes until the next
+		// --gc-usage-interval pass -- so the one backend whose retention has visibly
+		// stopped working is also the one whose size nobody can see.
+		e.republishOne(p)
+
 		return nil
 	}
 
 	u := newUsage(len(p.stages))
 	cov := coverage{scanned: 0, resolved: 0}
 
-	// tagDigests is stage 8's anti-join, built by stage 7 as it runs: every tag that
-	// SURVIVED the tag sweep protects the manifest it names. It is a Go-side join
-	// rather than the SQL NOT EXISTS because a manifest must be deleted through
-	// blob.Service.DeleteBatch -- manifests are read through the LRU (oci.serveManifest
-	// goes through Blobs.Get), so a raw SQL delete would leave a positive cache entry
-	// for an object that no longer exists.
-	tagDigests := map[string]struct{}{}
-
 	for i, st := range p.stages {
-		decide := e.deciderFor(&p, st, now, &cov, tagDigests)
+		// STAGE 8 DELETES IN SQL, BEFORE ITS ACCOUNTING SCAN (E: R6#4/R7#9). The
+		// tag/manifest anti-join and the write barrier are evaluated together, at delete
+		// time, by SweepUnreferencedManifests; the scan that follows then measures what
+		// actually survived rather than what a Go-side join predicted.
+		// p.hasWindow GUARDS THE RETENTION FLAVOR: with no configured window the
+		// stage window is 0, which would reach SQL as `< now()` and delete every
+		// untagged manifest -- NULL means retain forever, here as everywhere. The
+		// quota flavor (evictToQuota -> evictManifests) deliberately has no such
+		// guard: a cap is a cap. This managed()-but-windowless shape is real: an
+		// OCI backend with quota_bytes set and retention_window NULL.
+		if st.namespace == nsManifests && p.hasWindow {
+			if err := e.sweepManifests(ctx, runID, &p, st.window, metrics.GCReasonRetention, sum); err != nil {
+				return err
+			}
+		}
+
+		decide := e.deciderFor(&p, st, now, &cov)
 
 		if err := e.runStage(ctx, runID, &p, st, i, now, decide, u, sum); err != nil {
 			return err
@@ -410,15 +570,20 @@ type decider func(ctx context.Context, rows []repository.ScanObjectsForGCRow) ([
 
 // deciderFor builds a stage's retention rule. Each is spec §3's third predicate --
 // the write barrier's two halves are already applied by ScanObjectsForGC.
-func (e *Engine) deciderFor(
-	p *backendPlan, st stage, now time.Time, cov *coverage, tagDigests map[string]struct{},
-) decider {
+func (e *Engine) deciderFor(p *backendPlan, st stage, now time.Time, cov *coverage) decider {
 	cutoff := now.Add(-st.window)
 	live := st.window > 0 && p.hasWindow
 
 	switch {
 	case p.kind == repository.BackendKindSstate:
-		return e.sstateDecider(p, cutoff, live, cov)
+		// SPEC §5'S CONJUNCTIVE RULE: dead iff the window elapsed AND no surviving
+		// unihash names it. The reachability half is a page-level probe, so it is
+		// composed rather than inlined -- quota eviction ANDs the SAME half against a
+		// different age rule (R6#9), and two copies of "is this object reachable" is
+		// exactly how the two would come to disagree.
+		return conjunction(e.sstateUnreachable(p, cov), func(row repository.ScanObjectsForGCRow) bool {
+			return live && livenessOf(row).Before(cutoff)
+		})
 
 	case st.namespace == nsAC, st.namespace == nsACGRPC, st.namespace == nsSccache:
 		// greatest(created_at, coalesce(accessed_at, created_at)): the /ac namespaces
@@ -433,30 +598,18 @@ func (e *Engine) deciderFor(
 		// updated_at, not accessed_at: the stale-while-revalidate refresh already
 		// maintains it, and tags deliberately bypass the LRU in both directions, so
 		// accessed_at on a tag is always NULL and would be a second, disagreeing answer.
-		return func(_ context.Context, rows []repository.ScanObjectsForGCRow) ([]bool, error) {
-			mask := make([]bool, len(rows))
-
-			for i, row := range rows {
-				mask[i] = live && row.UpdatedAt.Time.Before(cutoff)
-
-				if !mask[i] {
-					tagDigests[string(row.Digest)] = struct{}{}
-				}
-			}
-
-			return mask, nil
-		}
+		return rowRule(func(row repository.ScanObjectsForGCRow) bool {
+			return live && row.UpdatedAt.Time.Before(cutoff)
+		})
 
 	case st.namespace == nsManifests:
-		return rowRule(func(row repository.ScanObjectsForGCRow) bool {
-			if !live || !livenessOf(row).Before(cutoff) {
-				return false
-			}
-
-			_, tagged := tagDigests[string(row.Digest)]
-
-			return !tagged
-		})
+		// ACCOUNTING ONLY (E: R6#4/R7#9). Stage 8's deletions are SweepUnreferencedManifests'
+		// alone: the anti-join has to see the tags namespace as it stands at DELETE time,
+		// and a Go-side decider can only see it as it stood when the tags stage scanned
+		// past. This pass runs AFTER that statement, so every row it sees is a survivor
+		// and the mask is uniformly false -- it exists to fill the usage counters and the
+		// quota histogram, nothing else.
+		return rowRule(func(_ repository.ScanObjectsForGCRow) bool { return false })
 
 	default:
 		return rowRule(func(row repository.ScanObjectsForGCRow) bool {
@@ -477,14 +630,38 @@ func rowRule(fn rule) decider {
 	}
 }
 
-// sstateDecider is spec §5's conjunctive rule: dead iff the window elapsed AND no
-// surviving unihash on the paired hashserv backend names it.
+// conjunction ANDs a page-level mask with a per-row rule, in that order: the mask
+// is computed first (it may cost a round trip), the rule is free.
+//
+// It is what keeps "is this row still reachable" a SINGLE implementation shared by
+// the retention rule and the quota rule (R6#9). A cap ignores the retention window
+// -- a cap is a cap -- but it must not ignore reachability: evicting an sstate
+// object whose unihash is alive, or a manifest a tag names, is not shedding cold
+// data, it is breaking a live build to make room.
+func conjunction(mask decider, fn rule) decider {
+	return func(ctx context.Context, rows []repository.ScanObjectsForGCRow) ([]bool, error) {
+		out, err := mask(ctx, rows)
+		if err != nil {
+			return nil, err
+		}
+
+		for i, row := range rows {
+			out[i] = out[i] && fn(row)
+		}
+
+		return out, nil
+	}
+}
+
+// sstateUnreachable is spec §5's reachability half, on its own: true for a row that
+// NO surviving unihash on the paired hashserv backend names.
 //
 // An unparseable key resolves to no unihash and is therefore UNREACHABLE -- it dies
-// on age alone. That is only safe because the rule is conjunctive: a swspec object
-// (do_populate_lic, empty arch fields) is legal and common, and treating it as
-// immediately deletable rather than merely age-eligible would delete a live cache.
-func (e *Engine) sstateDecider(p *backendPlan, cutoff time.Time, live bool, cov *coverage) decider {
+// on age alone. That is only safe because every caller ANDs this with an age rule:
+// a swspec object (do_populate_lic, empty arch fields) is legal and common, and
+// treating it as immediately deletable rather than merely age-eligible would delete
+// a live cache.
+func (e *Engine) sstateUnreachable(p *backendPlan, cov *coverage) decider {
 	return func(ctx context.Context, rows []repository.ScanObjectsForGCRow) ([]bool, error) {
 		mask := make([]bool, len(rows))
 		derived := make([]string, len(rows))
@@ -528,14 +705,14 @@ func (e *Engine) sstateDecider(p *backendPlan, cutoff time.Time, live bool, cov 
 
 		cov.scanned += int64(len(rows))
 
-		for i, row := range rows {
+		for i := range rows {
 			_, reachable := alive[derived[i]]
 
 			if derived[i] != "" && reachable {
 				cov.resolved++
 			}
 
-			mask[i] = live && !reachable && livenessOf(row).Before(cutoff)
+			mask[i] = !reachable
 		}
 
 		return mask, nil
@@ -569,7 +746,7 @@ func (e *Engine) sstateRefused(ctx context.Context, runID int64, p *backendPlan)
 	}
 
 	probe := coverage{scanned: 0, resolved: 0}
-	decide := e.sstateDecider(p, time.Time{}, false, &probe)
+	decide := e.sstateUnreachable(p, &probe)
 	afterKey := ""
 
 	for range coverageProbePages {
@@ -661,7 +838,7 @@ func (e *Engine) runStage(
 		if len(page) > 0 {
 			afterKey = page[len(page)-1].Key
 
-			if err := e.processPage(ctx, p, st, index, now, decide, page, u, sum); err != nil {
+			if err := e.processPage(ctx, runID, p, st, index, now, decide, page, u, sum); err != nil {
 				return err
 			}
 		}
@@ -679,6 +856,7 @@ func (e *Engine) runStage(
 // processPage decides, vetoes, deletes and accounts one page.
 func (e *Engine) processPage(
 	ctx context.Context,
+	runID int64,
 	p *backendPlan,
 	st stage,
 	index int,
@@ -723,7 +901,7 @@ func (e *Engine) processPage(
 	}
 
 	stmtCtx, cancel := chunkCtx(ctx)
-	n, err := e.blobs.DeleteBatch(stmtCtx, batch)
+	n, err := e.blobs.DeleteBatch(stmtCtx, runID, batch)
 
 	cancel()
 
@@ -781,8 +959,87 @@ func (e *Engine) scan(
 	return rows, nil
 }
 
+// sweepManifests is stage 8's deletion, and the ONLY thing that deletes a manifest
+// (E: R6#4/R7#9, R6#9).
+//
+// One statement does the write barrier, the age rule and the tag anti-join, all
+// evaluated against the corpus AS IT STANDS WHEN THE DELETE RUNS. The Go-side
+// tagDigests set it replaces was assembled while the TAGS stage scanned, pages
+// earlier: it answered "was this digest tagged a moment ago", and a `docker pull`
+// that writes or revalidates a tag in the gap -- the ordinary case, since SWR
+// revalidation writes tags continuously -- left a live tag naming a manifest the
+// sweep had already condemned.
+//
+// window is the stage's effective W for the retention pass and the eviction
+// histogram's cutoff for the quota pass; a zero window means "every unreferenced
+// manifest", which is what a fully-evicted stage asks for. reason is what the
+// deletion is attributed to.
+//
+// THE LRU INVALIDATION IS NOT OPTIONAL. Manifests are served through blob.Get, so
+// a surviving positive entry answers "present" for a row that no longer exists,
+// and the byte reap then turns that into a permanent dangling-metadata 500. The
+// keys come back from the statement precisely so this can happen.
+func (e *Engine) sweepManifests(
+	ctx context.Context,
+	runID int64,
+	p *backendPlan,
+	window time.Duration,
+	reason metrics.GCReason,
+	sum *Summary,
+) error {
+	if window < 0 {
+		return nil
+	}
+
+	stmtCtx, cancel := chunkCtx(ctx)
+	defer cancel()
+
+	if sum.DryRun {
+		n, err := e.db.DryRunSweepUnreferencedManifests(stmtCtx,
+			repository.DryRunSweepUnreferencedManifestsParams{
+				BackendID: p.id, RetentionWindow: interval(window), RunID: runID,
+			})
+		if err != nil {
+			return fmt.Errorf("dry-run sweep manifests for backend %d: %w", p.id, err)
+		}
+
+		sum.ObjectsDeleted += n
+		e.rec.ObjectsDeleted(p.backend, nsManifests, reason, n)
+
+		return nil
+	}
+
+	keys, err := e.db.SweepUnreferencedManifests(stmtCtx, repository.SweepUnreferencedManifestsParams{
+		BackendID: p.id, RetentionWindow: interval(window), RunID: runID,
+	})
+	if err != nil {
+		return fmt.Errorf("sweep manifests for backend %d: %w", p.id, err)
+	}
+
+	if len(keys) == 0 {
+		return nil
+	}
+
+	e.blobs.InvalidateKeys(p.id, nsManifests, keys)
+
+	sum.ObjectsDeleted += int64(len(keys))
+	e.rec.ObjectsDeleted(p.backend, nsManifests, reason, int64(len(keys)))
+
+	e.log.InfoContext(ctx, "swept unreferenced manifests",
+		slog.String("org", p.org), slog.String("project", p.project),
+		slog.Int("manifests", len(keys)), slog.String("reason", string(reason)))
+
+	return nil
+}
+
 // evictToQuota is quota-pressure eviction, and it runs INSIDE the staged pass: the
 // same stage order, exhausting each stage's candidates before touching its successor.
+//
+// IT IGNORES THE RETENTION WINDOW AND NOTHING ELSE (R6#9). A cap is a cap, so age
+// alone decides WHICH rows go -- but the stage's own REACHABILITY rule still
+// applies, composed in below: an sstate object whose unihash is alive and a
+// manifest a tag names are not cold data to shed, they are the live cache. The
+// eviction plan's histogram cutoff simply takes the place of the window.
 func (e *Engine) evictToQuota(
 	ctx context.Context, runID int64, now time.Time, p *backendPlan, u *usage, sum *Summary,
 ) error {
@@ -796,14 +1053,37 @@ func (e *Engine) evictToQuota(
 		slog.Int64("bytes", u.bytes), slog.Int64("quota", p.quota), slog.Bool("dry_run", sum.DryRun))
 
 	evicted := newUsage(len(p.stages))
+	probe := coverage{scanned: 0, resolved: 0}
 
 	for i, st := range p.stages {
 		quotaStage := st
 		quotaStage.reason = metrics.GCReasonQuota
 
-		decide := rowRule(func(row repository.ScanObjectsForGCRow) bool {
-			return plan.doomed(i, row, now)
-		})
+		age := func(row repository.ScanObjectsForGCRow) bool { return plan.doomed(i, row, now) }
+
+		var decide decider
+
+		switch {
+		case p.kind == repository.BackendKindSstate:
+			// The reachability half is the SAME probe the retention pass uses; only the
+			// age half is replaced. probe's coverage counters are thrown away here: the
+			// gauge an operator reads is the retention pass's, over the whole scan.
+			decide = conjunction(e.sstateUnreachable(p, &probe), age)
+
+		case st.namespace == nsManifests:
+			// The anti-join cannot be expressed as a Go-side row rule at all, so quota
+			// eviction of manifests goes through the SAME statement retention does, with
+			// the histogram cutoff standing in for the window (R6#9). A fully-evicted
+			// stage passes a zero window, which selects every unreferenced manifest.
+			if err := e.evictManifests(ctx, runID, p, plan, i, sum); err != nil {
+				return err
+			}
+
+			decide = rowRule(func(_ repository.ScanObjectsForGCRow) bool { return false })
+
+		default:
+			decide = rowRule(age)
+		}
 
 		if err := e.runStage(ctx, runID, p, quotaStage, i, now, decide, evicted, sum); err != nil {
 			return err
@@ -830,7 +1110,6 @@ func (e *Engine) publishUsage(ctx context.Context, p backendPlan, u *usage, dryR
 	at := time.Now()
 
 	e.rec.Usage(p.org, p.project, p.backend, u.objects, u.bytes, p.quota, at)
-	e.noteTouchRamp(u)
 
 	e.measuredMu.Lock()
 	e.lastUsage[p.id] = snapshot{objects: u.objects, bytes: u.bytes, at: at}
@@ -851,6 +1130,45 @@ func (e *Engine) publishUsage(ctx context.Context, p backendPlan, u *usage, dryR
 	e.measuredMu.Lock()
 	e.measured[p.id] = time.Now()
 	e.measuredMu.Unlock()
+}
+
+// evictManifests translates one eviction plan into stage 8's window.
+//
+// A stage the plan takes ENTIRELY gets a zero window (every unreferenced manifest,
+// regardless of age); the one PARTIAL stage gets the histogram's cutoff, which is
+// exactly the age at which the plan stops freeing; a stage the plan does not reach
+// is left alone. The tag anti-join is the statement's own, so this cannot evict a
+// manifest a live tag names no matter how far the plan reaches.
+func (e *Engine) evictManifests(
+	ctx context.Context,
+	runID int64,
+	p *backendPlan,
+	plan evictionPlan,
+	index int,
+	sum *Summary,
+) error {
+	switch {
+	case index < plan.fullStages:
+		return e.sweepManifests(ctx, runID, p, 0, metrics.GCReasonQuota, sum)
+	case index == plan.partial:
+		return e.sweepManifests(ctx, runID, p, plan.minAge, metrics.GCReasonQuota, sum)
+	default:
+		return nil
+	}
+}
+
+// republishOne re-publishes one backend's last known measurement after the gauge
+// reset, for a backend this pass will not measure.
+func (e *Engine) republishOne(p backendPlan) {
+	e.measuredMu.Lock()
+	defer e.measuredMu.Unlock()
+
+	snap, ok := e.lastUsage[p.id]
+	if !ok {
+		return
+	}
+
+	e.rec.Usage(p.org, p.project, p.backend, snap.objects, snap.bytes, p.quota, snap.at)
 }
 
 // republishCached re-publishes the last known usage of every backend this pass will

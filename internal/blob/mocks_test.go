@@ -257,6 +257,14 @@ func (f *fakeDBTX) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 		f.onExec(sql)
 	}
 
+	// The ABBA pre-lock is recorded (so a test can assert it ran, and in what order)
+	// but never consumes an entry from errs: the injected queue models the outcomes of
+	// the statement under test -- the DELETE, the UPDATE -- and a pre-lock silently
+	// eating a test's injected deadlock would make the retry gates assert nothing.
+	if strings.Contains(sql, "name: LockBlobDigests") {
+		return pgconn.NewCommandTag("SELECT 0"), nil
+	}
+
 	if len(f.errs) > 0 {
 		err := f.errs[0]
 		f.errs = f.errs[1:]

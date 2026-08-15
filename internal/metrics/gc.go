@@ -33,19 +33,20 @@ const (
 // what it says. A coverage of 0 on a backend whose paired hashserv holds rows is
 // the shape that makes the engine refuse to sweep at all.
 type gcCollectors struct {
-	runs           *prometheus.CounterVec // {status,trigger}
-	runDuration    prometheus.Histogram
-	lastRun        prometheus.Gauge
-	objectsDeleted *prometheus.CounterVec // {backend,namespace,reason}
-	blobsMarked    prometheus.Counter
-	blobsDeleted   prometheus.Counter
-	bytesReclaimed prometheus.Counter
-	pendingBacklog prometheus.Gauge
-	sstateCoverage *prometheus.GaugeVec // {org,project}
-	usageMeasured  *prometheus.GaugeVec // {org,project,backend}
-	quotaRatio     *prometheus.GaugeVec // {org,project,backend}
-	physicalBytes  prometheus.Gauge
-	touchFlushRows prometheus.Counter
+	runs            *prometheus.CounterVec // {status,trigger}
+	runDuration     prometheus.Histogram
+	lastRun         prometheus.Gauge
+	objectsDeleted  *prometheus.CounterVec // {backend,namespace,reason}
+	blobsMarked     prometheus.Counter
+	blobsDeleted    prometheus.Counter
+	bytesReclaimed  prometheus.Counter
+	pendingBacklog  prometheus.Gauge
+	sstateCoverage  *prometheus.GaugeVec // {org,project}
+	usageMeasured   *prometheus.GaugeVec // {org,project,backend}
+	quotaRatio      *prometheus.GaugeVec // {org,project,backend}
+	physicalBytes   prometheus.Gauge
+	touchFlushRows  prometheus.Counter
+	touchAuxDropped prometheus.Counter
 }
 
 // gcRunBuckets span a sweep, which is minutes rather than milliseconds: at the
@@ -103,12 +104,26 @@ func newGCCollectors(f promauto.Factory) gcCollectors {
 				"counter shows: a durable pending_delete row is re-driven forever.",
 		}),
 
+		// ONLY ZERO IS ACTIONABLE, and the help text has to say so (V: R6#15). The
+		// number falls for entirely healthy reasons: hashserv sweeps BEFORE sstate
+		// (stage 1 before stage 3), so every unihash this run retired leaves its sstate
+		// objects unresolved in the same run -- a cache with a normal amount of aged-out
+		// history sits well below 1.0 and belongs there. An alert on "coverage dropped"
+		// or "coverage < 0.9" therefore fires on ordinary ageing. Zero is different in
+		// kind: combined with a paired hashserv backend that holds rows, it is the shape
+		// that means the DERIVATION broke, and it is the shape the engine refuses to
+		// sweep on (spec §5).
 		sstateCoverage: f.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "bakery_gc_sstate_unihash_coverage",
 			Help: "Fraction of scanned sstate keys whose unihash resolved to a surviving " +
-				"row on the paired hashserv backend. Zero means the retention policy has " +
-				"silently collapsed to age-only -- correct for a deployment with no " +
-				"hashserv data, and a broken derivation otherwise.",
+				"row on the paired hashserv backend. ALERT ON EXACTLY 0, never on a " +
+				"threshold: healthy ageing lowers this every run (hashserv is swept " +
+				"before sstate, so a retired unihash leaves its objects unresolved), so " +
+				"only 0 is actionable. 0 with no hashserv data at all is correct and " +
+				"expected (an rsync'd mirror, BB_HASHSERVE=auto); 0 while the paired " +
+				"hashserv backend holds rows means the derivation broke, and the sweep " +
+				"refuses that backend rather than deleting a live cache on age alone " +
+				"(see bakery_gc_runs_total and the run's log line).",
 		}, []string{"org", "project"}),
 
 		usageMeasured: f.NewGaugeVec(prometheus.GaugeOpts{
@@ -131,15 +146,27 @@ func newGCCollectors(f promauto.Factory) gcCollectors {
 				"on for disk.",
 		}),
 
-		// UNWIRED (see TouchFlushRows' doc): registered now so the series exists at
-		// boot and the smoke test covers its shape, but nothing increments it yet --
-		// blob.Service.StartAccessToucher discards flushAccess's row count and the
-		// hashserv toucher has no hook either. A permanently-zero series here would be
-		// a lie if it claimed to measure anything; it does not yet.
 		touchFlushRows: f.NewCounter(prometheus.CounterOpts{
 			Name: "bakery_gc_touch_flush_rows_total",
 			Help: "accessed_at rows written by the F/T-ramped toucher flushers " +
-				"(cache_objects and hashserv_unihashes combined). Spec §6.1/§9.9.",
+				"(cache_objects and hashserv_unihashes combined). Spec §6.1/§9.9. " +
+				"A toucher that runs but never writes -- a broken staleness ramp, a " +
+				"mark set that is always empty -- is indistinguishable from a healthy " +
+				"one in every other series here.",
+		}),
+
+		// The aux map is the ONE pending set not bounded by the LRU's capacity (spec
+		// 6.3), so it carries its own per-shard cap and drops marks past it. A drop is
+		// survivable -- the worst case is a missed touch, with W_cas = 2 x W_ac
+		// underneath -- but it is not nothing: the rows it drops age out on created_at
+		// alone, which is exactly the "hot AC, cold CAS" failure §6.3 exists to close.
+		// Unmeasured, that degradation is invisible; this is the series that shows it.
+		touchAuxDropped: f.NewCounter(prometheus.CounterOpts{
+			Name: "bakery_gc_touch_aux_dropped_total",
+			Help: "Reachability marks (GetActionResult output digests) dropped because " +
+				"an aux pending shard was full. Nonzero means AC hits are naming CAS " +
+				"blobs faster than the flusher retires them, and those blobs are ageing " +
+				"on created_at alone.",
 		}),
 	}
 }
@@ -234,14 +261,25 @@ func (r *GCRecorder) ResetUsage() {
 // PhysicalBytes publishes the instance-wide live byte count.
 func (r *GCRecorder) PhysicalBytes(n int64) { r.m.gc.physicalBytes.Set(float64(n)) }
 
-// TouchFlushRows records one flusher tick's row count. NOT YET CALLED anywhere:
-// see gcCollectors.touchFlushRows' doc for what is owed before this fires for
-// real. It exists now so the wiring is a one-line call at the flush site rather
-// than a new series to design under time pressure later.
+// TouchFlushRows records one flusher tick's row count. Called by
+// blob.Service.flushAccess on every tick, including the failing ones (the rows a
+// partial flush already committed are written rows).
 func (r *GCRecorder) TouchFlushRows(n int64) {
 	if n <= 0 {
 		return
 	}
 
 	r.m.gc.touchFlushRows.Add(float64(n))
+}
+
+// TouchAuxDropped records reachability marks lost to a full aux shard. Called by
+// blob.Service.MarkAccessed, which is one insert per ActionResult output on a
+// GetActionResult hit -- not a hot path, but not a rare one either, so the recorder
+// takes a count rather than assuming one per call.
+func (r *GCRecorder) TouchAuxDropped(n int64) {
+	if n <= 0 {
+		return
+	}
+
+	r.m.gc.touchAuxDropped.Add(float64(n))
 }

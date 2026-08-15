@@ -34,6 +34,7 @@ type touchFixture struct {
 	route cache.Route
 	b     *Backend
 	srv   *httptest.Server
+	m     *metrics.Metrics
 }
 
 func newTouchFixture(t *testing.T) *touchFixture {
@@ -69,7 +70,8 @@ func newTouchFixture(t *testing.T) *touchFixture {
 		Enabled: true, ReadAuthRequired: true, Config: []byte(`{}`),
 	}
 
-	deps := cache.Deps{Blobs: &blob.Service{}, Metrics: metrics.New(), Logger: discardLogger()}
+	m := metrics.New()
+	deps := cache.Deps{Blobs: &blob.Service{}, Metrics: m, Logger: discardLogger()}
 
 	authn := fakeAuthenticator{
 		writeToken: {read: true, write: true},
@@ -87,7 +89,7 @@ func newTouchFixture(t *testing.T) *touchFixture {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	return &touchFixture{t: t, pool: pool, route: route, b: b, srv: srv}
+	return &touchFixture{t: t, pool: pool, route: route, b: b, srv: srv, m: m}
 }
 
 func (f *touchFixture) dial() *rawClient {
@@ -396,5 +398,240 @@ func TestHashservTouchFlushIsCoalesced(t *testing.T) {
 
 	if f.row(taskhash1).accessedAt.Time.IsZero() {
 		t.Error("accessed_at was never written by the eventual all=true flush")
+	}
+}
+
+// touchFlushRowsTotal reads bakery_gc_touch_flush_rows_total straight off the
+// registry, the same way internal/metrics' own tests do -- there is no exported
+// counter-reading API, and prometheus/client_golang's testutil is not a dependency
+// this package otherwise needs.
+func touchFlushRowsTotal(t *testing.T, m *metrics.Metrics) float64 {
+	t.Helper()
+
+	families, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+
+	for _, fam := range families {
+		if fam.GetName() != "bakery_gc_touch_flush_rows_total" {
+			continue
+		}
+
+		var total float64
+
+		for _, met := range fam.GetMetric() {
+			total += met.GetCounter().GetValue()
+		}
+
+		return total
+	}
+
+	return 0
+}
+
+// R8#2(a): unihashToucher.marks is capped, and a mark refused past the cap costs
+// exactly a touch -- never a wrong delete, and never an unbounded map. This is a pure
+// in-memory test: no DB and no Backend, because mark()/droppedMarks() touch neither.
+func TestUnihashToucherMarksCapDropsAndCounts(t *testing.T) {
+	t.Parallel()
+
+	tc := newUnihashToucher(nil, nil)
+
+	for i := range unihashMarksCap {
+		tc.mark(1, testMethod, taskhashOf(i))
+	}
+
+	if got := len(tc.marks); got != unihashMarksCap {
+		t.Fatalf("len(marks) = %d, want %d (the cap should be exactly full)", got, unihashMarksCap)
+	}
+
+	if got := tc.droppedMarks(); got != 0 {
+		t.Fatalf("droppedMarks() = %d before the cap was exceeded, want 0", got)
+	}
+
+	// One more, past the cap: refused, not silently grown past it.
+	overflow := taskhashOf(unihashMarksCap)
+	tc.mark(1, testMethod, overflow)
+
+	if got := len(tc.marks); got != unihashMarksCap {
+		t.Fatalf("len(marks) = %d after an over-cap mark, want %d unchanged", got, unihashMarksCap)
+	}
+
+	if got := tc.droppedMarks(); got != 1 {
+		t.Fatalf("droppedMarks() = %d, want 1", got)
+	}
+
+	// The dropped mark cost a touch, never a wrong delete: it must not appear as
+	// pending, because nothing was actually recorded for it.
+	if tc.pending(1, testMethod, overflow) {
+		t.Error("pending() = true for a mark the cap refused -- it was never recorded")
+	}
+
+	// A key already inside the map is unaffected by the cap: re-marking it (the
+	// first-mark-wins no-op path) must not count as a drop.
+	tc.mark(1, testMethod, taskhashOf(0))
+
+	if got := tc.droppedMarks(); got != 1 {
+		t.Fatalf("droppedMarks() = %d after re-marking an existing key, want still 1", got)
+	}
+}
+
+// taskhashOf renders i as a distinct 64-hex string, hex-only per CLAUDE.md's
+// unihash/taskhash rule.
+func taskhashOf(i int) string {
+	const hex = "0123456789abcdef"
+
+	b := make([]byte, 64)
+	for j := range b {
+		b[j] = hex[0]
+	}
+
+	for j := 0; i > 0 && j < len(b); j++ {
+		b[len(b)-1-j] = hex[i%16]
+		i /= 16
+	}
+
+	return string(b)
+}
+
+// R8#2(b): a FAILED flush must keep its marks pending -- clearing them (or leaving
+// them un-restored after the swap-based redesign) would drop the reads a transient
+// database error swallowed, and the §6.2 veto would stop protecting them too. This
+// exercises mergeBack directly: due left `marks` in the swap and never reached
+// `flushing`'s clean exit, so it must come back.
+func TestHashservToucherKeepsMarksWhenFlushFails(t *testing.T) {
+	t.Parallel()
+
+	f := newTouchFixture(t)
+	c := f.dial()
+	c.handshake()
+	c.sendJSON(map[string]any{"auth": map[string]any{"username": "u", "token": writeToken}})
+	c.recv()
+
+	seedReport(t, c, taskhash1, outhash1, unihash1)
+
+	c.sendJSON(map[string]any{"get": map[string]any{"method": testMethod, "taskhash": taskhash1}})
+	c.recv()
+
+	if !f.pending(taskhash1) {
+		t.Fatal("pending(taskhash1) = false before the failed flush")
+	}
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel() // already done: the query this flush issues must fail
+
+	if _, err := f.b.touch.flush(cancelled, time.Hour, true); err == nil {
+		t.Fatal("flush() error = nil, want the cancelled-context failure")
+	}
+
+	if !f.pending(taskhash1) {
+		t.Fatal("pending(taskhash1) = false after a FAILED flush -- mergeBack dropped the mark")
+	}
+
+	if f.row(taskhash1).accessedAt.Valid {
+		t.Fatal("accessed_at was written despite the flush failing")
+	}
+
+	// A live retry must succeed and durably clear it -- the failure must not have
+	// left the toucher in a stuck state.
+	f.flushNow()
+
+	if !f.row(taskhash1).accessedAt.Valid {
+		t.Fatal("accessed_at is still NULL after the retry")
+	}
+
+	if f.pending(taskhash1) {
+		t.Error("pending(taskhash1) = true after a successful retry")
+	}
+}
+
+// A: R6#1/R7#3, hashserv half. Backend.FlushNow must write accessed_at even for a
+// mark taken an instant ago, well inside any staleness window a ramp would set --
+// that is the entire reason it exists: the GC's write barrier is about to read
+// accessed_at off the database row, and staleness=0 is what forces it there.
+func TestBackendFlushNowForcesWriteInsideStalenessWindow(t *testing.T) {
+	t.Parallel()
+
+	f := newTouchFixture(t)
+	c := f.dial()
+	c.handshake()
+	c.sendJSON(map[string]any{"auth": map[string]any{"username": "u", "token": writeToken}})
+	c.recv()
+
+	seedReport(t, c, taskhash1, outhash1, unihash1)
+
+	c.sendJSON(map[string]any{"get": map[string]any{"method": testMethod, "taskhash": taskhash1}})
+	c.recv()
+
+	// Sanity check: an ordinary staleness-guarded flush declines this -- the mark is
+	// brand new -- so the contrast with FlushNow below is real.
+	if n, err := f.b.touch.flush(f.t.Context(), time.Hour, false); err != nil || n != 0 {
+		t.Fatalf("staleness-guarded flush() = (%d, %v), want (0, nil)", n, err)
+	}
+
+	n, err := f.b.FlushNow(f.t.Context())
+	if err != nil {
+		t.Fatalf("FlushNow() error = %v", err)
+	}
+
+	if n != 1 {
+		t.Fatalf("FlushNow() touched %d rows, want 1", n)
+	}
+
+	if !f.row(taskhash1).accessedAt.Valid {
+		t.Fatal("accessed_at is still NULL after FlushNow")
+	}
+
+	if f.pending(taskhash1) {
+		t.Error("pending(taskhash1) = true after FlushNow durably wrote it")
+	}
+}
+
+// FlushNow on a hand-built Backend (New() not called with a Queries, so b.touch is
+// nil) must no-op rather than panic -- every toucher method is nil-safe for exactly
+// this reason (backend.go's New doc comment).
+func TestBackendFlushNowNilToucher(t *testing.T) {
+	t.Parallel()
+
+	deps := cache.Deps{Blobs: &blob.Service{}, Metrics: metrics.New(), Logger: discardLogger()}
+	b := New(deps, staticRoutes{}, fakeAuthenticator{}, nil, nil)
+
+	n, err := b.FlushNow(t.Context())
+	if err != nil {
+		t.Fatalf("FlushNow() on a nil toucher error = %v", err)
+	}
+
+	if n != 0 {
+		t.Fatalf("FlushNow() on a nil toucher = %d, want 0", n)
+	}
+}
+
+// R8#2(c)/O: flush() must report rows through the SAME GC touch-flush series
+// blob.Service's flusher writes (bakery_gc_touch_flush_rows_total) -- it is the one
+// place an operator can tell "the toucher is running and writing" from "running and
+// writing nothing", combined across both touchers per that series' own doc comment.
+func TestHashservToucherFlushReportsTouchFlushRowsMetric(t *testing.T) {
+	t.Parallel()
+
+	f := newTouchFixture(t)
+	c := f.dial()
+	c.handshake()
+	c.sendJSON(map[string]any{"auth": map[string]any{"username": "u", "token": writeToken}})
+	c.recv()
+
+	before := touchFlushRowsTotal(t, f.m)
+
+	seedReport(t, c, taskhash1, outhash1, unihash1)
+
+	c.sendJSON(map[string]any{"get": map[string]any{"method": testMethod, "taskhash": taskhash1}})
+	c.recv()
+
+	f.flushNow()
+
+	after := touchFlushRowsTotal(t, f.m)
+
+	if after-before != 1 {
+		t.Fatalf("bakery_gc_touch_flush_rows_total advanced by %v, want 1", after-before)
 	}
 }

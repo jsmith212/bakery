@@ -106,25 +106,41 @@ func (a *auxPending) shardIndex(ck string) int {
 	return int(maphash.String(a.seed, ck) & (lruShards - 1))
 }
 
+// shardIndexBytes is shardIndex for a caller that holds a []byte and must not
+// allocate a string to ask a question. maphash.Bytes is DEFINED to equal
+// maphash.String over the same content, so the two agree on placement.
+func (a *auxPending) shardIndexBytes(ck []byte) int {
+	return int(maphash.Bytes(a.seed, ck) & (lruShards - 1))
+}
+
 // mark records an unflushed read of ck. FIRST MARK WINS, exactly as lruEntry.markedAt
 // does: the stamp means "when the oldest unflushed read happened", which is what makes
 // repeated reads inside T collapse into one UPDATE instead of continuously deferring
 // the flush.
-func (a *auxPending) mark(ck string, now int64) {
+//
+// It reports whether the mark was DROPPED because the shard is full. A drop is
+// survivable by design (spec 6.3: the worst case is a missed touch, and the
+// W_cas = 2 x W_ac ladder is the defence underneath it) but it is not free -- it means
+// this process is naming reachable CAS blobs faster than the flusher retires them, and
+// the rows it drops age out on created_at alone. Silence would make that invisible, so
+// the caller reports it on bakery_gc_touch_aux_dropped_total.
+func (a *auxPending) mark(ck string, now int64) (dropped bool) {
 	s := &a.shards[a.shardIndex(ck)]
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if _, ok := s.m[ck]; ok {
-		return
+		return false
 	}
 
 	if len(s.m) >= auxShardCap {
-		return
+		return true
 	}
 
 	s.m[ck] = now
+
+	return false
 }
 
 // collect reports marks at or older than cutoff WITHOUT removing them -- see
@@ -162,13 +178,16 @@ func (a *auxPending) clear(marks []touchMark) {
 	}
 }
 
-func (a *auxPending) pending(ck string) bool {
-	s := &a.shards[a.shardIndex(ck)]
+// pending is the aux half of the veto. Like lruCache.pendingMark it takes []byte and
+// probes with `s.m[string(ck)]`, the compiler's no-copy map lookup, so PendingTouch's
+// stack buffer never has to become a heap string.
+func (a *auxPending) pending(ck []byte) bool {
+	s := &a.shards[a.shardIndexBytes(ck)]
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, ok := s.m[ck]
+	_, ok := s.m[string(ck)]
 
 	return ok
 }
@@ -188,7 +207,9 @@ func (a *auxPending) pending(ck string) bool {
 func (s *Service) MarkAccessed(ref Ref) {
 	var buf [512]byte
 
-	s.aux.mark(string(ref.appendCacheKey(buf[:0])), s.lru.nowNano())
+	if s.aux.mark(string(ref.appendCacheKey(buf[:0])), s.lru.nowNano()) {
+		s.gc.TouchAuxDropped(1)
+	}
 }
 
 // PendingTouch is THE GC's VETO (spec 6.2): "does this process hold an unflushed read
@@ -206,14 +227,19 @@ func (s *Service) MarkAccessed(ref Ref) {
 // It takes the triple rather than a Ref because its caller holds scan rows, not routed
 // requests: the org/project slugs a Ref carries are metrics labels the GC has no use
 // for here.
+// IT ALLOCATES NOTHING. The sweep calls it once per candidate row -- a 1000-row chunk
+// at a time, chunk after chunk, for every backend in the instance -- so the cache key
+// is composed into a stack buffer and handed to both probes as a []byte. Both do the
+// no-copy `m[string(ck)]` lookup and neither retains it, so the buffer does not escape
+// and a veto probe costs zero allocations (TestPendingTouchAllocatesNothing).
 func (s *Service) PendingTouch(backendID int64, namespace, key string) bool {
 	var buf [512]byte
 
-	ck := string(Ref{
+	ck := Ref{
 		BackendID: backendID,
 		Org:       "", Project: "", Backend: "", Kind: "",
 		Namespace: namespace, Key: key,
-	}.appendCacheKey(buf[:0]))
+	}.appendCacheKey(buf[:0])
 
 	return s.lru.pendingMark(ck) || s.aux.pending(ck)
 }
@@ -268,6 +294,27 @@ func (s *Service) StartAccessToucher(ctx context.Context, interval time.Duration
 	}
 }
 
+// FlushAccessNow forces a SYNCHRONOUS flush of every pending accessed_at mark (both
+// the LRU's stamps and the aux map's reachability marks), regardless of staleness
+// (staleness=0: TouchObjectsAccessed's own guard is accessed_at < now() - staleness,
+// so 0 means "write it unless it was already touched in this exact instant"), and
+// reports rows written.
+//
+// This is the blob half of A: R6#1/R7#3 -- a sweep stage reads accessed_at off the
+// DATABASE row, and PendingTouch's in-memory veto has no reach into a query the
+// toucher has not run yet. A read that landed inside the current staleness window is
+// invisible to the sweep's own SELECT right up until something forces it onto disk.
+// The GC loop calls this immediately before running a cache_objects sweep stage, for
+// exactly the reason StartAccessToucher's doc gives for why an in-memory answer is
+// sufficient at all: this process is the only one whose memory it can come from.
+func (s *Service) FlushAccessNow(ctx context.Context) (int64, error) {
+	if s.tx == nil {
+		return 0, nil
+	}
+
+	return s.flushAccess(ctx, 0, true)
+}
+
 // flushAccess is one tick. all=true takes every mark regardless of age (the shutdown
 // flush); otherwise it takes only marks older than staleness, which is what makes N
 // reads within T cost ONE UPDATE rather than one per tick.
@@ -275,6 +322,12 @@ func (s *Service) StartAccessToucher(ctx context.Context, interval time.Duration
 // Marks are cleared only after the write commits, and only the ones that were written.
 // A failed flush therefore leaves the marks pending -- retried next tick, and still
 // visible to PendingTouch in the meantime.
+//
+// THE ROW COUNT IS REPORTED, not just returned. bakery_gc_touch_flush_rows_total is
+// how an operator tells "the toucher is running and writing accessed_at" from "the
+// toucher is running and writing nothing" -- and the second is what a broken staleness
+// ramp, an empty mark set or a wedged flush all look like from every other series.
+// Rows written before an error are counted: they committed.
 func (s *Service) flushAccess(ctx context.Context, staleness time.Duration, all bool) (int64, error) {
 	cutoff := int64(math.MaxInt64)
 	if !all {
@@ -295,6 +348,8 @@ func (s *Service) flushAccess(ctx context.Context, staleness time.Duration, all 
 		for i := 0; i < len(keys); i += touchBatchSize {
 			n, err := s.touchChunk(ctx, g, keys[i:min(i+touchBatchSize, len(keys))], staleness)
 			if err != nil {
+				s.gc.TouchFlushRows(rows)
+
 				return rows, err
 			}
 
@@ -304,6 +359,8 @@ func (s *Service) flushAccess(ctx context.Context, staleness time.Duration, all 
 
 	s.lru.clearMarks(marks)
 	s.aux.clear(auxMarks)
+
+	s.gc.TouchFlushRows(rows)
 
 	return rows, nil
 }

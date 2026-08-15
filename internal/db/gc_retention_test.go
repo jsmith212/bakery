@@ -494,13 +494,16 @@ func TestHashservQuotaIsRefused(t *testing.T) {
 	}
 }
 
-// --- opinionated defaults, seeded by the migration ----------------------------
+// --- opinionated defaults, seeded by CreateBackend ----------------------------
 
 // TestDownloadsRetainsForeverByDefault pins product decision 2 (spec §1.2):
-// downloads is an ARCHIVE, not a cache. The migration's opinionated per-kind
-// seeding explicitly excludes it (`WHERE ... AND kind <> 'downloads'`), so a
-// downloads backend's retention_window must come back NULL even though every
-// other kind gets a real default.
+// downloads is an ARCHIVE, not a cache. Since CreateBackend (query/backends.sql)
+// now computes retention_window at INSERT time rather than relying on 000012's
+// one-time backfill UPDATE, this exercises CreateBackend's own hard-NULL for
+// kind = 'downloads' -- a downloads backend's retention_window must come back
+// NULL even though every other kind gets a real default, and even when (see
+// TestCreateBackendSeedsRetentionAndQuota) the owning org has set a
+// default_retention_window that every OTHER kind would inherit.
 func TestDownloadsRetainsForeverByDefault(t *testing.T) {
 	t.Parallel()
 
@@ -522,20 +525,157 @@ func TestDownloadsRetainsForeverByDefault(t *testing.T) {
 	}
 }
 
+// TestCreateBackendSeedsRetentionAndQuota pins CreateBackend's own opinionated
+// seeding (R6#2/R7#4, query/backends.sql) -- the per-kind ladder, the org-default
+// override, and downloads' immunity to that override -- independently of the
+// migration's one-time backfill UPDATE, which this test never touches.
+func TestCreateBackendSeedsRetentionAndQuota(t *testing.T) {
+	t.Parallel()
+
+	pool := dbtest.New(t)
+	ctx := t.Context()
+	q := repository.New(pool)
+
+	// A fresh bazel backend, no org override: gets the per-kind default (30d).
+	bazelID := seedBackendKind(t, pool, repository.BackendKindBazel)
+
+	bazel, err := q.GetBackendByID(ctx, bazelID)
+	if err != nil {
+		t.Fatalf("GetBackendByID(bazel): %v", err)
+	}
+
+	if !bazel.RetentionWindow.Valid || bazel.RetentionWindow.Days != 30 {
+		t.Errorf("fresh bazel backend retention_window = %+v, want 30 days", bazel.RetentionWindow)
+	}
+
+	// A fresh downloads backend, no org override: NULL, the archive default.
+	downloadsID := seedBackendKind(t, pool, repository.BackendKindDownloads)
+
+	downloads, err := q.GetBackendByID(ctx, downloadsID)
+	if err != nil {
+		t.Fatalf("GetBackendByID(downloads): %v", err)
+	}
+
+	if downloads.RetentionWindow.Valid {
+		t.Errorf("fresh downloads backend retention_window = %+v, want NULL", downloads.RetentionWindow)
+	}
+
+	// An org with default_retention_window set: a NEW sstate backend in a
+	// DIFFERENT project of the SAME org must inherit the org default (180d),
+	// overriding the 90d per-kind default -- proving the COALESCE actually
+	// prefers the org's column over the CASE ladder, not just that a NULL org
+	// default falls through to it (every backend above already proves that half).
+	org, err := q.CreateOrganization(ctx, repository.CreateOrganizationParams{
+		Slug: "org-default-override", Name: "Org Default Override",
+	})
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+
+	if _, err := pool.Exec(ctx,
+		`UPDATE organizations SET default_retention_window = interval '180 days' WHERE id = $1`, org.ID,
+	); err != nil {
+		t.Fatalf("set org default_retention_window: %v", err)
+	}
+
+	project, err := q.CreateProject(ctx, repository.CreateProjectParams{
+		OrgID: org.ID, Slug: "widget", Name: "Widget",
+	})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+
+	sstate, err := q.CreateBackend(ctx, repository.CreateBackendParams{
+		ProjectID: project.ID, Kind: repository.BackendKindSstate,
+		Enabled: true, ReadAuthRequired: true, Config: []byte(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("create sstate backend: %v", err)
+	}
+
+	if !sstate.RetentionWindow.Valid || sstate.RetentionWindow.Days != 180 {
+		t.Errorf("sstate backend under an org default_retention_window of 180d got "+
+			"retention_window = %+v, want 180 days -- the org default did not override "+
+			"the 90d per-kind default", sstate.RetentionWindow)
+	}
+
+	// downloads IGNORES the org default too (spec §1.2: "stays NULL even when an
+	// org default exists") -- the SAME org, a SECOND project, a downloads backend.
+	project2, err := q.CreateProject(ctx, repository.CreateProjectParams{
+		OrgID: org.ID, Slug: "widget-2", Name: "Widget 2",
+	})
+	if err != nil {
+		t.Fatalf("create second project: %v", err)
+	}
+
+	downloadsOverridden, err := q.CreateBackend(ctx, repository.CreateBackendParams{
+		ProjectID: project2.ID, Kind: repository.BackendKindDownloads,
+		Enabled: true, ReadAuthRequired: true, Config: []byte(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("create downloads backend: %v", err)
+	}
+
+	if downloadsOverridden.RetentionWindow.Valid {
+		t.Errorf("downloads backend under an org default_retention_window of 180d got "+
+			"retention_window = %+v, want NULL -- downloads must ignore the org default",
+			downloadsOverridden.RetentionWindow)
+	}
+}
+
 // --- the migration round trip -------------------------------------------------
 
 // TestGCRetentionQuotasMigrationRoundTrips is 000012's own down+up proof, the
 // same shape TestHybridRolesMigrationRoundTrips (hybrid_roles_test.go) uses for
 // 000008: TestMigrateUpDownUp (db_test.go) already proves EVERY migration's round
 // trip leaves zero residual tables/enums/functions, but a migration that ADDS
-// COLUMNS to existing tables needs its own proof that those columns -- and the
-// opinionated seeding that populates them -- come back correctly on a second UP,
-// not just that DOWN cleanly removes them.
+// COLUMNS to existing tables needs its own proof that those columns come back
+// correctly on a second UP, not just that DOWN cleanly removes them.
+//
+// R6#6: the previous version of this test PRE-ARRANGED ITS OWN ANSWER -- it
+// created one backend after the round trip and then hand-ran the exact UPDATE
+// 000012's seeding is supposed to perform, so it could not have caught a broken
+// migration (it would have "passed" even if the migration's seeding UPDATE were
+// deleted entirely). Two changes fix that:
+//
+//  1. One backend of EVERY kind is seeded on the fully-migrated schema BEFORE the
+//     round trip, so MigrateDown's DROP COLUMN / DROP CONSTRAINT statements on
+//     cache_backends, and DROP TABLE on cache_backend_usage, run against a
+//     POPULATED table of every kind rather than an empty one -- a down migration
+//     that only ever gets exercised against zero rows is not proven to survive
+//     real data.
+//  2. After the round trip, a FRESH backend of every kind is created (via
+//     CreateBackend, no hand-run UPDATE anywhere) and its retention_window is
+//     asserted against the exact per-kind ladder 000012/CreateBackend both
+//     implement: 90d/90d/30d/30d/NULL for sstate/hashserv/bazel/oci/downloads.
 func TestGCRetentionQuotasMigrationRoundTrips(t *testing.T) {
 	t.Parallel()
 
-	_, dsn := dbtest.NewWithDSN(t)
+	preRoundTrip, dsn := dbtest.NewWithDSN(t)
 	ctx := t.Context()
+
+	// One backend of EVERY kind, seeded on the FULLY-MIGRATED schema `dbtest`
+	// already handed back (enum types registered, ordinary CreateBackend path --
+	// so these rows carry REAL, non-NULL retention_window/quota_bytes values,
+	// not just populated columns) -- so MigrateDown's DROP COLUMN / DROP
+	// CONSTRAINT statements on cache_backends, and DROP TABLE on
+	// cache_backend_usage, run against a table that actually holds data of
+	// every kind, exercising every CHECK constraint's removal for real, rather
+	// than against an empty table that would let a broken down-migration pass
+	// silently.
+	for _, kind := range []repository.BackendKind{
+		repository.BackendKindSstate, repository.BackendKindDownloads,
+		repository.BackendKindHashserv, repository.BackendKindBazel, repository.BackendKindOci,
+	} {
+		seedBackendKind(t, preRoundTrip, kind)
+	}
+
+	// db.NewBootstrapPool, NOT the pool above: MigrateDown takes the enum types
+	// with it, so a pool that insisted on registering them (preRoundTrip above)
+	// could not open afterwards. preRoundTrip is closed FIRST so its idle
+	// connections cannot contend with the ACCESS EXCLUSIVE locks MigrateDown's
+	// DROP/ALTER statements need.
+	preRoundTrip.Close()
 
 	pool, err := db.NewBootstrapPool(ctx, db.Config{URL: dsn, MaxConns: 2})
 	if err != nil {
@@ -561,28 +701,40 @@ func TestGCRetentionQuotasMigrationRoundTrips(t *testing.T) {
 
 	q := repository.New(serving)
 
-	// A fresh backend created AFTER the round trip must still get the opinionated
-	// sstate default (90d) -- proving the UPDATE ... WHERE kind = 'sstate' seeding
-	// statement, not just the table shape, survived down+up.
-	sstateID := seedBackendKind(t, serving, repository.BackendKindSstate)
-
-	if _, err := serving.Exec(ctx,
-		`UPDATE cache_backends
-		    SET retention_window = interval '90 days'
-		  WHERE id = $1 AND retention_window IS NULL`, sstateID,
-	); err != nil {
-		t.Fatalf("apply the same opinionated default a fresh backend would need: %v", err)
+	// The opinionated per-kind ladder, on FRESH rows created via CreateBackend
+	// AFTER the round trip -- no hand-run UPDATE standing in for it anywhere.
+	wantDays := map[repository.BackendKind]int32{
+		repository.BackendKindSstate:   90,
+		repository.BackendKindHashserv: 90,
+		repository.BackendKindBazel:    30,
+		repository.BackendKindOci:      30,
 	}
 
-	var window pgtype.Interval
-	if err := serving.QueryRow(ctx,
-		`SELECT retention_window FROM cache_backends WHERE id = $1`, sstateID,
-	).Scan(&window); err != nil {
-		t.Fatalf("read retention_window: %v", err)
-	}
+	for _, kind := range []repository.BackendKind{
+		repository.BackendKindSstate, repository.BackendKindHashserv,
+		repository.BackendKindBazel, repository.BackendKindOci, repository.BackendKindDownloads,
+	} {
+		id := seedBackendKind(t, serving, kind)
 
-	if !window.Valid {
-		t.Error("retention_window is NULL after the round trip -- the column did not survive down+up")
+		backend, err := q.GetBackendByID(ctx, id)
+		if err != nil {
+			t.Fatalf("GetBackendByID(%s): %v", kind, err)
+		}
+
+		want, ok := wantDays[kind]
+		if !ok { // downloads
+			if backend.RetentionWindow.Valid {
+				t.Errorf("%s: retention_window = %+v after the round trip, want NULL -- "+
+					"downloads is an archive", kind, backend.RetentionWindow)
+			}
+
+			continue
+		}
+
+		if !backend.RetentionWindow.Valid || backend.RetentionWindow.Days != want {
+			t.Errorf("%s: retention_window = %+v after the round trip, want %d days",
+				kind, backend.RetentionWindow, want)
+		}
 	}
 
 	// The hashserv-no-quota CHECK must survive too.

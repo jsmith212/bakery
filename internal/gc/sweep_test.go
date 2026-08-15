@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/jsmith212/bakery/internal/db/repository"
+	"github.com/jsmith212/bakery/internal/metrics"
 )
 
 // THE LADDER, END TO END, AGAINST A REAL DATABASE (spec §6.3, §4).
@@ -270,11 +272,17 @@ func TestSstateZeroCoverageRefusesToSweep(t *testing.T) {
 	}
 }
 
-// THE VETO (spec §6.2). A pending, unflushed touch is invisible to the scan's SELECT
-// -- the row still carries its old accessed_at -- so a key this process answered
-// "present" for seconds ago is selected as ninety days cold. FindMissingBlobs
-// answering "present" is a RESERVATION the client acts on, which is why the sweep
-// intersects every candidate chunk against the live pending state before deleting.
+// THE PENDING READ SURVIVES THE SWEEP (spec §6.2). A pending, unflushed touch is
+// invisible to the scan's SELECT -- the row still carries its old accessed_at -- so
+// a key this process answered "present" for seconds ago is selected as ninety days
+// cold. FindMissingBlobs answering "present" is a RESERVATION the client acts on.
+//
+// TWO MECHANISMS NOW STAND BETWEEN THAT MARK AND THE DELETE, and this test asserts
+// the OUTCOME rather than which one produced it: the pre-sweep force-flush (§6.2
+// mechanism 1, added by A: R6#1/R7#3) turns a mark taken before the sweep into a
+// real accessed_at, and the per-chunk veto catches the ones taken during it. The
+// second is the only one that can cover a read that lands mid-sweep, which is why
+// both are here.
 func TestSweepVetoesAKeyWithAnUnflushedRead(t *testing.T) {
 	t.Parallel()
 
@@ -305,6 +313,234 @@ func TestSweepVetoesAKeyWithAnUnflushedRead(t *testing.T) {
 
 	if f.exists(backend, nsAC, "genuinely-cold") {
 		t.Error("the cold key survived, so the veto is not what spared the other one")
+	}
+}
+
+// THE PRE-SWEEP FLUSH IS WHAT KEEPS A LIVE BUILD'S GC ROOT ALIVE (A: R6#1/R7#3,
+// spec §6.2 mechanism 1).
+//
+// hashserv marks a unihash read in memory and writes accessed_at at most once per
+// T. Stage 1 is a single self-contained SQL DELETE reading coalesce(accessed_at,
+// created_at): there is no Go-side pass over its candidates, so the per-chunk
+// PendingTouch veto that protects the cache_objects stages has no equivalent here.
+// Until the mark is forced onto disk, a unihash a build read minutes ago is
+// selected as ninety days cold -- and that is not a cache miss, it is the GC root
+// disappearing from under every sstate object whose filename embeds it.
+func TestSweepUnihashesVetoesAnUnflushedRead(t *testing.T) {
+	t.Parallel()
+
+	const (
+		read      = "taskhash-read-just-now"
+		untouched = "taskhash-genuinely-cold"
+	)
+
+	f := newFixture(t, testConfig())
+	backend := f.backend(repository.BackendKindHashserv, backendOpts{window: day(30), quota: 0, disabled: false})
+
+	f.unihash(backend, read, "9f3c8a1b2c3d4e5f60718293a4b5c6d7e8f90a1b", ago(400))
+	f.unihash(backend, untouched, "2b7e151628aed2a6abf7158809cf4f3c762e7160", ago(400))
+
+	// The read a build just took. It is pending in this process's memory and NOT in
+	// the database: accessed_at is still NULL, so the sweep's own SELECT sees a row
+	// that has not been read in four hundred days.
+	f.touch.mark(backend, "oe.sstatesig.OEOuthashBasic", read)
+
+	if at := f.unihashAccessedAt(backend, read); at.Valid {
+		t.Fatal("the mark reached the database before the sweep ran, so this test proves nothing")
+	}
+
+	f.run()
+
+	if !f.unihashExists(backend, read) {
+		t.Error("a unihash with an unflushed read was swept: the sweep must force the toucher's " +
+			"pending marks to disk BEFORE stage 1, not after it and not never")
+	}
+
+	if f.unihashExists(backend, untouched) {
+		t.Error("the genuinely cold unihash survived, so the flush is not what spared the other one")
+	}
+}
+
+// A MANIFEST A LIVE TAG NAMES SURVIVES ITS OWN WINDOW, AND ITS TWIN DIES (E:
+// R6#4/R7#9, R6#5 -- the protective direction).
+//
+// The anti-join is evaluated in SQL, in the same statement as the DELETE, against
+// the tags namespace AS IT STANDS THEN. The Go-side tagDigests set this replaced
+// answered a different question -- "was this digest tagged when the tags stage
+// scanned past" -- and a tag written or revalidated in the gap (the ordinary case:
+// SWR revalidation writes tags continuously) left a live tag pointing at a manifest
+// the sweep had already condemned.
+func TestTaggedManifestSurvivesAnyAgeAndItsUntaggedTwinDies(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, testConfig())
+	backend := f.backend(repository.BackendKindOci, backendOpts{window: day(30), quota: 0, disabled: false})
+
+	const (
+		tagged   = "sha256:tagged"
+		untagged = "sha256:untagged"
+		bytes    = "the very same manifest bytes"
+	)
+
+	f.put(backend, nsManifests, tagged, bytes)
+	f.put(backend, nsManifests, untagged, "different manifest bytes")
+
+	// One tag, revalidated an hour ago, naming the first manifest's digest.
+	f.put(backend, nsTags, "docker.io/library/alpine:latest", bytes)
+	f.refreshed(backend, nsTags, "docker.io/library/alpine:latest", time.Now().Add(-time.Hour))
+
+	// Both manifests are 400 days old -- far past W_manifests (60d), so the ladder
+	// cannot be what spares either of them.
+	f.age(backend, nsManifests, tagged, ago(400), ago(400))
+	f.age(backend, nsManifests, untagged, ago(400), ago(400))
+
+	f.run()
+
+	if !f.exists(backend, nsManifests, tagged) {
+		t.Error("a 400-day-old manifest a live tag names was swept: the anti-join is not being " +
+			"evaluated at delete time")
+	}
+
+	if f.exists(backend, nsManifests, untagged) {
+		t.Error("a 400-day-old manifest no tag names survived, so the tagged one's survival " +
+			"proves nothing about the anti-join")
+	}
+}
+
+// QUOTA EVICTION RESPECTS REACHABILITY (R6#9). A cap is a cap, so the retention
+// WINDOW is ignored -- but the stage's own reachability rule is not: evicting an
+// sstate object whose unihash is still alive is not shedding cold data, it is
+// deleting an object a running build is about to ask for by name.
+//
+// Both objects here are two days old and both are far inside the 90-day window, so
+// retention cannot be what deletes either of them; only the cap can. One has a live
+// unihash on the paired hashserv backend and the other does not, and that is the
+// whole difference between them.
+func TestQuotaEvictionSparesAReachableSstateObject(t *testing.T) {
+	t.Parallel()
+
+	const (
+		liveUnihash = "9f3c8a1b2c3d4e5f60718293a4b5c6d7e8f90a1b"
+		deadUnihash = "2b7e151628aed2a6abf7158809cf4f3c762e7160"
+	)
+
+	keyFor := func(unihash string) string {
+		return fmt.Sprintf(
+			"universal/%s/%s/sstate:zlib-native:x86_64-linux:1.3.1:r0:x86_64:14:%s_populate_sysroot.tar.zst",
+			unihash[0:2], unihash[2:4], unihash)
+	}
+
+	f := newFixture(t, testConfig())
+	hashserv := f.backend(repository.BackendKindHashserv,
+		backendOpts{window: day(90), quota: 0, disabled: false})
+	sstate := f.backend(repository.BackendKindSstate,
+		backendOpts{window: day(90), quota: 8, disabled: false})
+
+	f.unihash(hashserv, "taskhash-live", liveUnihash, ago(1))
+
+	for _, u := range []string{liveUnihash, deadUnihash} {
+		f.put(sstate, nsDefault, keyFor(u), "sstate object "+u)
+		f.age(sstate, nsDefault, keyFor(u), ago(2), ago(2))
+	}
+
+	f.run()
+
+	if f.exists(sstate, nsDefault, keyFor(deadUnihash)) {
+		t.Error("the over-quota backend evicted nothing: a cap ignores the retention window, " +
+			"and both objects are well inside it")
+	}
+
+	if !f.exists(sstate, nsDefault, keyFor(liveUnihash)) {
+		t.Error("quota eviction took an object whose unihash is still alive: a cap ignores the " +
+			"WINDOW, never the stage's reachability rule")
+	}
+}
+
+// QUOTA EVICTION OF MANIFESTS GOES THROUGH THE ANTI-JOIN QUERY (R6#9), which is the
+// only thing that deletes a manifest at all now that the Go-side decider is
+// accounting-only. Forget to wire the quota path to it and manifests become
+// silently immune to the cap -- an OCI backend that reports itself over quota
+// forever while evicting nothing.
+//
+// A NOTE ON WHAT THIS CANNOT SHOW, because it is a property of the staged order
+// rather than an omission: eviction exhausts a stage before touching its successor,
+// and tags are stage 7 to manifests' stage 8. A backend under enough pressure to
+// reach the manifests stage has therefore already shed EVERY tag, so within one
+// quota pass "tagged" is not a state a manifest can still be in. The anti-join in
+// the quota path is defence for the rows that survive stage 7 anyway -- a tag
+// vetoed by a pending read, or one the write barrier spares -- and the protective
+// direction is proven against the retention path in
+// TestTaggedManifestSurvivesAnyAgeAndItsUntaggedTwinDies.
+func TestQuotaEvictionReachesManifests(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, testConfig())
+	backend := f.backend(repository.BackendKindOci, backendOpts{window: day(30), quota: 8, disabled: false})
+
+	// (The API refuses to SET an OCI quota -- a pull-through proxy is bounded by its
+	// retention window, spec §1.3 -- but the COLUMN allows one and the CHECK does
+	// not forbid it, so the engine has to evict correctly for any row that carries
+	// one.)
+	const doomed = "sha256:untagged"
+
+	f.put(backend, nsManifests, doomed, "an untagged manifest nothing points at")
+	f.age(backend, nsManifests, doomed, ago(2), ago(2))
+
+	f.run()
+
+	if f.exists(backend, nsManifests, doomed) {
+		t.Error("an over-quota OCI backend evicted no manifest: quota eviction must drive the " +
+			"same SweepUnreferencedManifests statement retention does, with the histogram " +
+			"cutoff standing in for the window")
+	}
+}
+
+// A REFUSED sstate BACKEND MUST NOT VANISH FROM THE STORAGE GAUGES (P: R6#8).
+//
+// The sweep RESETS every per-backend gauge before republishing them, because a vec
+// is a map and a deleted backend would otherwise export its last value forever.
+// A backend the coverage guard refuses is measured by neither the reset's
+// republish (it looks like a backend about to be measured) nor the sweep itself --
+// so the one backend whose retention has visibly stopped working is also the one
+// whose size disappears from the dashboard.
+func TestSstateZeroCoverageKeepsItsStorageGauges(t *testing.T) {
+	t.Parallel()
+
+	const key = "universal/9f/3c/sstate:zlib-native:x86_64-linux:1.3.1:r0:x86_64:14:" +
+		"9f3c8a1b2c3d4e5f60718293a4b5c6d7e8f90a1b_populate_sysroot.tar.zst"
+
+	f := newFixture(t, testConfig())
+	hashserv := f.backend(repository.BackendKindHashserv,
+		backendOpts{window: day(90), quota: 0, disabled: false})
+	sstate := f.backend(repository.BackendKindSstate,
+		backendOpts{window: day(90), quota: 0, disabled: false})
+
+	// A unihash nothing in the sstate corpus names: the shape of a broken derivation.
+	f.unihash(hashserv, "taskhash-unrelated", "00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff", ago(1))
+
+	f.put(sstate, nsDefault, key, "an sstate object")
+	f.age(sstate, nsDefault, key, ago(400), ago(400))
+
+	// The lightweight usage pass measures every backend, refused or not -- this is
+	// the measurement the sweep's reset is about to drop.
+	if err := f.eng.MeasureUsage(t.Context()); err != nil {
+		t.Fatalf("MeasureUsage() error = %v", err)
+	}
+
+	if got := f.storageObjects(metrics.BackendSstate); got != 1 {
+		t.Fatalf("bakery_storage_objects after the usage pass = %v, want 1", got)
+	}
+
+	sum := f.run()
+
+	if sum.BackendsRefused != 1 {
+		t.Fatalf("BackendsRefused = %d, want 1 -- this test needs the guard to actually refuse",
+			sum.BackendsRefused)
+	}
+
+	if got := f.storageObjects(metrics.BackendSstate); got != 1 {
+		t.Errorf("bakery_storage_objects after a refused sweep = %v, want 1: the refusal reset "+
+			"the gauge and never republished it", got)
 	}
 }
 
@@ -400,5 +636,38 @@ func TestDisableRetentionHaltsTheMark(t *testing.T) {
 	if sum.BlobsDeleted != 1 {
 		t.Errorf("stage 0 reaped %d blobs, want 1: an already-marked blob is past recovery and "+
 			"stalling it reclaims nothing", sum.BlobsDeleted)
+	}
+}
+
+// THE N1 REGRESSION (verify pass, 2026-08-14): a managed()-but-WINDOWLESS OCI backend
+// -- quota set, retention_window NULL -- must not retention-sweep its manifests. The
+// fix wave moved stage 8's deletion into SweepUnreferencedManifests and lost the
+// hasWindow guard on the way: the stage window is 0 without a configured window, 0
+// reaches SQL as `< now()`, and every untagged manifest dies on a backend whose
+// operator asked for a cap, not a clock. NULL means retain forever, here as everywhere.
+func TestWindowlessQuotaBackendRetainsItsManifests(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, testConfig())
+	// Quota far above usage: managed() is true (the quota alone manages it), the
+	// backend is nowhere near eviction, and there is no window. Nothing may delete.
+	backend := f.backend(repository.BackendKindOci, backendOpts{window: 0, quota: 1 << 30, disabled: false})
+
+	const survivor = "sha256:untagged-but-unwindowed"
+
+	f.put(backend, nsManifests, survivor, "an untagged manifest on a windowless backend")
+	f.age(backend, nsManifests, survivor, ago(400), ago(400))
+
+	sum := f.run()
+
+	if !f.exists(backend, nsManifests, survivor) {
+		t.Fatal("a windowless (retention_window IS NULL) quota-carrying OCI backend " +
+			"retention-swept an untagged manifest: window 0 reached SQL as `< now()` -- " +
+			"NULL must mean retain forever")
+	}
+
+	if sum.ObjectsDeleted != 0 {
+		t.Errorf("sweep deleted %d objects on a backend with no window and headroom under "+
+			"its quota; want 0", sum.ObjectsDeleted)
 	}
 }

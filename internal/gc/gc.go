@@ -64,6 +64,14 @@ const (
 	TriggerInterval Trigger = "interval"
 	// TriggerAPI is POST /api/v1/gc/run.
 	TriggerAPI Trigger = "api"
+	// TriggerUsage is the lightweight --gc-usage-interval measurement pass
+	// (MeasureUsage), which mints its own gc_runs row purely so the measurement is
+	// auditable (R7#12). It is a THIRD value, not a reuse of TriggerInterval: that
+	// pass runs every six hours forever, independent of whether retention is even
+	// enabled, and a runs list that cannot tell those rows from real sweeps is a
+	// list an operator stops reading. GET /api/v1/gc/runs excludes them unless
+	// asked (ListGCRuns' include_usage).
+	TriggerUsage Trigger = "usage"
 )
 
 // ErrAlreadyRunning means a real sweep is already in flight in this process. The
@@ -75,9 +83,26 @@ const (
 // operator's `--dry-run` behind an unrelated sweep for no safety benefit.
 var ErrAlreadyRunning = errors.New("gc: a sweep is already running")
 
-// ErrMultiInstance means the GC loop was asked to run under
-// --allow-multi-instance. See the package doc for the three reasons.
+// ErrMultiInstance means a sweep was asked for under --allow-multi-instance. See
+// the package doc for the three reasons. The API trigger renders it 409.
+//
+// IT GUARDS TriggerAsync AS WELL AS THE LOOP (R7#1). Loop's refusal alone is not
+// the invariant: POST /api/v1/gc/run reaches the engine directly, so an operator
+// under --allow-multi-instance could start -- by hand, against a live second
+// instance -- exactly the sweep the loop refuses to schedule, with the same three
+// consequences and none of the warnings.
 var ErrMultiInstance = errors.New("gc: refusing to run under --allow-multi-instance")
+
+// ErrDisabled means a sweep was asked for while --gc-enabled is off. The API
+// trigger renders it 409, distinctly from ErrMultiInstance: "this deployment has
+// GC turned off" and "this deployment cannot run GC safely" are different
+// answers, and only the first is something the operator can fix with a flag they
+// already know about.
+//
+// The trigger is refused rather than quietly honoured because --gc-enabled off is
+// a deliberate operational state (an upgrade window, an incident) that a POST
+// must not silently override.
+var ErrDisabled = errors.New("gc: refusing to run because gc is disabled")
 
 const (
 	// disabledBackendCeiling caps a DISABLED backend's retention window (spec §3,
@@ -151,6 +176,21 @@ type Queries interface {
 	NullOrphanSiginfo(ctx context.Context, arg repository.NullOrphanSiginfoParams) (int64, error)
 	DryRunNullOrphanSiginfo(ctx context.Context, arg repository.DryRunNullOrphanSiginfoParams) (int64, error)
 
+	// SweepUnreferencedManifests is stage 8's ONLY deletion path (E: R6#4/R7#9). It
+	// evaluates the write barrier AND the tag anti-join at DELETE time, in one
+	// statement, and returns the keys it deleted so the caller can invalidate them
+	// from the LRU.
+	SweepUnreferencedManifests(
+		ctx context.Context, arg repository.SweepUnreferencedManifestsParams,
+	) ([]string, error)
+	DryRunSweepUnreferencedManifests(
+		ctx context.Context, arg repository.DryRunSweepUnreferencedManifestsParams,
+	) (int64, error)
+
+	// GetGCState reads the one-row touch-staleness ramp clock (spec §6.4). Read ONCE,
+	// at boot -- see Engine.LoadTouchRamp.
+	GetGCState(ctx context.Context) (pgtype.Timestamptz, error)
+
 	MarkBlobsPendingDelete(
 		ctx context.Context, arg repository.MarkBlobsPendingDeleteParams,
 	) ([]repository.MarkBlobsPendingDeleteRow, error)
@@ -164,9 +204,22 @@ type Queries interface {
 // Queries is: so the engine's orchestration can be tested without a byte store,
 // not because a second implementation is expected.
 type Blobs interface {
-	// DeleteBatch is the ONLY deletion path the GC uses. It is digest-ordered and it
-	// invalidates the LRU; DeleteObjectsChunk is neither.
-	DeleteBatch(ctx context.Context, refs []blob.DeleteRef) (int64, error)
+	// DeleteBatch is the ONLY keyed deletion path the GC uses. It is digest-ordered
+	// and it invalidates the LRU; DeleteObjectsChunk is neither.
+	//
+	// runID is the write barrier and is REQUIRED: DeleteObjectsByKeys re-derives
+	// `created_at < run.started_at AND pg_visible_in_snapshot(...)` from the gc_runs
+	// row at DELETE time, because the doomed set was computed by an earlier scan and a
+	// build can overwrite any key in it in the gap.
+	DeleteBatch(ctx context.Context, runID int64, refs []blob.DeleteRef) (int64, error)
+
+	// InvalidateKeys drops LRU entries for keys deleted by a statement that did not
+	// go through DeleteBatch -- today, stage 8's SweepUnreferencedManifests, whose
+	// anti-join must be evaluated in SQL at delete time and which therefore reports
+	// what it deleted rather than being told. It is the same obligation DeleteBatch
+	// discharges internally: manifests are served through blob.Get, so a surviving
+	// positive entry answers "present" for a row that is gone.
+	InvalidateKeys(backendID int64, namespace string, keys []string)
 
 	// ReapDigest unlinks one blob's bytes inside the transaction that deletes its
 	// row. Returns false when the blob was revived or already reaped -- both normal.
@@ -214,21 +267,75 @@ type Config struct {
 	TouchStaleness time.Duration
 }
 
+// AccessFlusher forces every pending cache_objects accessed_at mark to disk,
+// synchronously, and reports the rows written. *blob.Service satisfies it.
+//
+// IT IS THE PRIMARY HALF OF §6.2 (A: R6#1/R7#3). A sweep stage reads accessed_at
+// off the DATABASE row; a mark that is still only in this process's memory is
+// invisible to that SELECT, so a key read five minutes ago is selected as ninety
+// days cold. PendingTouch's veto catches that per chunk, but only for the blob
+// path and only for marks that exist when the chunk is decided -- forcing the
+// flush BEFORE the stage turns every mark older than the sweep into a real
+// accessed_at that the coalesce() predicate spares on its own.
+type AccessFlusher interface {
+	FlushAccessNow(ctx context.Context) (int64, error)
+}
+
+// UnihashFlusher is AccessFlusher's hashserv_unihashes twin: *hashserv.Backend
+// satisfies it. Stage 1 needs it MORE than the cache_objects stages need theirs,
+// because stage 1 is a self-contained SQL DELETE with no per-chunk veto at all --
+// there is no Go-side pass over its rows in which a pending mark could be
+// consulted, so the flush is the only mechanism there is.
+type UnihashFlusher interface {
+	FlushNow(ctx context.Context) (int64, error)
+}
+
 // Deps is everything the engine needs from outside its own configuration.
 type Deps struct {
 	DB      Queries
 	Blobs   Blobs
 	Metrics *metrics.Metrics
 	Log     *slog.Logger
+
+	// Access and Unihash are the pre-sweep force-flushers (§6.2 mechanism 1).
+	//
+	// Both are OPTIONAL and nil-tolerant, because a harness that drives the engine
+	// over fakes has no toucher to flush -- but a nil one in production means the
+	// sweep decides on accessed_at values up to --gc-touch-staleness stale, so New
+	// says so, loudly, once.
+	Access  AccessFlusher
+	Unihash UnihashFlusher
 }
 
 // Engine runs sweeps. One per process.
 type Engine struct {
-	db    Queries
-	blobs Blobs
-	rec   *metrics.GCRecorder
-	log   *slog.Logger
-	cfg   Config
+	db      Queries
+	blobs   Blobs
+	access  AccessFlusher
+	unihash UnihashFlusher
+	rec     *metrics.GCRecorder
+	log     *slog.Logger
+	cfg     Config
+
+	// lifetime is the SERVER's context, captured at construction (R7#8), and it is
+	// the one place in this codebase a context is deliberately held in a struct.
+	//
+	// TriggerAsync's detached sweep needs a context that outlives the HTTP request
+	// that started it (the request's dies with the response, often the instant the
+	// handler returns) but NOT the process. context.WithoutCancel(request) gave the
+	// first property and lost the second: the sweep became uncancellable, so
+	// shutdown could neither stop it nor wait for it, and it kept deleting rows
+	// while the pool it deletes through was closing. Deriving from the server's own
+	// lifetime instead gives a sweep that shuts down exactly like the interval
+	// loop's -- finish the chunk, write the terminal gc_runs row under
+	// WithoutCancel -- and asyncDone() is what lets Boot wait for that to happen.
+	lifetime context.Context //nolint:containedctx // the process lifetime, see above
+
+	// async counts detached (TriggerAsync) sweeps in flight so shutdown can wait for
+	// their terminal FinishGCRun. The interval loop is waited on through its own
+	// done channel in Boot; this is the same guarantee for the runs an operator
+	// started by hand.
+	async sync.WaitGroup
 
 	// running guards REAL runs. The database's partial unique index is the real
 	// authority; this exists so the API trigger can answer 409 without first writing
@@ -254,16 +361,24 @@ type Engine struct {
 	// declines to scan would silently disappear from the scrape.
 	lastUsage map[int64]snapshot
 
-	// nullPermille is the fraction (per mille) of scanned cache_objects rows whose
-	// accessed_at is still NULL. It drives the toucher's T ramp: see TouchStaleness.
-	nullPermille atomic.Int64
+	// rampUntil is gc_state.touch_ramp_until as unix nanos, read ONCE at boot
+	// (LoadTouchRamp) and read on every toucher tick by TouchStaleness. Zero means
+	// "not read yet", which resolves to the RAMPED (conservative, fewer writes)
+	// end -- see TouchStaleness.
+	rampUntil atomic.Int64
 }
 
 // New validates deps and cfg and builds the engine. Zero-valued durations and
 // batch sizes take the spec's shipped defaults rather than degenerating into a
 // zero interval or an empty chunk.
-func New(deps Deps, cfg Config) (*Engine, error) {
+//
+// ctx is the SERVER LIFETIME context, not a boot context (R7#8): it is what
+// TriggerAsync's detached sweeps run under, so a context that ends when Boot
+// finishes wiring would cancel every API-triggered sweep the instant it started.
+func New(ctx context.Context, deps Deps, cfg Config) (*Engine, error) {
 	switch {
+	case ctx == nil:
+		return nil, errors.New("gc: a lifetime context is required")
 	case deps.DB == nil:
 		return nil, errors.New("gc: Deps.DB is required")
 	case deps.Blobs == nil:
@@ -301,22 +416,28 @@ func New(deps Deps, cfg Config) (*Engine, error) {
 		cfg.TouchStaleness = time.Hour
 	}
 
-	e := &Engine{
-		db:           deps.DB,
-		blobs:        deps.Blobs,
-		rec:          deps.Metrics.GC(),
-		log:          log,
-		cfg:          cfg,
-		running:      atomic.Bool{},
-		measuredMu:   sync.Mutex{},
-		measured:     map[int64]time.Time{},
-		lastUsage:    map[int64]snapshot{},
-		nullPermille: atomic.Int64{},
+	if deps.Access == nil || deps.Unihash == nil {
+		log.Warn("gc: a pre-sweep access flusher is not wired: the sweep will decide on " +
+			"accessed_at values up to --gc-touch-staleness stale, and stage 1 has no veto " +
+			"of its own to fall back on")
 	}
 
-	// Opens at "every row is untouched", which is the true state of every row the
-	// moment 000012 lands and the conservative end of the ramp.
-	e.nullPermille.Store(1000)
+	e := &Engine{
+		db:         deps.DB,
+		blobs:      deps.Blobs,
+		access:     deps.Access,
+		unihash:    deps.Unihash,
+		rec:        deps.Metrics.GC(),
+		log:        log,
+		cfg:        cfg,
+		lifetime:   ctx,
+		async:      sync.WaitGroup{},
+		running:    atomic.Bool{},
+		measuredMu: sync.Mutex{},
+		measured:   map[int64]time.Time{},
+		lastUsage:  map[int64]snapshot{},
+		rampUntil:  atomic.Int64{},
+	}
 
 	return e, nil
 }
