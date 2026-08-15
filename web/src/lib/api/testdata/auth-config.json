@@ -1,0 +1,16 @@
+{
+  "issuer": "https://id.acme.dev/realms/main",
+  "client_id": "bakery-console",
+  "scopes": [
+    "openid",
+    "profile",
+    "email",
+    "groups"
+  ],
+  "authorization_endpoint": "https://id.acme.dev/realms/main/protocol/openid-connect/auth",
+  "token_endpoint": "https://id.acme.dev/realms/main/protocol/openid-connect/token",
+  "device_authorization_endpoint": "https://id.acme.dev/realms/main/protocol/openid-connect/auth/device",
+  "oidc_enabled": true,
+  "dev_login_enabled": false,
+  "allow_self_serve_orgs": true
+}

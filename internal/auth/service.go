@@ -61,6 +61,13 @@ type Deps struct {
 	// and NOWHERE else. There is no setter, no API route and no database column
 	// that can turn it on; see devlogin.go.
 	DevLogin bool
+
+	// AllowSelfServeOrgs mirrors --allow-self-serve-orgs, the SAME flag
+	// server.Boot already threads into api.Config.AllowSelfServeOrgs (orgs.go's
+	// enforcement). This package's copy is read-only, for AuthConfig alone (B8):
+	// it lets the console decide whether to render "Create organization" BEFORE
+	// the caller is even authenticated, which api.Me cannot do.
+	AllowSelfServeOrgs bool
 }
 
 // Service is the auth layer: verification, sessions, reconciliation, keys.
@@ -72,6 +79,9 @@ type Service struct {
 	metrics  *metrics.Metrics
 	log      *slog.Logger
 	devLogin bool
+
+	// allowSelfServeOrgs: see Deps.AllowSelfServeOrgs. Read only by AuthConfig.
+	allowSelfServeOrgs bool
 
 	keys    keyStore
 	toucher *keyToucher
@@ -107,15 +117,16 @@ func New(d Deps) (*Service, error) {
 	}
 
 	return &Service{
-		store:    d.Store,
-		sessions: d.Sessions,
-		provider: d.Provider,
-		groups:   groups,
-		metrics:  d.Metrics,
-		log:      log,
-		devLogin: d.DevLogin,
-		keys:     keys,
-		toucher:  newKeyToucher(keys),
+		store:              d.Store,
+		sessions:           d.Sessions,
+		provider:           d.Provider,
+		groups:             groups,
+		metrics:            d.Metrics,
+		log:                log,
+		devLogin:           d.DevLogin,
+		allowSelfServeOrgs: d.AllowSelfServeOrgs,
+		keys:               keys,
+		toucher:            newKeyToucher(keys),
 	}, nil
 }
 
@@ -166,12 +177,13 @@ func (s *Service) AuthConfig() AuthConfig {
 	cfg := AuthConfig{
 		Issuer: "", ClientID: "", Scopes: nil,
 		AuthorizationEndpoint: "", TokenEndpoint: "", DeviceAuthorizationEndpoint: "",
-		OIDCEnabled: false, DevLoginEnabled: s.devLogin,
+		OIDCEnabled: false, DevLoginEnabled: s.devLogin, AllowSelfServeOrgs: s.allowSelfServeOrgs,
 	}
 
 	if s.provider != nil {
 		cfg = s.provider.AuthConfig()
 		cfg.DevLoginEnabled = s.devLogin
+		cfg.AllowSelfServeOrgs = s.allowSelfServeOrgs
 	}
 
 	return cfg
@@ -197,7 +209,10 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	req, err := s.provider.AuthCodeURL()
 	if err != nil {
 		s.log.ErrorContext(r.Context(), "build authorization URL", slog.Any("error", err))
-		writeAuthError(w, http.StatusInternalServerError, codeInternal, "authentication is unavailable")
+		// B8 (R8#2): a redirect into the SPA's own /login, not raw JSON -- this is
+		// the "Continue with SSO" click itself failing, before the browser has gone
+		// anywhere near the IdP, so there is no console session to fall back into.
+		redirectDenied(w, r, deniedAuthFailed)
 
 		return
 	}
@@ -208,7 +223,7 @@ func (s *Service) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	// token cannot be the one that ends up carrying the completed login.
 	if err := s.sessions.RenewToken(ctx); err != nil {
 		s.log.ErrorContext(ctx, "renew session token", slog.Any("error", err))
-		writeAuthError(w, http.StatusInternalServerError, codeInternal, "authentication is unavailable")
+		redirectDenied(w, r, deniedAuthFailed)
 
 		return
 	}
@@ -230,9 +245,13 @@ func (s *Service) HandleCallback(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
+	// B8 (R8#2): every arm below that can be reached by a real browser mid-flow
+	// redirects into the SPA's own /login with a reason, rather than writing the
+	// raw JSON error envelope at this callback URL -- see the const block above
+	// deniedLoginGate for why a JSON page here is a dead end for a browser.
 	if errParam := r.URL.Query().Get("error"); errParam != "" {
 		s.observe(MethodSession, "denied")
-		writeAuthError(w, http.StatusForbidden, codeForbidden, "the identity provider refused the login")
+		redirectDenied(w, r, deniedIDPRefused)
 
 		return
 	}
@@ -245,7 +264,7 @@ func (s *Service) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	if wantState == "" || subtle.ConstantTimeCompare([]byte(wantState), []byte(gotState)) != 1 {
 		s.observe(MethodSession, "error")
 		s.log.WarnContext(ctx, "oidc callback state mismatch")
-		writeAuthError(w, http.StatusBadRequest, codeBadRequest, ErrStateMismatch.Error())
+		redirectDenied(w, r, deniedStaleRequest)
 
 		return
 	}
@@ -261,7 +280,7 @@ func (s *Service) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	if code == "" {
 		s.observe(MethodSession, "error")
-		writeAuthError(w, http.StatusBadRequest, codeBadRequest, "the callback carried no authorization code")
+		redirectDenied(w, r, deniedStaleRequest)
 
 		return
 	}
@@ -270,7 +289,7 @@ func (s *Service) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.observe(MethodSession, "error")
 		s.log.WarnContext(ctx, "oidc code exchange failed", slog.Any("error", err))
-		writeAuthError(w, http.StatusUnauthorized, codeUnauthorized, "authentication failed")
+		redirectDenied(w, r, deniedAuthFailed)
 
 		return
 	}
@@ -281,14 +300,18 @@ func (s *Service) HandleCallback(w http.ResponseWriter, r *http.Request) {
 			s.observe(MethodSession, "denied")
 			s.log.WarnContext(ctx, "login refused",
 				slog.String("subject", id.Subject), slog.Any("error", err))
-			writeAuthError(w, http.StatusForbidden, codeForbidden, ErrLoginNotAllowed.Error())
+
+			// ErrLoginNotAllowed covers BOTH arms Reconcile can produce it from -- the
+			// login-gate group check AND the unreadable-groups-claim fail-closed trap
+			// (reconcile.go's GroupsPresent guard).
+			redirectDenied(w, r, deniedLoginGate)
 
 			return
 		}
 
 		s.observe(MethodSession, "error")
 		s.log.ErrorContext(ctx, "login reconciliation failed", slog.Any("error", err))
-		writeAuthError(w, http.StatusInternalServerError, codeInternal, "authentication failed")
+		redirectDenied(w, r, deniedAuthFailed)
 
 		return
 	}
@@ -296,7 +319,7 @@ func (s *Service) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	if err := s.establish(ctx, userID); err != nil {
 		s.observe(MethodSession, "error")
 		s.log.ErrorContext(ctx, "establish session", slog.Any("error", err))
-		writeAuthError(w, http.StatusInternalServerError, codeInternal, "authentication failed")
+		redirectDenied(w, r, deniedAuthFailed)
 
 		return
 	}
@@ -636,8 +659,39 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	// Headers, then WriteHeader, then body. Setting a header after WriteHeader is
 	// a silent no-op, and encoding before it flushes an implicit 200.
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	// B8 (SPA->API wiring wave): the control plane is private data, exactly like
+	// internal/api's own writeJSON already treats it -- these /auth/* responses
+	// (config, dev-login, the callback's error body) carried no Cache-Control at
+	// all before this, which is a small but real footgun for /auth/config: a
+	// stale cached copy across a dev_login_enabled flip is wrong in the
+	// direction that shows a login screen a deployment no longer has.
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// Denial reasons for the /login?denied=<reason> redirect (B8, R8#2 continued).
+//
+// Every browser-facing failure arm of HandleLogin and HandleCallback lands here
+// instead of writing the raw JSON error envelope at the callback URL: a user
+// mid-OIDC-round-trip has no console chrome to read a {"error":{...}} page with,
+// nothing to click, and (pre-fix) nothing to do but close the tab. The reasons
+// are a small closed set so login/+page.svelte can render per-reason copy
+// (deniedStaleRequest suggests trying the sign-in link again; the others do not,
+// because retrying an idp_refused or auth_failed denial without changing
+// anything will just fail again the same way).
+const (
+	deniedLoginGate    = "login_gate"    // Reconcile refused: the login gate, or the unreadable-groups trap.
+	deniedIDPRefused   = "idp_refused"   // The identity provider itself answered ?error=.
+	deniedStaleRequest = "stale_request" // A state mismatch or a code-less callback: an old or reused link.
+	deniedAuthFailed   = "auth_failed"   // Code exchange, reconciliation (non-gate) or session establishment failed.
+)
+
+// redirectDenied sends the browser to the SPA's own /login with a reason the
+// login screen can render copy for. See the const block above for why this
+// exists and what each reason means.
+func redirectDenied(w http.ResponseWriter, r *http.Request, reason string) {
+	http.Redirect(w, r, "/login?denied="+reason, http.StatusFound)
 }
 
 // Error codes for /api/v1/auth/* failures.

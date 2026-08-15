@@ -432,7 +432,25 @@ type ServeCmd struct {
 	// falls back to the request's own scheme and Host (correct for a direct
 	// connection, e.g. `bakery serve` on a laptop) -- SET THIS IN ANY DEPLOYMENT WITH
 	// A PROXY IN FRONT OF IT.
-	ExternalURL string `env:"EXTERNAL_URL" help:"The server's public base URL (e.g. https://bakery.example.com), used as the OCI Bearer challenge realm. Set this when a TLS-terminating proxy sits in front of Bakery -- request-derived URLs are wrong there." name:"external-url"`
+	ExternalURL string `env:"EXTERNAL_URL" help:"The server's public base URL (e.g. https://bakery.example.com), used as the OCI Bearer challenge realm and as the config-snippet generator's origin. Set this when a TLS-terminating proxy sits in front of Bakery -- request-derived URLs are wrong there." name:"external-url"`
+
+	// GRPCExternalEndpoint is the PUBLIC gRPC authority Bazel and moon should dial,
+	// e.g. "grpcs://bakery.example.com:9092".
+	//
+	// GRPCAddr above is where the process BINDS; this is where the world REACHES it,
+	// and nothing in the process can derive the second from the first. The config
+	// snippet generator needs the second: a Bazel or moon client pointed at a port
+	// nothing listens on does not fail the build -- it disables its remote cache,
+	// logs at DEBUG, and delivers 0% hits on green builds, which is the quietest
+	// possible way for a cache server to be useless.
+	//
+	// Empty is supported: with GRPCAddr set, the generator derives
+	// {scheme}://{public host}:{GRPCAddr's port} and warns once. That guess is right
+	// for the single-host deployment and for local dev, and wrong the moment an
+	// ingress maps the listener somewhere else -- which is what this flag is for.
+	// Empty here AND an empty GRPCAddr is a 409 on a bazel/moon snippet: the REAPI
+	// listener is switched off, so there is no endpoint to name.
+	GRPCExternalEndpoint string `env:"GRPC_EXTERNAL_ENDPOINT" help:"The public gRPC endpoint Bazel and moon should dial (e.g. grpcs://bakery.example.com:9092), used verbatim in generated config snippets. Set this whenever an ingress maps the REAPI listener to a different host or port." name:"grpc-external-endpoint"`
 
 	// OCIUpstreamAuth is the SERVER-LEVEL credential map for M5's upstream registry
 	// fetches: "host=user:secret", repeated. It lives here and NOT in the database for

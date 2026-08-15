@@ -43,8 +43,11 @@ type CreateBackendRequest struct {
 	// pointer can only carry two: absent (keep whatever was seeded), explicit null
 	// (retain forever / no cap -- a real, reachable state), and a value. A *string
 	// collapses the first two, which would make "retain forever" unexpressible.
-	RetentionWindow json.RawMessage `json:"retention_window"`
-	QuotaBytes      json.RawMessage `json:"quota_bytes"`
+	//
+	// omitempty on the encoding side, same reasoning as UpdateBackendRequest's
+	// identical fields immediately below.
+	RetentionWindow json.RawMessage `json:"retention_window,omitempty"`
+	QuotaBytes      json.RawMessage `json:"quota_bytes,omitempty"`
 }
 
 // UpdateBackendRequest patches a backend. Absent fields are left alone; kind is
@@ -62,8 +65,16 @@ type UpdateBackendRequest struct {
 	// UpdateBackend sets both columns unconditionally (a plain nullable UPDATE),
 	// because NULL is already a meaningful value for both and a query-level
 	// "leave alone" would need a sentinel a nullable interval has no room for.
-	RetentionWindow json.RawMessage `json:"retention_window"`
-	QuotaBytes      json.RawMessage `json:"quota_bytes"`
+	//
+	// omitempty on the ENCODING side only (decodeJSON never re-marshals this
+	// struct; it reads the request body's raw bytes). Without it, a Go caller
+	// that builds an UpdateBackendRequest{Enabled: &x} and leaves these two
+	// nil would have json.Marshal emit an explicit `"retention_window":null`,
+	// which is indistinguishable on the wire from a DELIBERATE clear -- see
+	// UpdateOrgRequest's identical fields (orgs.go) for the caller
+	// (internal/cli's RenameOrg) that hit exactly this trap.
+	RetentionWindow json.RawMessage `json:"retention_window,omitempty"`
+	QuotaBytes      json.RawMessage `json:"quota_bytes,omitempty"`
 }
 
 // handleListBackends lists a project's configured backends.
@@ -341,13 +352,27 @@ func backendConfig(raw json.RawMessage) ([]byte, error) {
 // indistinguishable from null except that it looks like a real setting.
 const maxRetentionWindow = 10 * 365 * 24 * time.Hour
 
-// backendRetentionPatch parses the three-state retention_window field.
+// backendRetentionPatch parses a backend's own three-state retention_window
+// field. See retentionWindowPatch, which this and the org-level
+// default_retention_window field (orgs.go) both use -- the encoding is
+// identical, only the JSON field name in a 422 differs.
+func backendRetentionPatch(raw json.RawMessage) (pgtype.Interval, bool, error) {
+	return retentionWindowPatch(raw, "retention_window")
+}
+
+// retentionWindowPatch parses ANY three-state retention_window-shaped field:
+// absent (not set), explicit null ("retain forever" -- a real state, spec §4,
+// and the shipped state of every downloads backend), or a duration string.
+//
+// field names the JSON key in the 422 it might return, so ONE parser serves a
+// backend's own retention_window and an org's default_retention_window
+// (000012's default_retention_window column, B4) with the right field name in
+// each.
 //
 // Returns (value, set): set=false means the field was ABSENT and the caller must
-// keep the current column; set=true with an invalid pgtype.Interval means an
-// explicit null -- "retain forever", a real state (spec §4) and the shipped state
-// of every downloads backend.
-func backendRetentionPatch(raw json.RawMessage) (pgtype.Interval, bool, error) {
+// keep the current column; set=true with an invalid pgtype.Interval means the
+// explicit null.
+func retentionWindowPatch(raw json.RawMessage, field string) (pgtype.Interval, bool, error) {
 	if len(raw) == 0 {
 		return pgtype.Interval{}, false, nil
 	}
@@ -355,7 +380,7 @@ func backendRetentionPatch(raw json.RawMessage) (pgtype.Interval, bool, error) {
 	var s *string
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return pgtype.Interval{}, false,
-			errValidation("retention_window", `retention_window must be a duration string like "720h", or null`)
+			errValidation(field, field+` must be a duration string like "720h", or null`)
 	}
 
 	if s == nil {
@@ -365,7 +390,7 @@ func backendRetentionPatch(raw json.RawMessage) (pgtype.Interval, bool, error) {
 	d, err := time.ParseDuration(*s)
 	if err != nil {
 		return pgtype.Interval{}, false,
-			errValidation("retention_window", `retention_window must be a duration string like "720h", or null`)
+			errValidation(field, field+` must be a duration string like "720h", or null`)
 	}
 
 	// > 0 mirrors cache_backends_retention_window_positive. A zero or negative
@@ -373,8 +398,8 @@ func backendRetentionPatch(raw json.RawMessage) (pgtype.Interval, bool, error) {
 	// purpose and which the CHECK refuses anyway -- refusing it here makes it a 422
 	// with a sentence instead of a 500 with a constraint name.
 	if d <= 0 || d > maxRetentionWindow {
-		return pgtype.Interval{}, false, errValidation("retention_window",
-			"retention_window must be positive and no more than 10 years, or null to retain forever")
+		return pgtype.Interval{}, false, errValidation(field,
+			field+" must be positive and no more than 10 years, or null to retain forever")
 	}
 
 	return pgtype.Interval{
@@ -400,23 +425,11 @@ func backendRetentionPatch(raw json.RawMessage) (pgtype.Interval, bool, error) {
 func backendQuotaPatch(
 	raw json.RawMessage, kind repository.BackendKind,
 ) (pgtype.Int8, bool, error) {
-	if len(raw) == 0 {
-		return pgtype.Int8{}, false, nil
-	}
-
-	var n *int64
-	if err := json.Unmarshal(raw, &n); err != nil {
-		return pgtype.Int8{}, false,
-			errValidation("quota_bytes", "quota_bytes must be a positive integer, or null for no cap")
-	}
-
-	if n == nil {
-		return pgtype.Int8{}, true, nil
-	}
-
-	if *n <= 0 {
-		return pgtype.Int8{}, false,
-			errValidation("quota_bytes", "quota_bytes must be a positive integer, or null for no cap")
+	v, set, err := quotaBytesPatch(raw, "quota_bytes")
+	if err != nil || !set || !v.Valid {
+		// Not set, an error, or the explicit-null ("no cap") case: none of those needs
+		// the kind-specific refusal below, which only ever fires on a concrete cap.
+		return v, set, err
 	}
 
 	switch kind {
@@ -428,11 +441,37 @@ func backendQuotaPatch(
 		return pgtype.Int8{}, false, errValidation("quota_bytes",
 			"an oci backend cannot have a quota: a pull-through proxy is bounded by its "+
 				"retention window")
-	case repository.BackendKindSstate, repository.BackendKindDownloads, repository.BackendKindBazel:
-		return pgtype.Int8{Int64: *n, Valid: true}, true, nil
 	default:
-		return pgtype.Int8{Int64: *n, Valid: true}, true, nil
+		return v, true, nil
 	}
+}
+
+// quotaBytesPatch parses ANY three-state quota_bytes-shaped field: absent (not
+// set), explicit null (no cap), or a positive integer. field names the JSON key
+// in the 422 it might return, so this one parser serves a backend's own
+// quota_bytes (with backendQuotaPatch's kind-specific refusal layered on top)
+// and an org's unrestricted default_quota_bytes (000012, B4) alike.
+func quotaBytesPatch(raw json.RawMessage, field string) (pgtype.Int8, bool, error) {
+	if len(raw) == 0 {
+		return pgtype.Int8{}, false, nil
+	}
+
+	var n *int64
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return pgtype.Int8{}, false,
+			errValidation(field, field+" must be a positive integer, or null for no cap")
+	}
+
+	if n == nil {
+		return pgtype.Int8{}, true, nil
+	}
+
+	if *n <= 0 {
+		return pgtype.Int8{}, false,
+			errValidation(field, field+" must be a positive integer, or null for no cap")
+	}
+
+	return pgtype.Int8{Int64: *n, Valid: true}, true, nil
 }
 
 // pickInterval resolves a patched-or-current interval. See handleUpdateBackend for

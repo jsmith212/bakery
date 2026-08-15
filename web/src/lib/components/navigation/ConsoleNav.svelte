@@ -1,56 +1,103 @@
 <script lang="ts">
+	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
+
+	import { logout } from '$lib/api/auth';
+	import { isSiteAdmin } from '$lib/roles';
+	import { clearSession } from '$lib/session';
+	import { toastError } from '$lib/toasts';
+	import { orgPath, projectPath } from '$lib/tenancy';
 	import { theme, setTheme, resolveTheme } from '$lib/theme';
 	import { Button } from '$lib/components/buttons';
-	import { Badge, type BadgeStatus } from '$lib/components/badges';
+	import type { Me, Org, Project } from '$lib/api/types';
 
-	interface OrgOption {
-		name: string;
-		count: string;
+	interface Props {
+		me: Me;
+		/** `GET /orgs` -- every org the caller can VIEW, not only their memberships. */
+		orgs: Org[];
+		/** `GET /orgs/{org}/projects`, empty on the global screens. */
+		projects: Project[];
+		currentOrg: string | null;
+		currentProject: string | null;
 	}
-	interface ProjectOption {
-		name: string;
-		status: BadgeStatus;
-	}
+
+	let { me, orgs, projects, currentOrg, currentProject }: Props = $props();
 
 	let openMenu = $state<'org' | 'project' | null>(null);
-	let currentOrg = $state('acme');
-	let currentProject = $state('firmware');
-
-	const orgs: OrgOption[] = [
-		{ name: 'acme', count: '5' },
-		{ name: 'robotics-lab', count: '2' },
-		{ name: 'personal', count: '1' }
-	];
-
-	const projects: ProjectOption[] = [
-		{ name: 'firmware', status: 'hit' },
-		{ name: 'tools', status: 'hit' },
-		{ name: 'kernel-ci', status: 'stale' },
-		{ name: 'images', status: 'hit' },
-		{ name: 'sandbox', status: 'idle' }
-	];
 
 	const path = $derived(page.url.pathname);
+	const orgBase = $derived(currentOrg ? orgPath(currentOrg) : null);
+	const projectBase = $derived(
+		currentOrg && currentProject ? projectPath(currentOrg, currentProject) : null
+	);
 
-	const projectNav = $derived([
-		{ label: 'Overview', href: '/overview', active: path === '/overview' },
-		{ label: 'Backends', href: '/backends/sstate', active: path.startsWith('/backends') },
-		{ label: 'API keys', href: '/keys', active: path === '/keys' },
-		{ label: 'Config snippets', href: '/snippets', active: path === '/snippets' }
-	]);
+	// A hardcoded `/backends/sstate` 404s for a project whose only configured
+	// kind is, say, `oci` -- there is no sstate mount to land on. Point at the
+	// current project's own first configured kind instead, falling back to the
+	// "add a backend" screen when it has none yet.
+	const currentProjectObj = $derived(projects.find((p) => p.slug === currentProject) ?? null);
+	const backendsHref = $derived.by(() => {
+		if (!projectBase) return null;
+		const kind = currentProjectObj?.backends[0];
 
-	const orgNav = $derived([
-		{ label: 'Projects', href: '/projects', active: path === '/projects' },
-		{ label: 'Members', href: '/members', active: path === '/members' },
-		{ label: 'Settings', href: '/settings', active: path === '/settings' }
-	]);
+		return kind ? `${projectBase}/backends/${kind}` : `${projectBase}/backends/new`;
+	});
+
+	// Nav sections appear only when their scope exists. A "Backends" link with no
+	// project in the path would resolve to nothing; an absent link says the same
+	// thing honestly.
+	const projectNav = $derived(
+		projectBase && backendsHref
+			? [
+					{ label: 'Overview', href: `${projectBase}/overview` },
+					{ label: 'Backends', href: backendsHref },
+					{ label: 'API keys', href: `${projectBase}/keys` },
+					{ label: 'Config snippets', href: `${projectBase}/snippets` }
+				]
+			: []
+	);
+
+	const orgNav = $derived(
+		orgBase
+			? [
+					{ label: 'Projects', href: `${orgBase}/projects` },
+					{ label: 'Members', href: `${orgBase}/members` },
+					{ label: 'Settings', href: `${orgBase}/settings` }
+				]
+			: []
+	);
+
+	// Instance-wide operator screens. Gated on `is_site_admin`, which is what
+	// `GET /me` reports and what every one of those endpoints re-checks -- the
+	// gate is cosmetic and the server is the authority.
+	const instanceNav = $derived(
+		isSiteAdmin(me)
+			? [
+					{ label: 'Garbage collection', href: '/gc' },
+					{ label: 'Site admins', href: '/site-admins' }
+				]
+			: []
+	);
+
+	function active(href: string): boolean {
+		return path === href || path.startsWith(`${href}/`);
+	}
+
+	// "Backends" stays lit across `/backends/sstate`, `/backends/oci` and
+	// `/backends/new`, which `active()` alone would not do for a link that names
+	// one kind.
+	function navActive(href: string): boolean {
+		if (projectBase && href.startsWith(`${projectBase}/backends`)) {
+			return path.startsWith(`${projectBase}/backends`);
+		}
+
+		return active(href);
+	}
 
 	const userActive = $derived(path === '/user');
-	const projectColor = $derived(currentProject === 'all projects' ? 'text-text-3' : 'text-text-1');
-
 	const resolved = $derived(resolveTheme($theme));
 	const themeLabel = $derived(resolved === 'dark' ? 'Light theme' : 'Dark theme');
+	const initial = $derived((me.display_name || me.email || '?').trim().charAt(0).toUpperCase());
 
 	function toggleTheme() {
 		setTheme(resolved === 'dark' ? 'light' : 'dark');
@@ -60,14 +107,24 @@
 		openMenu = openMenu === which ? null : which;
 	}
 
-	function selectOrg(name: string) {
-		currentOrg = name;
-		openMenu = null;
-	}
+	let signingOut = $state(false);
 
-	function selectProject(name: string) {
-		currentProject = name;
-		openMenu = null;
+	async function signOut() {
+		if (signingOut) return;
+		signingOut = true;
+
+		try {
+			// Bodyless POST, matching `logout()`'s own contract (see api/auth.ts):
+			// `requireJSON` would accept a JSON body here too, but there is nothing
+			// to send, so this sends nothing.
+			await logout();
+			clearSession();
+			await goto('/login', { replaceState: true });
+		} catch (err) {
+			toastError(err, 'Could not sign out');
+		} finally {
+			signingOut = false;
+		}
 	}
 
 	const itemChrome =
@@ -78,7 +135,9 @@
 	const selectorBtn =
 		'flex h-[26px] w-full cursor-pointer items-center gap-1.5 rounded-1 border border-border-0 bg-bg-2 px-2 text-left';
 	const menu =
-		'absolute left-0 top-[calc(100%+4px)] z-40 flex w-[204px] flex-col gap-px rounded-2 border border-border-1 bg-bg-2 p-1 shadow-[var(--shadow-overlay)]';
+		'absolute left-0 top-[calc(100%+4px)] z-40 flex max-h-[320px] w-[204px] flex-col gap-px overflow-y-auto rounded-2 border border-border-1 bg-bg-2 p-1 shadow-[var(--shadow-overlay)]';
+	const sectionLabel =
+		'mb-1 mt-4 px-2 text-xs font-medium uppercase tracking-[var(--tracking-label)] text-text-3';
 </script>
 
 <svelte:window
@@ -107,26 +166,30 @@
 					>Org</span
 				>
 				<span
-					class="overflow-hidden text-ellipsis whitespace-nowrap font-mono text-sm text-text-1"
-					>{currentOrg}</span
+					class="overflow-hidden text-ellipsis whitespace-nowrap font-mono text-sm {currentOrg
+						? 'text-text-1'
+						: 'text-text-3'}">{currentOrg ?? 'none'}</span
 				>
 				<span class="ml-auto text-[8px] text-text-3" aria-hidden="true">▼</span>
 			</button>
 			{#if openMenu === 'org'}
 				<div class={menu}>
-					{#each orgs as o (o.name)}
-						<button
-							type="button"
-							aria-current={o.name === currentOrg ? 'true' : undefined}
-							onclick={() => selectOrg(o.name)}
-							class="{itemChrome} h-7 {o.name === currentOrg ? itemActive : itemIdle}"
+					{#each orgs as o (o.id)}
+						<a
+							href="{orgPath(o.slug)}/projects"
+							aria-current={o.slug === currentOrg ? 'true' : undefined}
+							onclick={() => (openMenu = null)}
+							class="{itemChrome} h-7 {o.slug === currentOrg ? itemActive : itemIdle}"
 						>
-							<span class="font-mono text-sm">{o.name}</span>
-							<span class="tabular ml-auto text-xs text-text-3">{o.count}</span>
-						</button>
+							<span class="overflow-hidden text-ellipsis whitespace-nowrap font-mono text-sm"
+								>{o.slug}</span
+							>
+						</a>
 					{/each}
 					<div class="my-[3px] border-t border-border-0"></div>
-					<button type="button" class="{itemChrome} h-7 {itemAccent}">Create organization</button>
+					<a href="/orgs" onclick={() => (openMenu = null)} class="{itemChrome} h-7 {itemAccent}"
+						>All organizations</a
+					>
 				</div>
 			{/if}
 		</div>
@@ -136,73 +199,93 @@
 				type="button"
 				aria-haspopup="true"
 				aria-expanded={openMenu === 'project'}
+				disabled={!currentOrg}
 				onclick={() => toggleMenu('project')}
-				class={selectorBtn}
+				class="{selectorBtn} disabled:cursor-not-allowed"
 			>
 				<span
 					class="w-[34px] shrink-0 text-[9px] font-medium uppercase tracking-[var(--tracking-label)] text-text-3"
 					>Proj</span
 				>
 				<span
-					class="overflow-hidden text-ellipsis whitespace-nowrap font-mono text-sm {projectColor}"
-					>{currentProject}</span
+					class="overflow-hidden text-ellipsis whitespace-nowrap font-mono text-sm {currentProject
+						? 'text-text-1'
+						: 'text-text-3'}">{currentProject ?? 'none'}</span
 				>
 				<span class="ml-auto text-[8px] text-text-3" aria-hidden="true">▼</span>
 			</button>
-			{#if openMenu === 'project'}
+			{#if openMenu === 'project' && currentOrg}
 				<div class={menu}>
-					{#each projects as p (p.name)}
-						<button
-							type="button"
-							aria-current={p.name === currentProject ? 'true' : undefined}
-							onclick={() => selectProject(p.name)}
-							class="{itemChrome} h-7 {p.name === currentProject ? itemActive : itemIdle}"
+					{#each projects as p (p.id)}
+						<a
+							href="{projectPath(currentOrg, p.slug)}/overview"
+							aria-current={p.slug === currentProject ? 'true' : undefined}
+							onclick={() => (openMenu = null)}
+							class="{itemChrome} h-7 {p.slug === currentProject ? itemActive : itemIdle}"
 						>
-							<span class="font-mono text-sm">{p.name}</span>
-							<span class="ml-auto"><Badge status={p.status} /></span>
-						</button>
+							<span class="overflow-hidden text-ellipsis whitespace-nowrap font-mono text-sm"
+								>{p.slug}</span
+							>
+						</a>
+					{:else}
+						<div class="px-2 py-1.5 text-sm text-text-3">No projects yet</div>
 					{/each}
 					<div class="my-[3px] border-t border-border-0"></div>
-					<button
-						type="button"
-						onclick={() => selectProject('all projects')}
-						class="{itemChrome} h-7 {itemIdle}">All projects</button
+					<a
+						href="{orgPath(currentOrg)}/projects"
+						onclick={() => (openMenu = null)}
+						class="{itemChrome} h-7 {itemAccent}">All projects</a
 					>
-					<button type="button" class="{itemChrome} h-7 {itemAccent}">New project</button>
 				</div>
 			{/if}
 		</div>
 	</div>
 
-	<div
-		class="mb-1 mt-4 px-2 text-xs font-medium uppercase tracking-[var(--tracking-label)] text-text-3"
-	>
-		Project
-	</div>
-	{#each projectNav as it (it.href)}
-		<a
-			href={it.href}
-			aria-current={it.active ? 'page' : undefined}
-			class="{itemChrome} h-7 {it.active ? itemActive : itemIdle}">{it.label}</a
-		>
-	{/each}
+	{#if projectNav.length}
+		<div class={sectionLabel}>Project</div>
+		{#each projectNav as it (it.href)}
+			<a
+				href={it.href}
+				aria-current={navActive(it.href) ? 'page' : undefined}
+				class="{itemChrome} h-7 {navActive(it.href) ? itemActive : itemIdle}">{it.label}</a
+			>
+		{/each}
+	{/if}
 
-	<div
-		class="mb-1 mt-4 px-2 text-xs font-medium uppercase tracking-[var(--tracking-label)] text-text-3"
-	>
-		Org
-	</div>
-	{#each orgNav as it (it.href)}
-		<a
-			href={it.href}
-			aria-current={it.active ? 'page' : undefined}
-			class="{itemChrome} h-7 {it.active ? itemActive : itemIdle}">{it.label}</a
-		>
-	{/each}
+	{#if orgNav.length}
+		<div class={sectionLabel}>Org</div>
+		{#each orgNav as it (it.href)}
+			<a
+				href={it.href}
+				aria-current={active(it.href) ? 'page' : undefined}
+				class="{itemChrome} h-7 {active(it.href) ? itemActive : itemIdle}">{it.label}</a
+			>
+		{/each}
+	{/if}
+
+	{#if instanceNav.length}
+		<div class={sectionLabel}>Instance</div>
+		{#each instanceNav as it (it.href)}
+			<a
+				href={it.href}
+				aria-current={active(it.href) ? 'page' : undefined}
+				class="{itemChrome} h-7 {active(it.href) ? itemActive : itemIdle}">{it.label}</a
+			>
+		{/each}
+	{/if}
 
 	<div class="mt-auto flex flex-col gap-1 pt-2">
 		<Button variant="ghost" size="sm" class="w-full justify-start" onclick={toggleTheme}>
 			{themeLabel}
+		</Button>
+		<Button
+			variant="ghost"
+			size="sm"
+			class="w-full justify-start"
+			disabled={signingOut}
+			onclick={signOut}
+		>
+			Sign out
 		</Button>
 		<a
 			href="/user"
@@ -211,9 +294,9 @@
 		>
 			<span
 				class="inline-flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full border border-accent-border bg-accent-muted text-[10px] font-semibold text-accent-text"
-				>A</span
+				>{initial}</span
 			>
-			<span class="overflow-hidden text-ellipsis whitespace-nowrap text-sm">anna@acme.dev</span>
+			<span class="overflow-hidden text-ellipsis whitespace-nowrap text-sm">{me.email}</span>
 		</a>
 	</div>
 </nav>

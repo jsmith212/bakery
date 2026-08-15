@@ -1,0 +1,28 @@
+{
+  "items": [
+    {
+      "kind": "sstate",
+      "objects_count": 184201,
+      "logical_bytes": 228076715213,
+      "measured_at": "2026-08-15T06:00:00.000Z",
+      "quota_bytes": 549755813888,
+      "retention_window": "2160h0m0s"
+    },
+    {
+      "kind": "hashserv",
+      "objects_count": null,
+      "logical_bytes": null,
+      "measured_at": null,
+      "quota_bytes": null,
+      "retention_window": "2160h0m0s"
+    },
+    {
+      "kind": "downloads",
+      "objects_count": 0,
+      "logical_bytes": 0,
+      "measured_at": "2026-08-15T06:00:00.000Z",
+      "quota_bytes": null,
+      "retention_window": null
+    }
+  ]
+}

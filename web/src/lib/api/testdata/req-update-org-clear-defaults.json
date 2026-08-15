@@ -1,0 +1,5 @@
+{
+  "name": "Acme Corp",
+  "default_retention_window": null,
+  "default_quota_bytes": null
+}

@@ -155,10 +155,41 @@ web/src/lib/components/
   badges/      Badge.svelte
   table/       Table.svelte
   navigation/  Tabs.svelte  ConsoleNav.svelte      (replaces the (console) nav placeholder)
-  feedback/    Modal.svelte  Toast.svelte  EmptyState.svelte  Skeleton.svelte
+  feedback/    Modal.svelte  Toast.svelte  EmptyState.svelte  Skeleton.svelte  Callout.svelte
   content/     CodeBlock.svelte  KeyValueList.svelte
   data/        StatTile.svelte  Sparkline.svelte  TimeSeriesChart.svelte
+               Provenance.svelte
+  feedback/    ... ToastHost.svelte
 ```
+
+Three additions from the SPA→API wiring wave:
+
+- **ToastHost** — mounted exactly once, in `(console)/+layout.svelte`, driven by
+  `$lib/toasts`. `Toast` had zero importers before it, which meant no mutation in
+  the console had any success or failure feedback.
+- **Provenance** — `provenance: Provenance` (`$lib/api/types`), fed by
+  `memberProvenance()` / `siteAdminProvenance()`. One component for both rosters
+  because the two wire shapes share **no** provenance tag
+  (`oidc_role`/`oidc_group`/`local_role`/`org_role_source` versus
+  `site_role_oidc`/`site_oidc_group`/`site_role_local`/`site_role_source`).
+  `org_role_source` is its own vocabulary and is **never** a `BadgeStatus`. It
+  carries no `effective` field on purpose: both consuming rosters already render
+  the effective role through their own dedicated control next to it (the
+  members table's org-role `<Select>`; the site-admins roster needs no separate
+  column at all), so `<Provenance>` answers WHY, never WHAT.
+- **Callout** (`feedback/Callout.svelte`) — `variant: 'warn'|'error'|'info'`,
+  optional `title` (a bold LEAD CLAUSE inline with the body, not a stacked
+  heading), children. Replaces eight identical hand-rolled
+  `border+glyph+px-3 py-2.5` blocks that had drifted into near-duplicates
+  across `keys`, `snippets`, `backends/new` and `gc`; its glyph/color pairing
+  is read from the same table `Toast` uses (`▲ warn`, `✕ error`, `○ info`) so
+  a warning reads the same whether it lands as a toast or sits in place on the
+  page.
+
+`BadgeStatus` has exactly one producer from cache-backend data: `backendStatus()`
+in `$lib/backendStatus`. There is no `as BadgeStatus` cast anywhere and none may
+be reintroduced — there is no JS lint toolchain in this repo, so the guarantee is
+structural.
 
 Use a tiny scoped `<style>` ONLY for what utilities can't express: the toggle knob
 `::after`, the checkbox check `clip-path` `::before`, the select chevron `::after`.
@@ -173,17 +204,33 @@ callback props or events; `render`/node props → snippets. Status is a typograp
 
 - **Button** — `variant: 'primary'|'secondary'|'ghost'|'danger'`,
   `size: 'sm'|'md'|'lg'`, `disabled`, `onclick`, slot children (verb-first label).
+  Optional `href` swaps the root element to `<a>` (same variant/size classes) so a
+  link never wraps a `<button>` — invalid nesting, two tab stops, and `disabled`
+  silently ignored on the button since an anchor has no such attribute. A
+  disabled anchor is genuinely inert: no `href`, `tabindex="-1"`, `aria-disabled`,
+  and a click guard that blocks Enter-activation too, not just a mouse click.
 - **Badge** — either `status: 'hit'|'miss'|'stale'|'idle'` (semantic color + glyph) or
   `variant: 'type'|'accent'` (`type` = lowercase mono id badge, e.g. `sstate`), slot
   children.
 - **Input** — `size: 'sm'|'md'|'lg'`, `mono`, `error`, `placeholder`, `value` (bindable),
   `disabled`. Field chrome: `.bk-field` label/hint/error-text.
 - **Select** — `size`, `error`, `disabled`, options; chevron via scoped `::after`.
-- **Toggle** — `checked` (bindable, drives `aria-checked`), `disabled`, `onchange`;
-  knob via scoped `::after`.
+- **Toggle** — `checked` (bindable, drives `aria-checked`), `disabled`, `onchange`,
+  optional `label` (renders as an adjacent span wired to the switch via
+  `aria-labelledby`, minted with `$props.id()` — `role="switch"` gets nothing
+  from a wrapping `<label>`, unlike a native control); knob via scoped `::after`.
 - **Checkbox** — `checked` (bindable), `disabled`, label; check via scoped `clip-path`.
-- **Tabs** — `tabs: {id,label}[]`, `active`, `onchange`; optional count via
-  `.bk-tab-count`. Underline uses `border-b-2 border-accent-text` on the selected tab.
+- **Tabs** — `tabs: {id,label}[]`, `active`, `onchange`, optional `mono` (identifier-like
+  tab sets — namespace/kind switchers — render `font-mono text-sm` instead of the
+  sans/base default); optional count via `.bk-tab-count`. Underline uses
+  `border-b-2 border-accent-text` on the selected tab.
+- **Field** — `label`, `hint`, `error`, optional `for` (an id override; unused so
+  far). Mints its own id and passes `{id, 'aria-invalid', 'aria-describedby'}` to
+  `children` as a snippet parameter — `{#snippet children(f)}<Input {...f} .../>{/snippet}` —
+  so `Label`'s `for` actually resolves to the control, and the error/hint text is
+  wired to it via `aria-describedby` (`aria-invalid` only on the error path).
+- **Callout** — `variant: 'warn'|'error'|'info'`, optional `title` (bold, inline
+  lead clause — not a stacked heading), children. See "Where components go" above.
 - **SideNav / ConsoleNav** — `sections: {label, items: {id,label,badge?}[]}[]`,
   `active`, `onselect` / `<a>` links; `header` + `footer` snippets. In the app, nav items
   are `<a>`; `aria-current` derives from `$page.url.pathname`. The theme toggle lives in
@@ -191,7 +238,8 @@ callback props or events; `render`/node props → snippets. Status is a typograp
 - **Table** — `dense`, `columns: {key,label,mono?,num?,width?,sortable?,render?}[]`,
   `rows`. `num` → right-aligned tabular; `mono` → mono cell; `render(row)` → snippet.
 - **StatTile** — `label`, `value`, `unit`, `delta`, `deltaGood` (bool → up/down class),
-  `spark: number[]`, `sparkColor`.
+  optional `caption` (a line under the value for a state numbers alone can't say —
+  "not yet measured", "across 3 capped backends"), `spark: number[]`, `sparkColor`.
 - **Sparkline** — `data: number[]`, `height`, `color`. Port the SVG path math verbatim.
 - **TimeSeriesChart** — `height`, `width`, `yMax`, `yFormat: (v)=>string`,
   `xLabels: string[]`, `series: {label,color,data}[]`. Hairline grid, 10px mono axis
@@ -212,29 +260,53 @@ callback props or events; `render`/node props → snippets. Status is a typograp
 Root `+layout.svelte` imports `app.css` and renders children. `+layout.ts` keeps
 `ssr = false`, `prerender = false` (SPA). adapter-static fallback is `index.html`.
 
+**Tenancy is in the PATH** (`/o/{org}/p/{project}/…`), as of the SPA→API wiring wave
+(`docs/design/specs/2026-08-15-spa-api-wiring.md` §4). The two literal segments cost
+nothing and buy immunity from slug collisions — an org named `projects` cannot be
+confused with the projects page, and no slug has to join the reserved list.
+
 ```
-/                       -> redirect to /overview (routes/+page.ts, throw redirect 307;
-                           routes/+page.svelte also gotos as a client fallback)
+/                       routes/+page.ts — resolves a tenant and redirects:
+                          stashed return path -> remembered org -> me.orgs[0]
+                          -> first org from GET /orgs (site admin) -> /orgs
 /login                  routes/login/+page.svelte      (full screen, NO nav rail)
+                          reads GET /auth/config; renders ?denied=login_gate as a
+                          TERMINAL state; dev-login is a parameterless bodyless POST
 
-(console) group — routes/(console)/+layout.svelte renders LEFT NAV + <main> in a
-flex, min-h-screen, bg-bg-0 shell; main is `flex flex-col gap-4 px-5 py-4`.
-The nav is a placeholder to be replaced by ConsoleNav.svelte.
+(console) group — routes/(console)/+layout.ts is the GUARD (GET /me: 200 -> data,
+401 -> stash + /login; there is NO 403 branch, it cannot happen). It also loads
+GET /orgs and GET /auth/config for the nav and the create-org gate.
+routes/(console)/+layout.svelte renders <ConsoleNav/> + <main> + <ToastHost/>.
+routes/(console)/+error.svelte renders a load failure in place, in console chrome.
 
-  /overview             routes/(console)/overview/+page.svelte
-  /projects             routes/(console)/projects/+page.svelte
-  /backends/[type]      routes/(console)/backends/[type]/+page.svelte
-                          (type: sstate|downloads|hashserv|bazel|oci; default sstate)
-  /backends/new         routes/(console)/backends/new/+page.svelte   (static wins over [type])
-  /snippets             routes/(console)/snippets/+page.svelte
-  /keys                 routes/(console)/keys/+page.svelte
-  /members              routes/(console)/members/+page.svelte
-  /settings             routes/(console)/settings/+page.svelte
-  /user                 routes/(console)/user/+page.svelte
+  /orgs                        org picker + create (gated on allow_self_serve_orgs)
+  /user                        global
+  /gc                          global, site admin      (lands in a later wave)
+  /site-admins                 global, site admin      (lands in a later wave)
+
+  o/[org]/+layout.ts           GET /orgs/{org} + GET /orgs/{org}/projects
+                                 (NEVER me.projects — see $lib/api/projects)
+  /o/[org]/projects
+  /o/[org]/members
+  /o/[org]/settings
+
+  o/[org]/p/[project]/+layout.ts   picks the project out of the parent's list
+  /o/[org]/p/[project]/overview
+  /o/[org]/p/[project]/backends/[type]   (sstate|downloads|hashserv|bazel|oci)
+  /o/[org]/p/[project]/backends/new      (static wins over [type])
+  /o/[org]/p/[project]/keys
+  /o/[org]/p/[project]/snippets
 ```
 
-All console pages currently hold a single placeholder heading; screen agents replace the
-bodies. ConsoleNav items are `<a href>`; derive `aria-current` from `$page.url.pathname`.
+The pre-tenancy flat routes (`/overview`, `/projects`, `/backends/[type]`,
+`/backends/new`, `/keys`, `/snippets`, `/members`, `/settings`) survive for one
+release as `+page.ts` redirects (`$lib/legacy`). They exist because the SPA fallback
+serves `index.html` for ANY path: without them a bookmarked URL does not 404 loudly,
+it renders the console's own not-found and looks like the console broke.
+
+ConsoleNav items are `<a href>`; `aria-current` derives from `page.url.pathname`.
+The org and project switchers are `<a href>` navigation built from the layout data —
+never local state.
 
 ## Notes / flags
 

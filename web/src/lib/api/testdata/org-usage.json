@@ -1,0 +1,16 @@
+{
+  "items": [
+    {
+      "project_slug": "firmware",
+      "objects_count": 184201,
+      "logical_bytes": 228076715213,
+      "measured_at": "2026-08-15T06:00:00.000Z"
+    },
+    {
+      "project_slug": "tools",
+      "objects_count": 0,
+      "logical_bytes": 0,
+      "measured_at": null
+    }
+  ]
+}

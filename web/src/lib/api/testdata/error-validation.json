@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "reserved_slug",
+    "field": "slug",
+    "message": "\"cache\" is reserved by the cache URL grammar and cannot be used as a slug"
+  }
+}

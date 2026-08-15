@@ -108,6 +108,25 @@ type Store interface {
 	ListGCRuns(ctx context.Context, arg repository.ListGCRunsParams) ([]repository.ListGCRunsRow, error)
 	GetGCRun(ctx context.Context, id int64) (repository.GetGCRunRow, error)
 
+	// ListOrgGCActivity is B7 (spec 2026-08-15, migration 000013): the per-backend
+	// attribution the engine wrote for the org's own projects, over its most
+	// recent runs. Read-only for the same reason as the two above -- gc_run_backends
+	// is written only by the engine's own sweep.
+	ListOrgGCActivity(ctx context.Context, arg repository.ListOrgGCActivityParams) ([]repository.ListOrgGCActivityRow, error)
+
+	// Usage (B2, first readers of cache_backend_usage -- see query/usage.sql for
+	// why both are LEFT JOINs).
+	GetOrgUsageByProject(ctx context.Context, orgID pgtype.UUID) ([]repository.GetOrgUsageByProjectRow, error)
+	GetProjectBackendUsage(
+		ctx context.Context, projectID pgtype.UUID,
+	) ([]repository.GetProjectBackendUsageRow, error)
+
+	// ListCacheObjectsForBrowse is B3: the keyset object browser over one
+	// backend's cache_objects.
+	ListCacheObjectsForBrowse(
+		ctx context.Context, arg repository.ListCacheObjectsForBrowseParams,
+	) ([]repository.ListCacheObjectsForBrowseRow, error)
+
 	// Tx is required, not optional. A project-role DOWNGRADE must revoke the keys
 	// that now exceed the role IN THE SAME TRANSACTION as the downgrade -- key
 	// validation deliberately does not join project_memberships (that would put a

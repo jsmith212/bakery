@@ -1,0 +1,38 @@
+{
+  "items": [
+    {
+      "user_id": "8f2b1d40-1f7a-4c9d-9a7a-0d2c3b4e5f60",
+      "email": "anna@acme.dev",
+      "display_name": "Anna Roux",
+      "org_role": "admin",
+      "oidc_role": "admin",
+      "oidc_group": "cn=bakery-admins,ou=groups,dc=acme,dc=dev",
+      "granted_at": null,
+      "org_role_source": "oidc_groups"
+    },
+    {
+      "user_id": "9a3c2e51-2a8b-4d0e-8b6c-1e2d3c4b5a69",
+      "email": "bo@acme.dev",
+      "display_name": "Bo Lind",
+      "org_role": "owner",
+      "local_role": "owner",
+      "granted_by": "8f2b1d40-1f7a-4c9d-9a7a-0d2c3b4e5f60",
+      "granted_by_email": "anna@acme.dev",
+      "granted_at": "2026-07-12T09:14:02.114Z",
+      "org_role_source": "local"
+    },
+    {
+      "user_id": "b7c8d9e0-3b4c-4e5f-9a0b-2c3d4e5f6071",
+      "email": "cyd@acme.dev",
+      "display_name": "Cyd Marek",
+      "org_role": "admin",
+      "oidc_role": "member",
+      "oidc_group": "cn=bakery-users,ou=groups,dc=acme,dc=dev",
+      "local_role": "admin",
+      "granted_by": "9a3c2e51-2a8b-4d0e-8b6c-1e2d3c4b5a69",
+      "granted_by_email": "bo@acme.dev",
+      "granted_at": "2026-08-04T13:20:00.000Z",
+      "org_role_source": "oidc_groups+local"
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "items": [
+    {
+      "id": 812,
+      "status": "succeeded",
+      "trigger": "interval",
+      "dry_run": false,
+      "started_at": "2026-08-15T06:00:00.000Z",
+      "finished_at": "2026-08-15T06:04:18.221Z",
+      "objects_deleted": 4102,
+      "hashserv_rows_deleted": 311,
+      "blobs_marked": 3980,
+      "blobs_deleted": 3901,
+      "bytes_reclaimed": 19244310992
+    },
+    {
+      "id": 811,
+      "status": "failed",
+      "trigger": "api",
+      "dry_run": false,
+      "started_at": "2026-08-15T00:00:00.000Z",
+      "finished_at": "2026-08-15T00:00:04.010Z",
+      "error": "sweep sstate: context deadline exceeded",
+      "objects_deleted": 0,
+      "hashserv_rows_deleted": 0,
+      "blobs_marked": 0,
+      "blobs_deleted": 0,
+      "bytes_reclaimed": 0
+    }
+  ],
+  "next_cursor": 811
+}

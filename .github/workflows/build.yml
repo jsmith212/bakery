@@ -393,6 +393,84 @@ jobs:
           name: oci-conformance-log
           path: build/oci-conformance.log
 
+  # The SPA-to-API wiring wave's gate: drive the REAL bakery binary and a real
+  # Chromium through the console -- dev-login, create an org and a project,
+  # configure sstate AND hashserv, mint a project API key, and preview the
+  # yocto config snippet, asserting BB_HASHSERVE and both netrc lines are
+  # present. That last assertion is the regression guard for the exact bug
+  # CLAUDE.md's hashserv invariant describes: a snippet that configures
+  # sstate without hash equivalence builds green while every sstate object
+  # silently misses.
+  #
+  # A SEPARATE job, like the four conformance jobs above: it needs a Chromium
+  # download `build`/`check` have no use for. It runs through
+  # `just web-e2e`, where a skipped or `.only`-narrowed test FAILS -- the same
+  # "a skip is not a pass" shape as every `--- SKIP` grep in this file.
+  web-e2e:
+    runs-on: ubuntu-latest
+
+    # Same postgres service as the other jobs: `bakery serve` (spawned by
+    # Playwright's webServer, not dbtest) reads DB_URL from TEST_DB_URL, and
+    # runs its own real migrations against it at boot.
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --health-start-period 10s
+
+    env:
+      TEST_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "25"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - uses: extractions/setup-just@v3
+
+      # A FRESH runner has no browser and none of the OS libraries Chromium
+      # needs to launch -- --with-deps installs both via apt. `just web-e2e`
+      # also calls `npx playwright install chromium` (idempotent, no-op on a
+      # cache hit) for the laptop case where the libraries are already there
+      # but the browser download is not; this step is what makes the
+      # libraries present here.
+      - name: Install Playwright's Chromium + OS dependencies
+        run: |
+          cd web
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Web e2e (real bakery binary + real Chromium; a skip fails the job)
+        run: just web-e2e
+
+      - name: Upload the web e2e log + report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-e2e-report
+          path: |
+            build/web-e2e.log
+            build/web-e2e.json
+
   commit:
     runs-on: ubuntu-latest
     steps:
@@ -408,7 +486,17 @@ jobs:
 
     # hashserv-conformance is in this list, and that is the point of having written it: a
     # gate that runs, goes red, and still lets the image push to ghcr.io gates nothing.
-    needs: [build, check, commit, conformance, hashserv-conformance, bazel-conformance, oci-conformance]
+    needs:
+      [
+        build,
+        check,
+        commit,
+        conformance,
+        hashserv-conformance,
+        bazel-conformance,
+        oci-conformance,
+        web-e2e,
+      ]
 
     permissions:
       contents: read

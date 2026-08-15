@@ -219,6 +219,18 @@ type fakeStore struct {
 	// fake's paging logic can be the same simple prefix-slice a real keyset scan
 	// produces.
 	gcRuns []repository.ListGCRunsRow
+	// gcRunBackends backs ListOrgGCActivity, keyed by nothing -- a test filters it
+	// itself the way the real query's join would (org-scoped, newest run first).
+	gcRunBackends []repository.ListOrgGCActivityRow
+
+	// orgUsage/projectUsage back B2's two usage reads; objects/cacheObjects backs
+	// B3's browser. All three are DB-shaped (org membership, the hybrid role
+	// model, the keyset comparison itself) enough that the real behavioural tests
+	// are DB-backed -- these exist so the authorization-matrix tests in THIS
+	// package can still assert a denied caller reaches none of them.
+	orgUsage     []repository.GetOrgUsageByProjectRow
+	projectUsage []repository.GetProjectBackendUsageRow
+	cacheObjects []repository.ListCacheObjectsForBrowseRow
 
 	// calls records mutating calls, so a test can assert a denied request wrote
 	// NOTHING -- a 403 that still performed the write is the failure mode a
@@ -785,6 +797,99 @@ func (s *fakeStore) GetGCRun(_ context.Context, id int64) (repository.GetGCRunRo
 	}
 
 	return repository.GetGCRunRow{}, pgx.ErrNoRows
+}
+
+// ListOrgGCActivity's fake does NOT reimplement the real query's org-scoping
+// join: that join is exactly what the real DB-backed test proves (org-scoping
+// of gc/activity -- another org's backends invisible), and a fake that agreed
+// with the handler would prove nothing about it. s.gcRunBackends is therefore
+// whatever ONE test pre-loads (already scoped to the org under test), and this
+// only re-applies the CURSOR and the RUN-COUNT limit, so the pagination-facing
+// unit tests in this package (a short vs. a full page) still have something
+// real to assert against.
+func (s *fakeStore) ListOrgGCActivity(
+	_ context.Context, arg repository.ListOrgGCActivityParams,
+) ([]repository.ListOrgGCActivityRow, error) {
+	s.note("ListOrgGCActivity")
+
+	if s.desiredErr != nil {
+		return nil, s.desiredErr
+	}
+
+	seen := map[int64]bool{}
+	out := make([]repository.ListOrgGCActivityRow, 0, len(s.gcRunBackends))
+
+	for _, row := range s.gcRunBackends {
+		if arg.BeforeID.Valid && row.RunID >= arg.BeforeID.Int64 {
+			continue
+		}
+
+		if !seen[row.RunID] {
+			if int32(len(seen)) == arg.RunLimit {
+				continue
+			}
+
+			seen[row.RunID] = true
+		}
+
+		out = append(out, row)
+	}
+
+	return out, nil
+}
+
+func (s *fakeStore) GetOrgUsageByProject(
+	_ context.Context, orgID pgtype.UUID,
+) ([]repository.GetOrgUsageByProjectRow, error) {
+	s.note("GetOrgUsageByProject")
+
+	if s.desiredErr != nil {
+		return nil, s.desiredErr
+	}
+
+	_ = orgID // the fixture pre-filters; a real Store scopes by it in SQL
+
+	return s.orgUsage, nil
+}
+
+func (s *fakeStore) GetProjectBackendUsage(
+	_ context.Context, projectID pgtype.UUID,
+) ([]repository.GetProjectBackendUsageRow, error) {
+	s.note("GetProjectBackendUsage")
+
+	if s.desiredErr != nil {
+		return nil, s.desiredErr
+	}
+
+	_ = projectID
+
+	return s.projectUsage, nil
+}
+
+func (s *fakeStore) ListCacheObjectsForBrowse(
+	_ context.Context, arg repository.ListCacheObjectsForBrowseParams,
+) ([]repository.ListCacheObjectsForBrowseRow, error) {
+	s.note("ListCacheObjectsForBrowse")
+
+	if s.desiredErr != nil {
+		return nil, s.desiredErr
+	}
+
+	out := make([]repository.ListCacheObjectsForBrowseRow, 0, len(s.cacheObjects))
+
+	for _, row := range s.cacheObjects {
+		if row.Namespace != arg.Namespace || row.Key <= arg.AfterKey {
+			continue
+		}
+
+		out = append(out, row)
+
+		if int32(len(out)) == arg.PageLimit {
+			break
+		}
+	}
+
+	return out, nil
 }
 
 // Tx cannot rebind a *repository.Queries onto a fake -- Queries is a concrete

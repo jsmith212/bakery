@@ -280,8 +280,23 @@ SELECT * FROM organizations WHERE slug = $1;
 -- name: ListOrganizations :many
 SELECT * FROM organizations ORDER BY slug;
 
+-- UpdateOrganization sets ALL THREE patchable columns unconditionally, the same
+-- read-modify-write PATCH shape UpdateBackend uses (query/backends.sql): the
+-- handler reads the current row, resolves the 3-state
+-- default_retention_window/default_quota_bytes encoding (absent keeps the
+-- current column, explicit null clears it, a value sets it) and passes every
+-- column back, including the two this request did not mention. A query that set
+-- only `name` unconditionally and left the two default_* columns as a plain
+-- nullable UPDATE would silently clear them on a rename that never mentioned
+-- them.
+--
 -- name: UpdateOrganization :one
-UPDATE organizations SET name = $2 WHERE id = $1 RETURNING *;
+UPDATE organizations
+   SET name                     = $2,
+       default_retention_window = sqlc.narg(default_retention_window),
+       default_quota_bytes      = sqlc.narg(default_quota_bytes)
+ WHERE id = $1
+RETURNING *;
 
 -- ON DELETE RESTRICT all the way down means this is refused while the org still
 -- has projects. That is deliberate: a CASCADE would drop metadata without

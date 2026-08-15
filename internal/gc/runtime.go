@@ -241,7 +241,7 @@ func (e *Engine) MeasureUsage(ctx context.Context) error {
 	sum := Summary{
 		RunID: run.ID, Trigger: TriggerUsage, DryRun: true,
 		ObjectsDeleted: 0, HashservRows: 0, BlobsMarked: 0, BlobsDeleted: 0,
-		BytesReclaimed: 0, BackendsRefused: 0,
+		BytesReclaimed: 0, BackendsRefused: 0, LogicalBytesFreed: 0,
 	}
 
 	measureErr := e.measureAll(ctx, run, pending, &sum)
@@ -388,7 +388,7 @@ func (e *Engine) RedrivePendingDelete(ctx context.Context) {
 	sum := Summary{
 		RunID: 0, Trigger: TriggerInterval, DryRun: false,
 		ObjectsDeleted: 0, HashservRows: 0, BlobsMarked: 0, BlobsDeleted: 0,
-		BytesReclaimed: 0, BackendsRefused: 0,
+		BytesReclaimed: 0, BackendsRefused: 0, LogicalBytesFreed: 0,
 	}
 
 	if err := e.reapPending(ctx, &sum); err != nil {

@@ -47,6 +47,16 @@ type Org struct {
 	// render, and computing it here saves the SPA from re-deriving authorization.
 	Role string `json:"role,omitempty"`
 
+	// DefaultRetentionWindow / DefaultQuotaBytes are B4 (000012's
+	// default_retention_window/default_quota_bytes, on the wire since this
+	// wave): the SEED a new backend in this org gets when its own
+	// create-time override is absent (query/backends.sql's CreateBackend).
+	// NULL/omitted here means "fall back to the per-kind opinionated default" --
+	// it is never an enforced ceiling on an EXISTING backend's own window or
+	// quota, which is why UpdateBackend never reads these two columns.
+	DefaultRetentionWindow *string `json:"default_retention_window"`
+	DefaultQuotaBytes      *int64  `json:"default_quota_bytes"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -59,7 +69,9 @@ func newOrg(o repository.Organization, p Principal) Org {
 
 	return Org{
 		ID: uuidString(o.ID), Slug: o.Slug, Name: o.Name, Role: role,
-		CreatedAt: o.CreatedAt.Time, UpdatedAt: o.UpdatedAt.Time,
+		DefaultRetentionWindow: durationString(o.DefaultRetentionWindow),
+		DefaultQuotaBytes:      int64Ptr(o.DefaultQuotaBytes),
+		CreatedAt:              o.CreatedAt.Time, UpdatedAt: o.UpdatedAt.Time,
 	}
 }
 

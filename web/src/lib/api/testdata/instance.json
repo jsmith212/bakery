@@ -1,0 +1,18 @@
+{
+  "version": "0.6.0",
+  "storage_driver": "local",
+  "public_addr": ":8080",
+  "metrics_addr": "127.0.0.1:9090",
+  "grpc_addr": ":9092",
+  "external_url": "https://bakery.corp",
+  "oidc_issuer": "https://id.acme.dev/realms/main",
+  "dev_login_enabled": false,
+  "grpc_external_endpoint": "grpcs://bakery.corp:9092",
+  "allow_self_serve_orgs": true,
+  "allow_local_site_admins": true,
+  "allow_multi_instance": false,
+  "gc_enabled": true,
+  "gc_interval": "6h0m0s",
+  "gc_usage_interval": "6h0m0s",
+  "gc_grace_period": "24h0m0s"
+}

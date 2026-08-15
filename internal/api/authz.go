@@ -232,14 +232,22 @@ type handlerFunc func(w http.ResponseWriter, r *http.Request) error
 // guard is the wrapper EVERY handler goes through. It:
 //
 //  1. rejects a broken credential;
-//  2. requires a principal on any non-public route;
-//  3. refuses an API-key principal anywhere but /me (see below);
-//  4. enforces the JSON content type on state-changing methods (CSRF);
+//  2. enforces the JSON content type on state-changing methods (CSRF) --
+//     BEFORE the public branch below, so a public route is covered too;
+//  3. requires a principal on any non-public route;
+//  4. refuses an API-key principal anywhere but /me (see below);
 //  5. resolves {org} / {project} from slugs to database ids;
 //  6. asks the principal whether it may act at this Access level;
 //  7. only then calls the handler, with the resolved scope in the context.
 //
-// Step 3 is a policy, not a capability: an API key COULD read its own project
+// Step 2 runs ahead of the AccessPublic short-circuit on purpose: two of the
+// public routes are state-changing (POST /auth/logout, POST /auth/dev-login),
+// and "public" means "no credential required", not "exempt from the CSRF
+// defence". requireJSON itself is method-gated (GET/HEAD/OPTIONS always pass),
+// so moving it here does not touch the public GET routes (/auth/config,
+// /auth/login, /auth/callback).
+//
+// Step 4 is a policy, not a capability: an API key COULD read its own project
 // (CanReadProject is true for it), but the control plane is for humans and the
 // CLI, and a key that could enumerate a project's other keys and its members is a
 // lateral-movement primitive for no benefit. /me stays open so `bakery whoami`
@@ -250,6 +258,12 @@ func (a *API) guard(access Access, h handlerFunc) http.HandlerFunc {
 
 		if err := authErrFrom(ctx); err != nil {
 			a.writeError(w, r, a.denyAuth(err))
+
+			return
+		}
+
+		if err := requireJSON(r); err != nil {
+			a.writeError(w, r, err)
 
 			return
 		}
@@ -272,12 +286,6 @@ func (a *API) guard(access Access, h handlerFunc) http.HandlerFunc {
 		if p.Method() == auth.MethodAPIKey && access != AccessAuthenticated {
 			a.writeError(w, r, errForbidden(
 				"an API key authorizes cache traffic only; use a session or a CLI login for the control plane"))
-
-			return
-		}
-
-		if err := requireJSON(r); err != nil {
-			a.writeError(w, r, err)
 
 			return
 		}

@@ -1,0 +1,31 @@
+{
+  "items": [
+    {
+      "run_id": 812,
+      "started_at": "2026-08-15T06:00:00.000Z",
+      "finished_at": "2026-08-15T06:04:18.221Z",
+      "status": "succeeded",
+      "backends": [
+        {
+          "project_slug": "firmware",
+          "kind": "hashserv",
+          "objects_deleted": 311,
+          "bytes_freed": 0
+        },
+        {
+          "project_slug": "firmware",
+          "kind": "sstate",
+          "objects_deleted": 3791,
+          "bytes_freed": 19244310992
+        },
+        {
+          "project_slug": "tools",
+          "kind": "bazel",
+          "objects_deleted": 0,
+          "bytes_freed": 0
+        }
+      ]
+    }
+  ],
+  "next_cursor": null
+}

@@ -18,6 +18,11 @@ internal/db/repository/
 web/node_modules/
 web/.svelte-kit/
 
+# Playwright (web/e2e) run artifacts -- traces, screenshots, the HTML report.
+# Browsers themselves install to ~/.cache/ms-playwright, outside the repo.
+web/test-results/
+web/playwright-report/
+
 # SvelteKit build output. The Go binary embeds this directory with
 # //go:embed all:dist, and go:embed fails to compile when a pattern matches no
 # files -- so a fresh clone has to be able to `go build ./...` before npm has

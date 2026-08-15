@@ -198,6 +198,11 @@ type Queries interface {
 
 	UpsertBackendUsage(ctx context.Context, arg repository.UpsertBackendUsageParams) error
 	InstancePhysicalBytes(ctx context.Context) (int64, error)
+
+	// RecordGCRunBackend is the SPA->API wiring wave's B7 write (000013): one row
+	// per backend a REAL run actually swept, zeros included -- see sweep.go's
+	// publishRunBackend for exactly where and why.
+	RecordGCRunBackend(ctx context.Context, arg repository.RecordGCRunBackendParams) error
 }
 
 // Blobs is the blob.Service surface. It is an interface for the same reason

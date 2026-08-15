@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "claim_derived_role",
+    "message": "this membership is derived from an identity-provider group claim; there is no local grant to remove. Change the group in the IdP or in the group map."
+  }
+}

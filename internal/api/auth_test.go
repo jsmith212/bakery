@@ -37,6 +37,14 @@ func repositoryCreateOrg(slug string) repository.CreateOrganizationParams {
 //     the dev-login route exists -- but when it is TRUE the whole point is for the
 //     console to render that affordance, and when it is FALSE the route is not
 //     registered at all and 404s. It discloses nothing that probing would not.
+//   - allow_self_serve_orgs (B8, SPA->API wiring wave): whether ANY signed-in
+//     human may create an organization, or only a site admin. It is a boolean
+//     deployment POLICY, not a secret -- an anonymous caller already learns the
+//     answer for free by attempting POST /orgs while signed out (401, same as
+//     always) or, once signed in, by attempting it and reading the 403's
+//     message. It lives here rather than on api.Me because the console has to
+//     decide whether to RENDER the "Create organization" affordance on the
+//     very first screen an anonymous visitor sees, before any authentication.
 //
 // What must NEVER be here is client_secret. This test fails if a field whose name
 // even SUGGESTS a secret is added to auth.AuthConfig -- because the next person to
@@ -54,6 +62,7 @@ func TestAuthConfigCarriesNoSecret(t *testing.T) {
 		"device_authorization_endpoint": true,
 		"oidc_enabled":                  true,
 		"dev_login_enabled":             true,
+		"allow_self_serve_orgs":         true,
 	}
 
 	// A fully-populated config: omitempty must not hide a field from this test.
@@ -112,5 +121,6 @@ func authConfigFixture() auth.AuthConfig {
 		DeviceAuthorizationEndpoint: "https://idp.example.com/device",
 		OIDCEnabled:                 true,
 		DevLoginEnabled:             false,
+		AllowSelfServeOrgs:          true,
 	}
 }

@@ -29,6 +29,8 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
+	"sync"
 
 	"github.com/jsmith212/bakery/internal/auth"
 	"github.com/jsmith212/bakery/internal/gc"
@@ -76,6 +78,38 @@ type Config struct {
 	// local grant, which is exactly what an operator needs on the day they turn it
 	// off.
 	AllowLocalSiteAdmins bool
+
+	// Instance is B6's GET /instance body, resolved ONCE by server.Boot from the
+	// same cmd/BootParams every other Config field above reads from, and served
+	// back verbatim -- see instance.go's package doc for why this is a static
+	// echo and never touches Prometheus.
+	Instance InstanceInfo
+
+	// ExternalURL is --external-url / EXTERNAL_URL: the server's public base URL.
+	//
+	// B1 (spec 2026-08-15). It is the FIRST term of the snippet generator's origin
+	// precedence -- config, then X-Forwarded-*, then the request host -- because a
+	// snippet carries a live credential and an operator who has already told us the
+	// public origin should not be able to have it overridden by a header. Empty is
+	// supported and normal for a direct-connection deployment.
+	ExternalURL string
+
+	// GRPCExternalEndpoint is --grpc-external-endpoint / GRPC_EXTERNAL_ENDPOINT: the
+	// PUBLIC gRPC authority Bazel and moon should dial, e.g. "grpcs://bakery.corp:9092".
+	//
+	// Used VERBATIM when set. It exists because the REAPI listener is a separate
+	// listener on a separate port (GRPCAddr) that may be exposed on a different host
+	// or port than the console -- and neither the request nor GRPCAddr can tell us
+	// what an ingress did with it.
+	GRPCExternalEndpoint string
+
+	// GRPCAddr is --grpc-addr / GRPC_ADDR, verbatim, and the snippet generator reads
+	// exactly one thing off it: THE PORT. Deriving the gRPC endpoint from the HTTP
+	// request's port instead (what M4 shipped) emits an endpoint nothing listens on
+	// under EVERY configuration including a plain `bakery serve`, and moon's response
+	// to an unreachable cache is to disable it silently. Empty means the REAPI
+	// listener is off, which is a 409 on a bazel/moon snippet -- see grpcEndpoint.
+	GRPCAddr string
 }
 
 // API is the control-plane API.
@@ -99,6 +133,22 @@ type API struct {
 	// handlePutSiteAdmin -- never by the revoke or the listing -- and never written
 	// after New.
 	allowLocalSiteAdmins bool
+
+	// instance: see Config.Instance. Read only by handleGetInstance, and never
+	// written after New -- a boot-time echo, not a live value.
+	instance InstanceInfo
+
+	// The three B1 origin inputs. Read only by snippets.go, never written after New.
+	externalURL          string
+	grpcExternalEndpoint string
+	grpcAddr             string
+
+	// warnGRPCOnce / warnExternalURLOnce mirror oci.Backend.warnRealmOnce: a
+	// DERIVED public endpoint is a guess, and a guess that is wrong makes moon
+	// silently disable its cache. It is worth exactly one log line per process --
+	// per request would be a log flood on the highest-traffic misconfiguration.
+	warnGRPCOnce        sync.Once
+	warnExternalURLOnce sync.Once
 
 	metrics *metrics.Metrics
 
@@ -157,6 +207,10 @@ func New(cfg Config) (*API, error) {
 		log:                  log,
 		allowSelfServeOrgs:   cfg.AllowSelfServeOrgs,
 		allowLocalSiteAdmins: cfg.AllowLocalSiteAdmins,
+		instance:             cfg.Instance,
+		externalURL:          strings.TrimSpace(cfg.ExternalURL),
+		grpcExternalEndpoint: strings.TrimSpace(cfg.GRPCExternalEndpoint),
+		grpcAddr:             strings.TrimSpace(cfg.GRPCAddr),
 		metrics:              cfg.Metrics,
 		routes:               nil,
 	}, nil
@@ -353,4 +407,26 @@ func (a *API) mount(mux *http.ServeMux) {
 	a.route(mux, AccessSiteAdmin, "GET "+p+"/gc/runs", a.handleListGCRuns)
 	a.route(mux, AccessSiteAdmin, "GET "+p+"/gc/runs/{id}", a.handleGetGCRun)
 	a.route(mux, AccessSiteAdmin, "POST "+p+"/gc/run", a.handleTriggerGCRun)
+
+	// ---- GC org visibility (B7, spec 2026-08-15). OrgView, deliberately BELOW
+	// AccessSiteAdmin above: this is the org's own retention history, read-only,
+	// scoped to its own projects by the query's own join -- the instance-wide
+	// runs list and the trigger stay site-admin-only.
+	a.route(mux, AccessOrgView, "GET "+p+"/orgs/{org}/gc/activity", a.handleGetOrgGCActivity)
+
+	// ---- usage (B2, first readers of cache_backend_usage). OrgView / ProjectRead,
+	// matching the projects/backends routes they sit beside.
+	a.route(mux, AccessOrgView, "GET "+p+"/orgs/{org}/usage", a.handleGetOrgUsage)
+	a.route(mux, AccessProjectRead, "GET "+p+"/orgs/{org}/projects/{project}/usage",
+		a.handleGetProjectUsage)
+
+	// ---- object browser (B3). ProjectRead, the same floor as the backend detail
+	// route it extends. {kind} is a LITERAL-adjacent path segment, not a second
+	// {kind}-shaped wildcard alongside backends/{kind} above -- ServeMux is fine
+	// with a longer, more specific pattern sharing a prefix with a shorter one.
+	a.route(mux, AccessProjectRead,
+		"GET "+p+"/orgs/{org}/projects/{project}/backends/{kind}/objects", a.handleListCacheObjects)
+
+	// ---- instance (B6). SiteAdmin: a boot-config echo, never Prometheus.
+	a.route(mux, AccessSiteAdmin, "GET "+p+"/instance", a.handleGetInstance)
 }
