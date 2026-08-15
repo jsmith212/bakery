@@ -164,15 +164,28 @@ acquisitions and forces a string allocation on the zero-alloc path. Instead:
 keyToucher-pattern map (single mutex is fine — hashserv QPS is nowhere near the HEAD storm,
 and every get already pays a DB query), same F/T, same final flush.
 
-### 6.2 The delete/touch race (finding 5 — an invariant, not an optimization)
+### 6.2 The delete/touch race (an invariant, not an optimization)
 
 `FindMissingBlobs` answering "present" is a **reservation** served from the LRU with zero DB
-contact; a pending (unflushed) touch is invisible to the sweep's SELECT. Before deleting,
-**the sweep intersects each candidate chunk against the live pending state** (LRU
-`markedAt` probe per key + the §6.3 aux map + the hashserv map) and drops any key present.
-Exact, in-memory, cold-path only — and it is *sound only because GC refuses to run
-multi-instance* (§9.4): this process's pending state is complete. State this in the doc
-comment; it is the second reason the multi-instance refusal is load-bearing.
+contact; a pending (unflushed) touch is invisible to the sweep's SELECT. Three mechanisms
+compose, all *sound only because GC refuses to run multi-instance* (§9.4 — this process's
+pending state is complete):
+
+1. **Pre-sweep force-flush** (the primary mechanism, post-review): the engine synchronously
+   flushes the hashserv toucher immediately before stage 1 and the blob toucher before the
+   first `cache_objects` stage, so every mark older than the sweep becomes a real
+   `accessed_at` that the `coalesce` predicate then spares. The residual window is a mark
+   arriving *during* a stage's own execution — bounded by stage duration (seconds–minutes),
+   versus the up-to-`T` hold it replaces.
+2. **The per-chunk veto**: before deleting, the sweep intersects each candidate chunk
+   against the live pending state (LRU `markedAt` probe + the §6.3 aux map) and drops any
+   key present — this catches marks made mid-sweep on the blob side.
+3. **The delete itself carries both write-barrier halves** (`DeleteObjectsByKeys` joins the
+   run row): a row overwritten or re-created between scan and delete (an `/ac` overwrite
+   refreshes `created_at`/`live_xid`) no longer matches. The delete transaction also takes
+   the affected blob digests' row locks explicitly, in digest order
+   (`LockBlobDigests ... ORDER BY digest FOR NO KEY UPDATE`), so the refcount trigger's
+   lock order is deterministic by construction rather than by planner accident.
 
 ### 6.3 The ac-grpc reachability TOUCH (critique finding 2 — replaces "ladder is enough")
 
@@ -185,12 +198,28 @@ wrong delete. On `GetActionResult` (a read of an already-committed, already-unma
 flushed by the same flusher. This closes the `--remote_download_minimal` divergence
 *exactly*: an AC hit now touches its outputs whether or not Bazel fetches them.
 
-The ladder (`W_cas = 2·W_ac`) stays as defense in depth. A source-verification pass on
-Bazel's AC-hit output-probing behavior (BwoB lease extension, FindMissingBlobs on outputs,
-by version) is running; its outcome tunes the default `W_cas` note in the upgrade docs but
-does not gate the design — the touch makes CAS safe regardless of the verdict.
-Opaque-`/ac` clients (ccache, sccache, moon-http, bazel-http) need no equivalent: none of
-them has a download-minimal mode; they fetch what they hit, and fetches touch.
+The touch also descends one level: for each `OutputDirectory`, the (locally present, hot)
+`Tree` blob is read and every `FileNode` digest in `root`+`children` is marked — under
+BwoB, Bazel `injectRemoteFile`s tree *contents* from the Tree's metadata with zero CAS
+contact, so without this the tree blob stays hot while its contents age out. Best-effort
+(any error or an oversized tree ⇒ skip; a missed touch is the safe direction).
+
+The ladder (`W_cas = 2·W_ac`) stays as defense in depth — but the touch is **load-bearing,
+not optional**, per source verification (2026-08-14, Bazel 6.4/6.5/7.0/7.4/8.0 +
+moon master): `lookupCache` issues only `GetActionResult`; under
+`--remote_download_minimal` the skip-download decision (`RemoteOutputChecker.
+shouldDownloadOutput`) is purely local and skipped outputs are `injectRemoteFile`d from
+`ActionResult` metadata with **zero CAS contact**. The only Bazel mechanism that ever
+probes AC-hit outputs is `--experimental_remote_cache_lease_extension` (Bazel 7+, default
+**false**, current-build Skyframe graph only), whose own comment assumes the server treats
+`FindMissingBlobs` as a lease-extending touch — exactly our `accessed_at` semantics.
+Default-config Bazel instead trusts the server's TTL contract
+(`--experimental_remote_cache_ttl`, default 3h — far under our windows) and discovers an
+evicted blob only lazily, as the `LostInputsEvent` rewind. Without §6.3's touch, "hot AC,
+cold CAS" is therefore the *normal* BwoB steady state, not an edge case.
+Opaque-`/ac` clients (ccache, sccache, moon-http, bazel-http) need no equivalent: none has
+a download-minimal mode — moon's `hydrate_manifest` unconditionally reads every output blob
+on every hit — they fetch what they hit, and fetches touch.
 
 Gating tests: `TestCASOutlivesItsActionCacheEntry`,
 `TestWindowLadderIgnoresAnInvertedConfig`, `TestACHitTouchesItsOutputs` (new — AC hit under
@@ -201,11 +230,14 @@ zero output reads keeps outputs alive past `W_cas`).
 `SET (fillfactor = 85)` on both tables is catalog-only and **does not move existing
 tuples**: the corpus sits at ~95–100% fill, so the FIRST touch of every pre-existing row is
 non-HOT (new tuple + entries in both indexes). That one-time index-bloat/WAL spike is
-managed, not ignored: the toucher **ramps** — `T` starts at 24h for the first 7 days after
-migration (recorded in a small state row or derived from the migration timestamp) before
-tightening to 1h — and the migration raises this table's autovacuum aggressiveness
-(`autovacuum_vacuum_scale_factor = 0.02`). `pg_repack` is documented as the optional
-operator fast-path.
+managed, not ignored: the toucher **ramps** — `T` starts at 24h until
+`gc_state.touch_ramp_until` (a one-row table the migration stamps at `now() + 7 days`;
+chosen over an accessed-at-NULL-fraction proxy, which never converges on a mostly-cold
+corpus and was last-backend-wins) — and the migration raises this table's autovacuum
+aggressiveness (`autovacuum_vacuum_scale_factor = 0.02`). `pg_repack` is documented as the
+optional operator fast-path. Operator validation note: confirm HOT absorption on a loaded
+instance (`pg_stat_user_tables.n_tup_hot_upd / n_tup_upd`) before tightening autovacuum
+further.
 
 ## 7. Migration `000012_gc_retention_quotas`
 
@@ -335,4 +367,7 @@ Hard-reject quotas · parsing `/ac` values (permanent contract) · ac-grpc→CAS
 `gc_root` column · upstream hashserv GC RPCs · per-namespace configurable windows ·
 scoped `gc_runs` · any `accessed_at` index · trigger-maintained usage counters · GC under
 `--allow-multi-instance` · object pinning · maintenance-window scheduler · S3 in the reap
-path · SPA wiring beyond the two storage gauges and a GC-runs screen.
+path · **all SPA wiring, including the GC-runs screen and the storage-gauge console views**
+— the API and metrics land in M6; the screens land with the SPA→API wiring wave, whose
+milestone this explicitly is (the console is still fully mock-data everywhere; wiring one
+screen now would be an inconsistency, not a feature).

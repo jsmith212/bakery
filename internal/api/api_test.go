@@ -95,6 +95,11 @@ func TestRouteTable(t *testing.T) {
 		{AccessProjectRead, "GET /api/v1/orgs/{org}/projects/{project}/backends/{kind}"},
 		{AccessProjectAdmin, "PATCH /api/v1/orgs/{org}/projects/{project}/backends/{kind}"},
 		{AccessProjectAdmin, "DELETE /api/v1/orgs/{org}/projects/{project}/backends/{kind}"},
+
+		// M6 (spec §9.10): site admin only, same as site-admins above.
+		{AccessSiteAdmin, "GET /api/v1/gc/runs"},
+		{AccessSiteAdmin, "GET /api/v1/gc/runs/{id}"},
+		{AccessSiteAdmin, "POST /api/v1/gc/run"},
 	}
 
 	a := &API{

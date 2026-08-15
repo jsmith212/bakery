@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -486,4 +487,47 @@ func (c *Client) DeleteKey(ctx context.Context, org, project, key string) error 
 
 func projectPath(org, project string) string {
 	return "/orgs/" + seg(org) + "/projects/" + seg(project)
+}
+
+// TriggerGCRun is POST /gc/run. The server answers 202 the instant the sweep has
+// a run id, never once the sweep finishes -- see api.handleTriggerGCRun.
+func (c *Client) TriggerGCRun(ctx context.Context, dryRun bool) (api.TriggerGCRunResponse, error) {
+	var out api.TriggerGCRunResponse
+	err := c.do(ctx, http.MethodPost, "/gc/run", api.TriggerGCRunRequest{DryRun: dryRun}, &out, withAuth)
+
+	return out, err
+}
+
+// GetGCRun is GET /gc/runs/{id}.
+func (c *Client) GetGCRun(ctx context.Context, id int64) (api.GCRun, error) {
+	var out api.GCRun
+	err := c.do(ctx, http.MethodGet, "/gc/runs/"+strconv.FormatInt(id, 10), nil, &out, withAuth)
+
+	return out, err
+}
+
+// ListGCRuns is GET /gc/runs. status == "" means every status; limit <= 0 takes
+// the server's default page size. NextCursor rides the returned api.GCRunList
+// unchanged -- the CLI does not paginate for the user today, only the console
+// needs to (`bakery gc list` prints one page and stops).
+func (c *Client) ListGCRuns(ctx context.Context, status string, limit int) (api.GCRunList, error) {
+	q := url.Values{}
+
+	if status != "" {
+		q.Set("status", status)
+	}
+
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+
+	path := "/gc/runs"
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+
+	var out api.GCRunList
+	err := c.do(ctx, http.MethodGet, path, nil, &out, withAuth)
+
+	return out, err
 }

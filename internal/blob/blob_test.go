@@ -143,8 +143,12 @@ func (f *fixture) mark(t *testing.T, grace time.Duration) []Digest {
 
 	ctx := t.Context()
 
-	run, err := f.store.StartGCRun(ctx, pgtype.Interval{
-		Microseconds: grace.Microseconds(), Days: 0, Months: 0, Valid: true,
+	run, err := f.store.StartGCRun(ctx, repository.StartGCRunParams{
+		GracePeriod: pgtype.Interval{
+			Microseconds: grace.Microseconds(), Days: 0, Months: 0, Valid: true,
+		},
+		Trigger: "interval",
+		DryRun:  false,
 	})
 	if err != nil {
 		t.Fatalf("StartGCRun() error = %v", err)
@@ -157,12 +161,12 @@ func (f *fixture) mark(t *testing.T, grace time.Duration) []Digest {
 		t.Fatalf("MarkBlobsPendingDelete() error = %v", err)
 	}
 
-	err = f.store.FinishGCRun(ctx, repository.FinishGCRunParams{
+	if _, err = f.store.FinishGCRun(ctx, repository.FinishGCRunParams{
 		ID: run.ID, Status: repository.GcRunStatusSucceeded,
 		Error:          pgtype.Text{String: "", Valid: false},
 		ObjectsDeleted: 0, BlobsMarked: int64(len(rows)), BlobsDeleted: 0, BytesReclaimed: 0,
-	})
-	if err != nil {
+		HashservRowsDeleted: 0,
+	}); err != nil {
 		t.Fatalf("FinishGCRun() error = %v", err)
 	}
 
@@ -757,7 +761,11 @@ func TestRefcountRace_IncrefDecrefDelete(t *testing.T) {
 // rather than a simplification of them. The mark is the GC's job (M6); the unlink is
 // blob.ReapDigest's, and this is how the two compose.
 func gcMark(ctx context.Context, store *db.Store, errs chan<- error) []Digest {
-	run, err := store.StartGCRun(ctx, pgtype.Interval{Microseconds: 0, Days: 0, Months: 0, Valid: true})
+	run, err := store.StartGCRun(ctx, repository.StartGCRunParams{
+		GracePeriod: pgtype.Interval{Microseconds: 0, Days: 0, Months: 0, Valid: true},
+		Trigger:     "interval",
+		DryRun:      false,
+	})
 	if err != nil {
 		errs <- fmt.Errorf("start gc run: %w", err)
 
@@ -769,10 +777,11 @@ func gcMark(ctx context.Context, store *db.Store, errs chan<- error) []Digest {
 		errs <- fmt.Errorf("mark: %w", err)
 	}
 
-	if ferr := store.FinishGCRun(ctx, repository.FinishGCRunParams{
+	if _, ferr := store.FinishGCRun(ctx, repository.FinishGCRunParams{
 		ID: run.ID, Status: repository.GcRunStatusSucceeded,
 		Error:          pgtype.Text{String: "", Valid: false},
 		ObjectsDeleted: 0, BlobsMarked: int64(len(rows)), BlobsDeleted: 0, BytesReclaimed: 0,
+		HashservRowsDeleted: 0,
 	}); ferr != nil {
 		errs <- fmt.Errorf("finish gc run: %w", ferr)
 	}

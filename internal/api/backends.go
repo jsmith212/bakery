@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/jsmith212/bakery/internal/db/repository"
 )
@@ -30,6 +33,18 @@ type CreateBackendRequest struct {
 	ReadAuthRequired *bool `json:"read_auth_required"`
 
 	Config json.RawMessage `json:"config"`
+
+	// RetentionWindow and QuotaBytes OVERRIDE the seeded defaults (M6, spec §4/§7).
+	// CreateBackend already computes an opinionated window from the org default and
+	// the kind, so leaving these absent is the normal case; supplying one is an
+	// operator overriding that seed at creation time.
+	//
+	// json.RawMessage, not a pointer, because these fields have THREE meanings and a
+	// pointer can only carry two: absent (keep whatever was seeded), explicit null
+	// (retain forever / no cap -- a real, reachable state), and a value. A *string
+	// collapses the first two, which would make "retain forever" unexpressible.
+	RetentionWindow json.RawMessage `json:"retention_window"`
+	QuotaBytes      json.RawMessage `json:"quota_bytes"`
 }
 
 // UpdateBackendRequest patches a backend. Absent fields are left alone; kind is
@@ -38,6 +53,17 @@ type UpdateBackendRequest struct {
 	Enabled          *bool           `json:"enabled"`
 	ReadAuthRequired *bool           `json:"read_auth_required"`
 	Config           json.RawMessage `json:"config"`
+
+	// RetentionWindow and QuotaBytes are the M6 knobs, with the same three-state
+	// encoding CreateBackendRequest documents: absent keeps the current column,
+	// explicit null clears it to "retain forever" / "no cap", a value sets it.
+	//
+	// The PATCH semantics live HERE, in the handler, and not in the query: 000012's
+	// UpdateBackend sets both columns unconditionally (a plain nullable UPDATE),
+	// because NULL is already a meaningful value for both and a query-level
+	// "leave alone" would need a sentinel a nullable interval has no room for.
+	RetentionWindow json.RawMessage `json:"retention_window"`
+	QuotaBytes      json.RawMessage `json:"quota_bytes"`
 }
 
 // handleListBackends lists a project's configured backends.
@@ -80,6 +106,19 @@ func (a *API) handleCreateBackend(w http.ResponseWriter, r *http.Request) error 
 		return err
 	}
 
+	// Parsed and VALIDATED before the insert: a malformed window must not leave a
+	// backend behind. Applied after it, because CreateBackend computes the seeded
+	// defaults in SQL and this is an override of whatever it chose.
+	window, setWindow, err := backendRetentionPatch(req.RetentionWindow)
+	if err != nil {
+		return err
+	}
+
+	quota, setQuota, err := backendQuotaPatch(req.QuotaBytes, kind)
+	if err != nil {
+		return err
+	}
+
 	backend, err := a.store.CreateBackend(ctx, repository.CreateBackendParams{
 		ProjectID:        s.ProjectID,
 		Kind:             kind,
@@ -98,6 +137,28 @@ func (a *API) handleCreateBackend(w http.ResponseWriter, r *http.Request) error 
 		}
 
 		return fmt.Errorf("create %s backend: %w", kind, err)
+	}
+
+	// TWO STATEMENTS, and deliberately not one transaction. CreateBackend derives
+	// the seed from the org row in SQL (so a new backend is never left outside the
+	// opinionated defaults), which leaves no room in its parameter list for an
+	// override; this patches the seed afterwards. The failure mode of the split is
+	// benign and self-correcting: the backend exists with its SEEDED window, the
+	// caller sees the error, and a PATCH sets what they asked for. The failure mode
+	// of doing it the other way round -- no seed unless the client sends one --
+	// is a backend silently outside retention forever.
+	if setWindow || setQuota {
+		backend, err = a.store.UpdateBackend(ctx, repository.UpdateBackendParams{
+			ID:               backend.ID,
+			Enabled:          backend.Enabled,
+			ReadAuthRequired: backend.ReadAuthRequired,
+			Config:           backend.Config,
+			RetentionWindow:  pickInterval(setWindow, window, backend.RetentionWindow),
+			QuotaBytes:       pickInt8(setQuota, quota, backend.QuotaBytes),
+		})
+		if err != nil {
+			return fmt.Errorf("apply retention/quota to the new %s backend: %w", kind, err)
+		}
 	}
 
 	writeJSON(w, http.StatusCreated, newBackend(backend))
@@ -140,14 +201,33 @@ func (a *API) handleUpdateBackend(w http.ResponseWriter, r *http.Request) error 
 		}
 	}
 
+	window, setWindow, err := backendRetentionPatch(req.RetentionWindow)
+	if err != nil {
+		return err
+	}
+
+	quota, setQuota, err := backendQuotaPatch(req.QuotaBytes, current.Kind)
+	if err != nil {
+		return err
+	}
+
 	// current.ID came from GetBackend(project_id, kind) -- i.e. from the scope the
 	// guard authorized, never from the request. UpdateBackend takes a bare id and
 	// would happily patch any backend in the installation if handed one.
+	//
+	// EVERY COLUMN IS PASSED, INCLUDING THE TWO THIS REQUEST DID NOT MENTION. The
+	// query sets retention_window and quota_bytes unconditionally, so an omitted
+	// field that resolved to a zero pgtype value would CLEAR the column -- a PATCH
+	// of `{"enabled": false}` would silently turn a backend's retention off. Reading
+	// the current row and passing it back is the same read-modify-write that gives
+	// enabled/read_auth_required/config their PATCH semantics.
 	backend, err := a.store.UpdateBackend(ctx, repository.UpdateBackendParams{
 		ID:               current.ID,
 		Enabled:          boolOr(req.Enabled, current.Enabled),
 		ReadAuthRequired: boolOr(req.ReadAuthRequired, current.ReadAuthRequired),
 		Config:           cfg,
+		RetentionWindow:  pickInterval(setWindow, window, current.RetentionWindow),
+		QuotaBytes:       pickInt8(setQuota, quota, current.QuotaBytes),
 	})
 	if err != nil {
 		return fmt.Errorf("update backend: %w", err)
@@ -253,6 +333,125 @@ func backendConfig(raw json.RawMessage) ([]byte, error) {
 	}
 
 	return raw, nil
+}
+
+// maxRetentionWindow bounds a retention_window. Ten years is not a policy, it is a
+// typo guard: `retention_window` is an interval Postgres will happily store as
+// 100000h, and a window longer than the installation will exist is
+// indistinguishable from null except that it looks like a real setting.
+const maxRetentionWindow = 10 * 365 * 24 * time.Hour
+
+// backendRetentionPatch parses the three-state retention_window field.
+//
+// Returns (value, set): set=false means the field was ABSENT and the caller must
+// keep the current column; set=true with an invalid pgtype.Interval means an
+// explicit null -- "retain forever", a real state (spec §4) and the shipped state
+// of every downloads backend.
+func backendRetentionPatch(raw json.RawMessage) (pgtype.Interval, bool, error) {
+	if len(raw) == 0 {
+		return pgtype.Interval{}, false, nil
+	}
+
+	var s *string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return pgtype.Interval{}, false,
+			errValidation("retention_window", `retention_window must be a duration string like "720h", or null`)
+	}
+
+	if s == nil {
+		return pgtype.Interval{}, true, nil
+	}
+
+	d, err := time.ParseDuration(*s)
+	if err != nil {
+		return pgtype.Interval{}, false,
+			errValidation("retention_window", `retention_window must be a duration string like "720h", or null`)
+	}
+
+	// > 0 mirrors cache_backends_retention_window_positive. A zero or negative
+	// window would mean "delete everything on the next sweep", which nobody types on
+	// purpose and which the CHECK refuses anyway -- refusing it here makes it a 422
+	// with a sentence instead of a 500 with a constraint name.
+	if d <= 0 || d > maxRetentionWindow {
+		return pgtype.Interval{}, false, errValidation("retention_window",
+			"retention_window must be positive and no more than 10 years, or null to retain forever")
+	}
+
+	return pgtype.Interval{
+		Microseconds: d.Microseconds(), Days: 0, Months: 0, Valid: true,
+	}, true, nil
+}
+
+// backendQuotaPatch parses the three-state quota_bytes field and enforces the two
+// kinds that may not have one.
+//
+// hashserv is refused because it is STRUCTURALLY unenforceable: hashserv owns no
+// cache_objects rows, the quota histogram runs over cache_objects, so the quota
+// would read 0 forever -- a silent lie rather than an honest "no cap". 000012's
+// cache_backends_hashserv_no_quota CHECK is the backstop; this is the 422 that
+// explains it.
+//
+// oci is refused because it is a PRODUCT decision (spec §1.3): a pull-through proxy
+// is bounded by its retention window. Unlike hashserv there is no CHECK -- an OCI
+// quota is representable and the sweep enforces it correctly if a row ever carries
+// one (that is why internal/gc still evicts OCI namespaces in stage order) -- so
+// this validation is the whole of the rule, and relaxing it later requires no
+// migration.
+func backendQuotaPatch(
+	raw json.RawMessage, kind repository.BackendKind,
+) (pgtype.Int8, bool, error) {
+	if len(raw) == 0 {
+		return pgtype.Int8{}, false, nil
+	}
+
+	var n *int64
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return pgtype.Int8{}, false,
+			errValidation("quota_bytes", "quota_bytes must be a positive integer, or null for no cap")
+	}
+
+	if n == nil {
+		return pgtype.Int8{}, true, nil
+	}
+
+	if *n <= 0 {
+		return pgtype.Int8{}, false,
+			errValidation("quota_bytes", "quota_bytes must be a positive integer, or null for no cap")
+	}
+
+	switch kind {
+	case repository.BackendKindHashserv:
+		return pgtype.Int8{}, false, errValidation("quota_bytes",
+			"a hashserv backend cannot have a quota: it stores no cache objects, so the cap "+
+				"would never be reached and would always read as unused")
+	case repository.BackendKindOci:
+		return pgtype.Int8{}, false, errValidation("quota_bytes",
+			"an oci backend cannot have a quota: a pull-through proxy is bounded by its "+
+				"retention window")
+	case repository.BackendKindSstate, repository.BackendKindDownloads, repository.BackendKindBazel:
+		return pgtype.Int8{Int64: *n, Valid: true}, true, nil
+	default:
+		return pgtype.Int8{Int64: *n, Valid: true}, true, nil
+	}
+}
+
+// pickInterval resolves a patched-or-current interval. See handleUpdateBackend for
+// why "current" is passed rather than a zero value.
+func pickInterval(set bool, patched, current pgtype.Interval) pgtype.Interval {
+	if set {
+		return patched
+	}
+
+	return current
+}
+
+// pickInt8 is pickInterval for quota_bytes.
+func pickInt8(set bool, patched, current pgtype.Int8) pgtype.Int8 {
+	if set {
+		return patched
+	}
+
+	return current
 }
 
 // boolOr resolves an optional bool against a default.

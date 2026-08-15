@@ -28,6 +28,7 @@ type CLI struct {
 	Key       KeyCmd       `cmd:"" help:"Manage project API keys."`
 	Sstate    SstateCmd    `cmd:"" help:"Push a local Yocto sstate cache to a Bakery server."`
 	Downloads DownloadsCmd `cmd:"" help:"Push a local Yocto downloads (source premirror) directory."`
+	GC        GCCmd        `cmd:"" help:"Trigger and inspect GC sweeps. Site admins only." name:"gc"`
 
 	// User is the ONLY command group that does not go through the API. It needs
 	// DB_URL and it speaks to Postgres directly -- see UserCmd.
@@ -260,6 +261,35 @@ type DownloadsPushCmd struct {
 	DryRun      bool   `help:"Report what would upload; PUT nothing." name:"dry-run"`
 }
 
+// GCCmd groups the M6 operator-surface verbs (spec §9.10): GET /gc/runs[, /{id}]
+// and POST /gc/run, all AccessSiteAdmin on the server. Like every command in this
+// group except `user site-admin`, this is an HTTP CLIENT, never DB-direct -- a
+// sweep is server-side machinery (the process-local LRU invalidation and the
+// single-writer boot advisory lock both make running one from a second process
+// wrong), so there is nothing here that could run out-of-band even in principle.
+type GCCmd struct {
+	Run  GCRunCmd  `cmd:"" help:"Trigger a GC sweep."`
+	List GCListCmd `cmd:"" help:"List recent GC runs, most recent first."`
+}
+
+// GCRunCmd triggers a sweep and, by default, returns as soon as the server has
+// accepted it -- the server itself never blocks the request on the sweep
+// finishing (spec §9.10), and neither does this by default. --wait opts into
+// polling GET /gc/runs/{id} until the run reaches a terminal status.
+type GCRunCmd struct {
+	DryRun bool `help:"Read-only: report what the sweep would do; delete nothing." name:"dry-run"`
+	Wait   bool `help:"Block until the run finishes, polling its status." name:"wait"`
+}
+
+// GCListCmd lists recent runs. Status is validated SERVER-SIDE (422 on an unknown
+// value) rather than with a Kong enum: the closed vocabulary is the API's to own,
+// and duplicating it here is exactly the kind of drift CLAUDE.md's protocol docs
+// warn about -- two places asserting the same closed set eventually disagree.
+type GCListCmd struct {
+	Status string `help:"Filter by status: running, succeeded or failed. Omit for every status." name:"status"`
+	Limit  int    `default:"20" help:"Maximum runs to list." name:"limit"`
+}
+
 // DBFlags is the database connection, shared by every command that needs one.
 //
 // One DSN, not decomposed host/port/user/password: the password belongs in the
@@ -422,6 +452,57 @@ type ServeCmd struct {
 	// because it stalls builds rather than failing them -- this is the flag an
 	// operator reaches for without a database migration.
 	OCIDisableUpstream bool `env:"BAKERY_OCI_DISABLE_UPSTREAM" help:"Ignore every OCI backend's upstream: serve only what is already cached. The kill switch for when an upstream registry is down or slow." name:"oci-disable-upstream"`
+
+	GC GCFlags `embed:""`
+}
+
+// GCFlags is M6's knob set (spec §9.8).
+//
+// RETENTION SHIPS ON, and it is opinionated: migration 000012 seeded real windows
+// onto existing backends, so the first sweep after an upgrade deletes everything
+// colder than the window. That was an accepted product decision, and these are its
+// rails -- --gc-grace-period between the metadata delete and the byte reclaim,
+// `bakery gc run --dry-run` to see what a sweep would do, and
+// --gc-disable-retention as the brake.
+//
+// There is no --gc-touch-max-pending: the toucher's pending set is the LRU itself,
+// so it is bounded by the LRU's capacity for free.
+type GCFlags struct {
+	GCEnabled bool `default:"true" env:"GC_ENABLED" help:"Run the garbage collector. Off means cached objects and blobs accumulate without bound." name:"gc-enabled" negatable:""`
+
+	// Six hours, not one. At the shipped pacing (1000 rows per chunk, 100ms between
+	// chunks) a ten-million-row backend is about seventeen minutes of PAUSE alone, so
+	// an hourly sweep would spend a large fraction of its life scanning for work that
+	// a day's worth of traffic has not yet created.
+	GCInterval time.Duration `default:"6h" env:"GC_INTERVAL" help:"How often the sweep runs." name:"gc-interval"`
+
+	// Usage measurement is DECOUPLED from retention being enabled: an operator who
+	// has turned retention off still needs storage and quota numbers, and a dashboard
+	// that goes stale exactly when someone reaches for the brake is a dashboard that
+	// lies during the incident it exists for.
+	GCUsageInterval time.Duration `default:"6h" env:"GC_USAGE_INTERVAL" help:"How often backend usage is measured, even with retention disabled." name:"gc-usage-interval"`
+
+	// THE RECOVERY WINDOW. It is frozen per run at start (gc_runs.grace_period), so
+	// raising it takes effect on the NEXT run -- it cannot rescue bytes a run in
+	// flight has already marked.
+	GCGracePeriod time.Duration `default:"24h" env:"GC_GRACE_PERIOD" help:"How long an unreferenced blob's bytes survive after nothing names them. The recovery window." name:"gc-grace-period"`
+
+	GCBatchSize  int           `default:"1000"  env:"GC_BATCH_SIZE"  help:"Rows per scan and per batch delete." name:"gc-batch-size"`
+	GCBatchPause time.Duration `default:"100ms" env:"GC_BATCH_PAUSE" help:"Pause between chunks. The whole of the sweep's rate limiting." name:"gc-batch-pause"`
+
+	// THE BRAKE, and it halts Layer B's MARK as well as every retention stage. The
+	// incident it serves is "we deleted things we wanted" -- and those bytes are still
+	// sitting inside the grace window, so leaving the mark running would convert a
+	// recoverable window into permanent loss at maximum speed. Blobs ALREADY marked
+	// are still reclaimed: they are past recovery, and stalling them frees nothing.
+	GCDisableRetention bool `env:"GC_DISABLE_RETENTION" help:"Halt every retention stage and Layer B's mark. The brake for 'we deleted things we wanted'." name:"gc-disable-retention"`
+
+	// The accessed_at toucher. Reads MARK in memory and this flusher coalesces the
+	// marks into one batched UPDATE per (backend, namespace) per tick, because one
+	// UPDATE per HEAD would funnel a BB_NUMBER_THREADS-parallel storm into a row-lock
+	// convoy on the hottest rows in the database.
+	GCTouchInterval  time.Duration `default:"1m" env:"GC_TOUCH_INTERVAL"  help:"How often pending accessed_at marks are flushed." name:"gc-touch-interval"`
+	GCTouchStaleness time.Duration `default:"1h" env:"GC_TOUCH_STALENESS" help:"Steady-state minimum age before a key's accessed_at is rewritten. Ramped longer while the corpus is still mostly untouched." name:"gc-touch-staleness"`
 }
 
 // MigrateCmd groups the schema subcommands.

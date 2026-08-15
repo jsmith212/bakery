@@ -438,6 +438,21 @@ type Backend struct {
 
 	Config json.RawMessage `json:"config"`
 
+	// RetentionWindow is how long this backend keeps an object nothing has read
+	// (M6, spec §4), as a Go duration string -- "2160h" for the 90-day sstate
+	// default. NULL is "retain forever" and is rendered as JSON null, never as
+	// "0s": zero would read as "expire immediately", which is the opposite.
+	//
+	// A duration STRING rather than seconds because every other duration this
+	// product exposes (--gc-interval, --gc-grace-period) is one, and because a
+	// bare number in JSON invites the units question this format answers.
+	RetentionWindow *string `json:"retention_window"`
+
+	// QuotaBytes is the LOGICAL byte cap (spec §8): the sum of size_bytes this
+	// backend NAMES, charging a deduped blob to every backend that names it. It is
+	// not a disk figure and the console says so. null is "no cap".
+	QuotaBytes *int64 `json:"quota_bytes"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -451,8 +466,40 @@ func newBackend(b repository.CacheBackend) Backend {
 	return Backend{
 		ID: b.ID, ProjectID: uuidString(b.ProjectID), Kind: string(b.Kind),
 		Enabled: b.Enabled, ReadAuthRequired: b.ReadAuthRequired, Config: cfg,
+		RetentionWindow: durationString(b.RetentionWindow), QuotaBytes: int64Ptr(b.QuotaBytes),
 		CreatedAt: b.CreatedAt.Time, UpdatedAt: b.UpdatedAt.Time,
 	}
+}
+
+// durationString renders a retention_window for the wire.
+//
+// Months and days are folded at 30 and 24h, which is the same approximation
+// internal/gc's ladder makes and is safe for the same reason: the value that ever
+// reaches a comparison is the interval in the database, compared against now() by
+// Postgres itself. This is a display and round-trip format, not an arithmetic one.
+func durationString(v pgtype.Interval) *string {
+	if !v.Valid {
+		return nil
+	}
+
+	d := time.Duration(v.Microseconds) * time.Microsecond
+	d += time.Duration(v.Days) * 24 * time.Hour
+	d += time.Duration(v.Months) * 30 * 24 * time.Hour
+
+	s := d.String()
+
+	return &s
+}
+
+// int64Ptr renders a nullable bigint as an optional JSON number.
+func int64Ptr(v pgtype.Int8) *int64 {
+	if !v.Valid {
+		return nil
+	}
+
+	n := v.Int64
+
+	return &n
 }
 
 // Me is the current principal: who you are and everything you may do.

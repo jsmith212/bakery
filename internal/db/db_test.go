@@ -105,6 +105,7 @@ func assertSchemaPresent(ctx context.Context, t *testing.T, pool *pgxpool.Pool) 
 	for _, rel := range []string{
 		"users", "organizations", "projects", "org_memberships", "project_memberships",
 		"cache_backends", "api_keys", "sessions", "blobs", "cache_objects", "gc_runs",
+		"hashserv_unihashes", "hashserv_outhashes", "cache_backend_usage",
 	} {
 		var got pgtype.Text
 		if err := pool.QueryRow(ctx, `SELECT to_regclass('public.' || $1)::text`, rel).Scan(&got); err != nil {
@@ -158,11 +159,12 @@ func TestMigrationVersion(t *testing.T) {
 		t.Error("dirty = true on a cleanly migrated database")
 	}
 
-	// 11 up/down pairs ship in internal/db/migrations. If this number changes, the
-	// change was deliberate and this line moves with it. (000011 is M5's OCI change:
-	// cache_objects.content_type plus the `token` reserved slug.)
-	if version != 11 {
-		t.Errorf("version = %d, want 11", version)
+	// 12 up/down pairs ship in internal/db/migrations. If this number changes, the
+	// change was deliberate and this line moves with it. (000012 is M6's GC
+	// retention/quotas change: accessed_at, cache_backends.retention_window/
+	// quota_bytes, cache_backend_usage, and the gc_runs trigger/dry_run columns.)
+	if version != 12 {
+		t.Errorf("version = %d, want 12", version)
 	}
 }
 
@@ -445,7 +447,10 @@ func TestGCWriteBarrierSparesAConcurrentBuild(t *testing.T) {
 
 	// The GC run: started_at and snapshot are frozen here, and the build's xid is
 	// in flight and therefore NOT visible in that snapshot.
-	run, err := q.StartGCRun(ctx, pgtype.Interval{Microseconds: 0, Days: 0, Months: 0, Valid: true})
+	run, err := q.StartGCRun(ctx, repository.StartGCRunParams{
+		GracePeriod: pgtype.Interval{Microseconds: 0, Days: 0, Months: 0, Valid: true},
+		Trigger:     "interval",
+	})
 	if err != nil {
 		t.Fatalf("StartGCRun: %v", err)
 	}
@@ -487,7 +492,7 @@ func TestGCWriteBarrierSparesAConcurrentBuild(t *testing.T) {
 	// Finish the first run. gc_runs_single_active_idx allows exactly one 'running'
 	// row, so this is not bookkeeping -- the next StartGCRun is a unique violation
 	// without it.
-	if err := q.FinishGCRun(ctx, repository.FinishGCRunParams{
+	if rows, err := q.FinishGCRun(ctx, repository.FinishGCRunParams{
 		ID:             run.ID,
 		Status:         repository.GcRunStatusSucceeded,
 		Error:          pgtype.Text{String: "", Valid: false},
@@ -497,12 +502,17 @@ func TestGCWriteBarrierSparesAConcurrentBuild(t *testing.T) {
 		BytesReclaimed: 0,
 	}); err != nil {
 		t.Fatalf("FinishGCRun: %v", err)
+	} else if rows != 1 {
+		t.Fatalf("FinishGCRun updated %d rows, want 1", rows)
 	}
 
 	// A LATER run takes a fresh snapshot in which the build's xid IS visible, so
 	// the same blob is now legitimately sweepable. Without this leg, a barrier that
 	// spares everything forever would pass.
-	next, err := q.StartGCRun(ctx, pgtype.Interval{Microseconds: 0, Days: 0, Months: 0, Valid: true})
+	next, err := q.StartGCRun(ctx, repository.StartGCRunParams{
+		GracePeriod: pgtype.Interval{Microseconds: 0, Days: 0, Months: 0, Valid: true},
+		Trigger:     "interval",
+	})
 	if err != nil {
 		t.Fatalf("StartGCRun (second): %v", err)
 	}
@@ -533,11 +543,11 @@ func TestOnlyOneGCRunAtATime(t *testing.T) {
 
 	grace := pgtype.Interval{Microseconds: 0, Days: 0, Months: 0, Valid: true}
 
-	if _, err := q.StartGCRun(ctx, grace); err != nil {
+	if _, err := q.StartGCRun(ctx, repository.StartGCRunParams{GracePeriod: grace, Trigger: "interval"}); err != nil {
 		t.Fatalf("first StartGCRun: %v", err)
 	}
 
-	if _, err := q.StartGCRun(ctx, grace); err == nil {
+	if _, err := q.StartGCRun(ctx, repository.StartGCRunParams{GracePeriod: grace, Trigger: "interval"}); err == nil {
 		t.Fatal("a second concurrent GC run was allowed to start")
 	}
 }
@@ -842,7 +852,7 @@ func TestGetBlobForWriteLockBlocksTheGCMark(t *testing.T) {
 	}
 
 	// The GC marks. FOR UPDATE OF b SKIP LOCKED must SKIP the row tx A holds.
-	run, err := q.StartGCRun(ctx, zeroGrace())
+	run, err := q.StartGCRun(ctx, repository.StartGCRunParams{GracePeriod: zeroGrace(), Trigger: "interval"})
 	if err != nil {
 		t.Fatalf("StartGCRun: %v", err)
 	}
@@ -863,7 +873,7 @@ func TestGetBlobForWriteLockBlocksTheGCMark(t *testing.T) {
 		t.Fatalf("rollback tx A: %v", err)
 	}
 
-	if err := q.FinishGCRun(ctx, repository.FinishGCRunParams{
+	if rows, err := q.FinishGCRun(ctx, repository.FinishGCRunParams{
 		ID:             run.ID,
 		Status:         repository.GcRunStatusSucceeded,
 		Error:          pgtype.Text{String: "", Valid: false},
@@ -873,9 +883,11 @@ func TestGetBlobForWriteLockBlocksTheGCMark(t *testing.T) {
 		BytesReclaimed: 0,
 	}); err != nil {
 		t.Fatalf("FinishGCRun: %v", err)
+	} else if rows != 1 {
+		t.Fatalf("FinishGCRun updated %d rows, want 1", rows)
 	}
 
-	next, err := q.StartGCRun(ctx, zeroGrace())
+	next, err := q.StartGCRun(ctx, repository.StartGCRunParams{GracePeriod: zeroGrace(), Trigger: "interval"})
 	if err != nil {
 		t.Fatalf("StartGCRun (second): %v", err)
 	}

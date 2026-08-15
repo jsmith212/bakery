@@ -31,6 +31,7 @@ import (
 	"net/http"
 
 	"github.com/jsmith212/bakery/internal/auth"
+	"github.com/jsmith212/bakery/internal/gc"
 	"github.com/jsmith212/bakery/internal/metrics"
 )
 
@@ -48,7 +49,13 @@ type Config struct {
 	// Metrics supplies the HTTP middleware. Labels are on r.Pattern -- never
 	// r.URL.Path, which would mint a time series per org/project/key id.
 	Metrics *metrics.Metrics
-	Log     *slog.Logger
+	// GC triggers M6 sweeps for POST /api/v1/gc/run (spec §9.10). The two listing
+	// routes read gc_runs straight off Store; only the trigger needs the running
+	// engine itself, to answer 409 the instant a second real run is attempted
+	// rather than after writing a row that would violate gc_runs' partial unique
+	// index.
+	GC  *gc.Engine
+	Log *slog.Logger
 
 	// AllowSelfServeOrgs lets ANY signed-in human create an organization (and become
 	// its local owner). Off restricts creation to site admins.
@@ -76,7 +83,13 @@ type API struct {
 	store Store
 	auth  authService
 	keys  keyMinter
-	log   *slog.Logger
+	// gc is the NARROWED gcTrigger, not *gc.Engine directly -- so a test can inject
+	// a fake without a database or a real sweep. It may be nil (see New): a nil
+	// Config.GC leaves POST /gc/run REGISTERED but refusing every call, rather
+	// than failing every embedder that has not wired M6 yet. server.Boot always
+	// wires a real engine.
+	gc  gcTrigger
+	log *slog.Logger
 
 	// allowSelfServeOrgs: see Config.AllowSelfServeOrgs. Read only by
 	// handleCreateOrg, and never written after New.
@@ -127,10 +140,20 @@ func New(cfg Config) (*API, error) {
 		log = slog.Default()
 	}
 
+	// cfg.GC is *gc.Engine, a concrete pointer -- assigning a nil one straight into
+	// the gcTrigger interface field would produce a NON-nil interface wrapping a
+	// nil pointer (Go's classic typed-nil trap), and a.gc == nil in the handler
+	// would then never be true. This is the one place that distinction is made.
+	var gcT gcTrigger
+	if cfg.GC != nil {
+		gcT = cfg.GC
+	}
+
 	return &API{
 		store:                cfg.Store,
 		auth:                 cfg.Auth,
 		keys:                 serviceKeyMinter{svc: cfg.Auth},
+		gc:                   gcT,
 		log:                  log,
 		allowSelfServeOrgs:   cfg.AllowSelfServeOrgs,
 		allowLocalSiteAdmins: cfg.AllowLocalSiteAdmins,
@@ -319,4 +342,15 @@ func (a *API) mount(mux *http.ServeMux) {
 		a.handleUpdateBackend)
 	a.route(mux, AccessProjectAdmin, "DELETE "+p+"/orgs/{org}/projects/{project}/backends/{kind}",
 		a.handleDeleteBackend)
+
+	// ---- GC (M6, spec §9.10). AccessSiteAdmin, the same level as site-admins
+	// above and for the same reason: a sweep can delete a tenant's cache
+	// wholesale, so triggering one is at least as dangerous as granting a site
+	// role, and the guard admits no API-key principal to this level at all. The
+	// two listing routes read gc_runs straight off Store; the trigger route needs
+	// the running engine itself (see gcTrigger) to answer 409 without first
+	// writing a row that would violate gc_runs' partial unique index.
+	a.route(mux, AccessSiteAdmin, "GET "+p+"/gc/runs", a.handleListGCRuns)
+	a.route(mux, AccessSiteAdmin, "GET "+p+"/gc/runs/{id}", a.handleGetGCRun)
+	a.route(mux, AccessSiteAdmin, "POST "+p+"/gc/run", a.handleTriggerGCRun)
 }

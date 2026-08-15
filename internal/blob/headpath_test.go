@@ -259,6 +259,54 @@ func TestCacheKeyIsNamespacedByBackend(t *testing.T) {
 	}
 }
 
+// ZERO ALLOCATIONS ON AN LRU HIT, and it is a TEST rather than a line in a benchmark
+// because benchmarks do not fail builds.
+//
+// Every allocation on this path is one the garbage collector pays for once per HEAD in
+// a BB_NUMBER_THREADS-parallel storm over an entire setscene graph -- tens of thousands
+// of them per build, per builder. The design spends real complexity to keep the count
+// at zero: appendCacheKey writes into a caller-supplied STACK buffer instead of
+// building a string, lruCache.get takes []byte and probes with the compiler's no-copy
+// `m[string(key)]` form, and the Recorder memo is keyed on a COMPARABLE STRUCT
+// (recKey) precisely so the map probe does not allocate the 32-byte concatenated key
+// metrics.RecorderCache would. Any one of those quietly reverting is invisible in
+// every other gate here -- the answers stay correct and the queries stay at zero -- and
+// shows up only as GC pressure under a load nobody runs in CI.
+//
+// The Ref is built OUTSIDE the measured closure: sstateKey is fmt.Sprintf, which would
+// measure the test's own allocation rather than Exists'.
+func TestExists_LRUHitAllocatesNothing(t *testing.T) {
+	repo := newFakeReader()
+	repo.add(sstateKey(1), digestOf(1), 4096)
+
+	svc := newTestService(t, repo, 4096)
+
+	ref := testRef(sstateKey(1))
+	ctx := t.Context()
+
+	if ok, err := svc.Exists(ctx, ref); err != nil || !ok {
+		t.Fatalf("warm Exists() = %v, %v; want true, nil", ok, err)
+	}
+
+	var failed atomic.Bool
+
+	allocs := testing.AllocsPerRun(100, func() {
+		ok, err := svc.Exists(ctx, ref)
+		if err != nil || !ok {
+			failed.Store(true)
+		}
+	})
+
+	if failed.Load() {
+		t.Fatal("Exists() stopped answering true during the allocation measurement")
+	}
+
+	if allocs != 0 {
+		t.Errorf("Exists() on a warm LRU allocated %v times per call, want 0 -- "+
+			"the sstate HEAD storm now makes garbage per lookup", allocs)
+	}
+}
+
 // --- benchmarks -------------------------------------------------------------
 //
 // db/op is the number that matters. ns/op is measured against a FAKE repository, so

@@ -43,6 +43,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
@@ -288,9 +289,30 @@ type Config struct {
 
 	// CacheSize is the LRU's entry ceiling. Zero means defaultCacheSize.
 	CacheSize int
+
+	// Logger is used by the background access toucher and nothing else -- every
+	// request path in this package reports through errors and metrics, never logs.
+	// Nil means slog.Default().
+	Logger *slog.Logger
 }
 
 // Service is the keyed blob service.
+//
+// FIELD ORDER IS LOAD-BEARING HERE, and the M6 toucher's two new fields (log, aux) sit
+// at the BOTTOM for that reason rather than beside the things they relate to.
+//
+// Exists is the sstate HEAD storm's whole path, and on it every call reads s.lru (one
+// pointer load) and takes s.recMu.RLock, which ATOMICALLY INCREMENTS the RWMutex's
+// readerCount -- a write, from every one of BB_NUMBER_THREADS goroutines, to whatever
+// cache line readerCount happens to live on. Inserting two 8-byte fields ahead of lru
+// slid lru (offset 48 -> 64) and recMu (72 -> 96) into the SAME 64-byte line, so that
+// atomic write invalidated the line holding the pointer every reader needs: measured
+// +10 ns/op on Exists, ~8% of the hot path, for a struct-field reshuffle that reads as
+// pure formatting in a diff. Keeping the cold additions after sfInFlight restores the
+// original offsets.
+//
+// So: NEW FIELDS GO AT THE END unless they are read on the HEAD path, and anything
+// added between metrics and recs must be re-measured with BenchmarkExists_LRUHot.
 type Service struct {
 	reader  Reader
 	tx      Txer
@@ -326,7 +348,28 @@ type Service struct {
 	qGetPhysDel counter
 	qReap       counter
 
+	qTouchAccessed counter
+	qDeleteByKeys  counter
+	qLockDigests   counter
+
 	sfInFlight gauge
+
+	// --- COLD FIELDS ONLY BELOW THIS LINE (see the type's doc comment) ---------
+
+	// log is used by the background access toucher and nothing else -- no request
+	// path in this package logs.
+	log *slog.Logger
+
+	// gc records the toucher's two series (bakery_gc_touch_flush_rows_total,
+	// bakery_gc_touch_aux_dropped_total). It is derived from Config.Metrics rather
+	// than injected separately: Metrics is already required and is the registry
+	// everything else here writes to, so a second injection point could only ever
+	// let the two disagree.
+	gc *metrics.GCRecorder
+
+	// aux is the non-LRU pending-touch set: spec 6.3's reachability marks. See
+	// toucher.go for why there are two mark sources and not one.
+	aux *auxPending
 }
 
 // counter and gauge keep the prometheus types out of the struct's signature and make
@@ -357,6 +400,11 @@ func New(cfg Config) (*Service, error) {
 
 	m := cfg.Metrics
 
+	log := cfg.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+
 	return &Service{
 		reader:      cfg.Reader,
 		tx:          cfg.Tx,
@@ -376,7 +424,16 @@ func New(cfg Config) (*Service, error) {
 		qDelete:     m.DBQueries.WithLabelValues("DeleteObject"),
 		qGetPhysDel: m.DBQueries.WithLabelValues("GetBlobForPhysicalDelete"),
 		qReap:       m.DBQueries.WithLabelValues("ReapBlob"),
-		sfInFlight:  m.SingleflightInFlight,
+
+		qTouchAccessed: m.DBQueries.WithLabelValues("TouchObjectsAccessed"),
+		qDeleteByKeys:  m.DBQueries.WithLabelValues("DeleteObjectsByKeys"),
+		qLockDigests:   m.DBQueries.WithLabelValues("LockBlobDigests"),
+
+		sfInFlight: m.SingleflightInFlight,
+
+		log: log,
+		gc:  m.GC(),
+		aux: newAuxPending(),
 	}, nil
 }
 

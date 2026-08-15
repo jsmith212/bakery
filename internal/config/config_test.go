@@ -408,6 +408,10 @@ func TestCommandTree(t *testing.T) {
 		// `bakery migrate` with no subcommand is `migrate up`, because that is the
 		// only thing anyone means by it.
 		{name: "bare migrate defaults to up", args: []string{"migrate"}, want: "migrate up"},
+		// M6 (spec §9.10): both are HTTP client verbs, so unlike the migrate/serve
+		// rows above they need no DB_URL to parse -- only --server, which defaults.
+		{name: "gc run", args: []string{"gc", "run"}, want: "gc run"},
+		{name: "gc list", args: []string{"gc", "list"}, want: "gc list"},
 	}
 
 	for _, tt := range tests {
@@ -421,6 +425,59 @@ func TestCommandTree(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestGCCmdBinding: `gc run`'s two flags and `gc list`'s two flags bind, with
+// `gc list`'s defaults matching the API's own (gcRunDefaultLimit, internal/api/gc.go)
+// so a bare `bakery gc list` and a bare `GET /gc/runs` ask for the same page size.
+func TestGCCmdBinding(t *testing.T) {
+	t.Run("run defaults", func(t *testing.T) {
+		_, cli := parse(t, "gc", "run")
+
+		if cli.GC.Run.DryRun {
+			t.Error("DryRun = true, want false by default")
+		}
+
+		if cli.GC.Run.Wait {
+			t.Error("Wait = true, want false by default")
+		}
+	})
+
+	t.Run("run flags bind", func(t *testing.T) {
+		_, cli := parse(t, "gc", "run", "--dry-run", "--wait")
+
+		if !cli.GC.Run.DryRun {
+			t.Error("DryRun = false, want true")
+		}
+
+		if !cli.GC.Run.Wait {
+			t.Error("Wait = false, want true")
+		}
+	})
+
+	t.Run("list defaults", func(t *testing.T) {
+		_, cli := parse(t, "gc", "list")
+
+		if cli.GC.List.Status != "" {
+			t.Errorf("Status = %q, want empty (every status)", cli.GC.List.Status)
+		}
+
+		if cli.GC.List.Limit != 20 {
+			t.Errorf("Limit = %d, want 20", cli.GC.List.Limit)
+		}
+	})
+
+	t.Run("list flags bind", func(t *testing.T) {
+		_, cli := parse(t, "gc", "list", "--status", "failed", "--limit", "5")
+
+		if cli.GC.List.Status != "failed" {
+			t.Errorf("Status = %q, want %q", cli.GC.List.Status, "failed")
+		}
+
+		if cli.GC.List.Limit != 5 {
+			t.Errorf("Limit = %d, want 5", cli.GC.List.Limit)
+		}
+	})
 }
 
 // TestDBURLIsRequired: every command that touches Postgres refuses to parse without

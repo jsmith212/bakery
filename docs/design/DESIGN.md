@@ -177,7 +177,7 @@ Each is independently shippable and leaves the tree green.
 - **M3 — hashserv. ✅ DONE** (see "M3 as landed" below). ([spec](specs/2026-07-13-m3-hashserv.md)) WebSocket-only, framing-first, one writer goroutine per connection, auth denied in-band. Upstream bitbake's own hashserv suite **and** the real `bitbake-hashclient` both run against Bakery in CI, and the gate earned its keep on day one — it caught a real divergence the design review had not.
 - **M4 — Bazel REAPI (gRPC) + `/ac` `/cas` `/sccache` HTTP. ✅ DONE** (see "M4 as landed" below). Ships moon (gRPC), Bazel (gRPC + HTTP), ccache and sccache together.
 - **M5 — Docker OCI pull-through proxy. ✅ DONE** (see "M5 as landed" below). Byte-exact manifests, stale-while-revalidate, own Bearer challenge; ships containerd, BuildKit, podman/skopeo and Docker Engine.
-- **M6 — GC, retention, quotas + UI polish.** ([spec](specs/2026-08-14-m6-gc-retention-quotas.md)) (The GC *write barrier* and refcount tests land with M1, not here.) Product decisions confirmed 2026-08-14: retention ships ON with per-kind defaults, `downloads` is an archive (never auto-evicts), org quota is a seed default only, OCI gets no quota, scheduling is a plain interval.
+- **M6 — GC, retention, quotas. ✅ DONE** (see "M6 as landed" below). ([spec](specs/2026-08-14-m6-gc-retention-quotas.md)) Product decisions confirmed 2026-08-14: retention ships ON with per-kind defaults, `downloads` is an archive (never auto-evicts), org quota is a seed default only, OCI gets no quota, scheduling is a plain interval. (UI polish descoped to the SPA wiring wave.)
 
 ### M3: what the pre-implementation review got right, and what it got wrong
 
@@ -490,6 +490,36 @@ only; 404/405 is the verified-safe answer), non-sha256 digests (clean 404), sche
 upstream Range resume (perf, revisit with S3), per-tenant upstream credentials and envelope
 encryption (deferred until a tenant needs them), `accessed_at` (still M6's call), and the SPA
 screens. A real `nerdctl pull` through hosts.toml is the DoD manual step, like moon in M4.
+
+### M6 as landed
+
+`internal/gc/` — the staged sweep engine over the M1 machinery (`gc_runs`, mark/reap,
+refcount triggers), migration `000012` (nullable un-indexed `accessed_at`, real
+`retention_window`/`quota_bytes` columns with per-kind seeding at migration AND at
+`CreateBackend`, `cache_backend_usage`, `gc_state` ramp stamp, dry-run slot split), the
+`blob.Service` access toucher (marks ride the LRU entry under the already-held shard
+mutex; zero-query, zero-alloc hit path preserved and now gated by an allocs test) and
+`DeleteBatch` (digest-ordered pre-lock + barrier-carrying delete + shard-grouped LRU
+invalidation), the hashserv unihash toucher, the ac-grpc reachability touch (incl. tree
+contents — Bazel BwoB verified from source: no CAS contact on AC hits by default), the
+window ladder, evict-to-quota with sweep-scan accounting, site-admin API + CLI, and the
+first writers to the M1 storage gauges.
+
+**Process:** a 5-seat research wave → adjudicated memo → 20-finding adversarial critique →
+spec → 6-stage build-gated implementation workflow → 3-lens adversarial review (16 findings,
+all landed) → an independent verify pass that caught **a regression the fix wave itself
+introduced** (a windowless quota-bearing OCI backend retention-sweeping every untagged
+manifest — the `hasWindow` guard + a proven-failing regression test now pin it). Full suite
+green, no skips, race-clean.
+
+**What M6 did NOT build:** hard-reject quotas (client PUT-failure latches unverified;
+enforcement point recorded in the spec), any `/ac` parsing or ac-grpc reachability *sweep*,
+OCI manifest parsing, `gc_root`, per-namespace configurable windows, scoped `gc_runs`,
+`accessed_at` indexes, GC under `--allow-multi-instance`, object pinning, the
+maintenance-window scheduler, S3 reap, and ALL SPA wiring (GC-runs screen + gauge views
+land with the SPA wave). Known follow-ups: boot's `RedrivePendingDelete` overlaps the first
+startup sweep's stage 0 (harmless duplicate scan), and the engine's flusher wiring in
+`Boot` is proven by compilation rather than a wiring test.
 
 ---
 
