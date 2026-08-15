@@ -589,12 +589,21 @@ func TestTriggerAsyncRunsUnderTheLifetimeContext(t *testing.T) {
 	}
 
 	entered := make(chan struct{})
+	release := make(chan struct{})
 
 	var once sync.Once
 
+	// Page 0 PARKS until the test releases it. Without the park, the whole
+	// fake-backed sweep can complete between `entered` and the assertion below --
+	// a sweep that FINISHED also proves the dead request context did not kill it,
+	// but the probe cannot tell that apart from a cancelled one. Observed as a
+	// real flake under coverage instrumentation in CI; the park makes "still
+	// mid-sweep" a fact rather than a race. onScan runs with no fake lock held,
+	// so blocking here cannot deadlock the assertion's own q.mu.Lock().
 	q.onScan = func(page int) {
 		if page == 0 {
 			once.Do(func() { close(entered) })
+			<-release
 		}
 	}
 
@@ -609,7 +618,8 @@ func TestTriggerAsyncRunsUnderTheLifetimeContext(t *testing.T) {
 	endRequest()
 	<-entered
 
-	// Still sweeping: the dead request context did not take it with it.
+	// Still sweeping -- provably, it is parked inside page 0 -- so the dead
+	// request context did not take it with it.
 	q.mu.Lock()
 	finished := len(q.finished)
 	q.mu.Unlock()
@@ -618,7 +628,11 @@ func TestTriggerAsyncRunsUnderTheLifetimeContext(t *testing.T) {
 		t.Fatal("the detached sweep finished the moment its request context died")
 	}
 
+	// Shutdown BEFORE the release: the sweep wakes into an already-cancelled
+	// lifetime, notices it at the next between-chunks check, and writes the
+	// failed/errShutdown terminal row the assertions below expect.
 	shutdown()
+	close(release)
 
 	select {
 	case <-eng.AsyncDone():
