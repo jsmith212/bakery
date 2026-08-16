@@ -1,7 +1,10 @@
 package auth
 
 import (
+	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"reflect"
 	"slices"
@@ -11,6 +14,42 @@ import (
 
 	"golang.org/x/oauth2"
 )
+
+// TestNewProviderFailsFastAgainstABlackHolingIssuer proves discovery is
+// bounded. Without a timeout, an unreachable or black-holing IdP hangs Boot
+// forever -- BEFORE any listener binds -- so no startupProbe could ever
+// connect, and an operator sees an eternally-failing probe on a container
+// that printed no error at all (docs/deploy/k8s.md).
+//
+// The fake IdP here never responds at all (it blocks until the request
+// context is canceled), and the CALLER's context carries a deadline far
+// short of discoveryTimeout -- context.WithTimeout inside NewProvider takes
+// the EARLIER of the two deadlines, so this proves the bound is real without
+// the test itself waiting out the full 30s.
+func TestNewProviderFailsFastAgainstABlackHolingIssuer(t *testing.T) {
+	t.Parallel()
+
+	blackHole := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer blackHole.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := NewProvider(ctx, OIDCConfig{Issuer: blackHole.URL, ClientID: "client"})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("NewProvider() succeeded against a server that never responds")
+	}
+
+	if elapsed > 5*time.Second {
+		t.Errorf("NewProvider() took %s to fail, want it bounded near the caller's ~300ms deadline "+
+			"(discoveryTimeout must not out-wait a shorter caller deadline, and must not hang)", elapsed)
+	}
+}
 
 // TestVerifyIDToken is the load-bearing test in this package.
 //
@@ -114,6 +153,46 @@ func TestVerifyIDToken(t *testing.T) {
 
 			if want := []string{"platform", "yocto-admins"}; !reflect.DeepEqual(id.Groups, want) {
 				t.Errorf("Groups = %v, want %v", id.Groups, want)
+			}
+		})
+	}
+}
+
+// TestNonHTTPSPictureClaimIsDropped covers the whole `avatarURL` filter: an
+// https `picture` claim passes through verbatim, and everything else --
+// data:, http:, scheme-relative, a bare path, garbage -- is dropped rather
+// than stored or rendered. This is the one `if` that closes the weird-URL
+// class the migration's CHECK constraint backstops structurally.
+func TestNonHTTPSPictureClaimIsDropped(t *testing.T) {
+	idp := newFakeIDP(t)
+	provider := idp.provider(t)
+
+	tests := []struct {
+		name    string
+		picture string
+		want    string
+	}{
+		{"https passes through", "https://cdn.example.dev/a.png", "https://cdn.example.dev/a.png"},
+		{"http is dropped", "http://cdn.example.dev/a.png", ""},
+		{"data URI is dropped", "data:image/png;base64,AAAA", ""},
+		{"scheme-relative is dropped", "//evil.example/a.png", ""},
+		{"bare path is dropped", "/a.png", ""},
+		{"garbage is dropped", "not a url", ""},
+		{"absent claim is dropped", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := defaultClaims(idp)
+			c.picture = tt.picture
+
+			id, err := provider.VerifyIDToken(t.Context(), idp.signIDToken(t, c))
+			if err != nil {
+				t.Fatalf("VerifyIDToken() error = %v, want success", err)
+			}
+
+			if id.AvatarURL != tt.want {
+				t.Errorf("AvatarURL = %q, want %q", id.AvatarURL, tt.want)
 			}
 		})
 	}

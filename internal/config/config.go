@@ -22,6 +22,7 @@ type CLI struct {
 	Login     LoginCmd     `cmd:"" help:"Sign in to a Bakery server with the OIDC device grant."`
 	Logout    LogoutCmd    `cmd:"" help:"Clear the cached tokens for a Bakery server."`
 	Whoami    WhoamiCmd    `cmd:"" help:"Print who you are signed in as, and what you may do."`
+	Token     TokenCmd     `cmd:"" help:"Manage your personal access tokens (bkru_)." name:"token"`
 	Org       OrgCmd       `cmd:"" help:"Manage organizations."`
 	Project   ProjectCmd   `cmd:"" help:"Manage projects."`
 	Member    MemberCmd    `cmd:"" help:"Manage project memberships."`
@@ -37,26 +38,109 @@ type CLI struct {
 	// Server is global rather than per-command because it is the one thing every
 	// client command needs and no client command chooses: it is a property of the
 	// installation, and it belongs in the environment of a shell that talks to one.
-	Server string `default:"http://localhost:8080" env:"BAKERY_SERVER" help:"Bakery server to talk to." name:"server"`
+	//
+	// No `default` tag: an empty value here means "let the CLI resolve it" --
+	// --server (this flag) > BAKERY_SERVER (env, via Kong, only when the flag was
+	// not passed) > credentials.json's default_server (`bakery login
+	// --set-default`) > http://localhost:8080. See internal/cli's resolveServer,
+	// which is where the last two links live -- a struct tag cannot read a file.
+	Server string `env:"BAKERY_SERVER" help:"Bakery server to talk to. Falls back to BAKERY_SERVER, then the credentials file's default_server, then http://localhost:8080." name:"server"`
 
 	// JSON is the machine-readable escape hatch. The default output is for a human
 	// reading a terminal; this is for the pipeline that comes after.
 	JSON bool `env:"BAKERY_JSON" help:"Print the server's JSON instead of a table." name:"json"`
 }
 
-// LoginCmd runs the OIDC device grant.
+// LoginCmd runs the OIDC device grant, or -- with --token -- the headless
+// path a build host uses instead.
 //
-// It takes no flags: everything the flow needs -- issuer, client id, scopes, the
-// device authorization endpoint -- is fetched from the server's /auth/config, so
-// the CLI cannot disagree with the server about which identity provider it
-// trusts, and a workstation needs no configuration beyond --server.
-type LoginCmd struct{}
+// With no flags it takes none: everything the device flow needs -- issuer,
+// client id, scopes, the device authorization endpoint -- is fetched from the
+// server's /auth/config, so the CLI cannot disagree with the server about
+// which identity provider it trusts, and a workstation needs no configuration
+// beyond --server.
+type LoginCmd struct {
+	// Token is a bkru_ personal access token. It is validated against GET /me
+	// BEFORE it is cached -- see loginWithToken -- and skips the device grant
+	// entirely: no browser, no polling, exactly what a headless build host or a
+	// CI job needs.
+	//
+	// BAKERY_USER_TOKEN exists because THE OBVIOUS INVOCATION IS THE LEAKY ONE.
+	// This is the only flag in the CLI that carries a long-lived credential, and
+	// it was the only credential flag without an environment binding -- so
+	// `bakery login --token bkru_...` put a live token in `ps aux` on a shared
+	// build host and in ~/.bash_history, which is precisely the environment this
+	// credential was built for. `--token -` (stdin) was always the safe path and
+	// nothing pointed at it. Same shape as SstatePushCmd.Key's BAKERY_API_KEY;
+	// the help names both safe forms before the unsafe one.
+	//
+	// NOT `BAKERY_TOKEN`: that name is already taken, by the SNIPPET GENERATOR --
+	// the moon workspace snippet emits `BAKERY_TOKEN=<project api key>` and tells
+	// the client to read the token from it (api/snippets.go). Binding this flag
+	// to the same name would mean that on any host configured from that snippet,
+	// a bare `bakery login` -- no flag, device grant intended -- would silently
+	// pick up a `bkry_` project key as its --token and refuse with "must be a
+	// personal access token" instead of opening a browser. An env binding that
+	// breaks the flagless invocation on exactly the machines this credential
+	// targets is worse than the leak it fixes.
+	Token string `env:"BAKERY_USER_TOKEN" help:"A personal access token (bkru_...). Prefer BAKERY_USER_TOKEN or - (read it from stdin): a token passed on the command line lands in your shell history and in ps output. Skips the device grant." name:"token"`
 
-// LogoutCmd clears the cached tokens for --server.
+	// SetDefault writes credentials.json's default_server, the third link in
+	// the --server resolution chain (config.CLI.Server's doc). It is opt-in: a
+	// login on a one-off `--server` should not silently repoint every future
+	// command run with no --server at all.
+	SetDefault bool `help:"Record this server as the default for future commands run with no --server." name:"set-default"`
+}
+
+// LogoutCmd clears the cached OIDC session for --server. A cached user token
+// or project/robot key on the same server is untouched -- see TokenStore.Delete.
 type LogoutCmd struct{}
 
 // WhoamiCmd is GET /me.
 type WhoamiCmd struct{}
+
+// TokenCmd groups the personal-access-token verbs (bkru_). See UserCmd for the
+// unrelated out-of-band `user site-admin` break-glass -- this group is an
+// ordinary HTTP client against /api/v1/user/tokens, session-only on the
+// server, exactly like `key`.
+type TokenCmd struct {
+	Create TokenCreateCmd `cmd:"" help:"Mint a personal access token. Shown once and never again."`
+	List   TokenListCmd   `cmd:"" help:"List your personal access tokens. Metadata only; the secret is never listed."`
+	Revoke TokenRevokeCmd `cmd:"" help:"Revoke a personal access token."`
+}
+
+// TokenListCmd lists the caller's own tokens.
+type TokenListCmd struct{}
+
+// TokenCreateCmd mints a personal access token for the caller.
+//
+// There is no --user flag, for the same reason KeyCreateCmd has none: this
+// credential acts as whoever mints it, so minting one for someone else would
+// put your identity in front of their build.
+type TokenCreateCmd struct {
+	Name string `arg:"" help:"A label, so the token can be told apart later."`
+
+	// Scope is a CEILING, not a grant: the token's real authority is the
+	// caller's own LIVE roles, narrowed by this -- see auth.CreateUserToken.
+	Scope string `default:"write" enum:"read,write" help:"The ceiling on what the token may do. read or write." name:"scope"`
+
+	// A duration, not a date, matching KeyCreateCmd -- and the same default
+	// (omitted, i.e. zero): a personal token is allowed to never expire,
+	// unlike a robot token (OrgRobotCreateCmd), which is required to.
+	ExpiresIn time.Duration `help:"Lifetime, e.g. 2160h. Omit for a token that never expires." name:"expires-in"`
+
+	// Store defaults ON: the whole point of this credential is a build host
+	// that never opens a browser again, so the ordinary path saves it.
+	// --no-store mints and prints without touching credentials.json.
+	Store bool `default:"true" negatable:"" help:"Save the minted token to credentials.json for this server." name:"store"`
+}
+
+// TokenRevokeCmd revokes one of the caller's own tokens. There is no {user}
+// segment anywhere in this group -- a token is always the CALLER's, and the
+// server scopes the revoke by user_id in the query's own predicate.
+type TokenRevokeCmd struct {
+	Token string `arg:"" help:"Token id, as shown by bakery token list."`
+}
 
 // OrgCmd groups the organization verbs.
 type OrgCmd struct {
@@ -65,6 +149,7 @@ type OrgCmd struct {
 	Show   OrgShowCmd   `cmd:"" help:"Show one organization."`
 	Rename OrgRenameCmd `cmd:"" help:"Change an organization's display name."`
 	Delete OrgDeleteCmd `cmd:"" help:"Delete an organization and everything in it."`
+	Robot  OrgRobotCmd  `cmd:"" help:"Manage org robots (bkro_): org-wide machine identities for CI."`
 }
 
 // OrgListCmd lists the orgs the caller can see.
@@ -95,6 +180,65 @@ type OrgRenameCmd struct {
 type OrgDeleteCmd struct {
 	Org string `arg:"" help:"Organization slug."`
 	Yes bool   `help:"Required. Confirms that deleting this org's projects, keys and cached objects is intended." name:"yes"`
+}
+
+// OrgRobotCmd groups the robot verbs. A robot is an org-owned machine
+// identity, not a user -- it has no project role, no console session, and
+// (CanReadProject/CanWriteProject) reads and writes every project in the org,
+// present and future, at whatever scope its token carries.
+type OrgRobotCmd struct {
+	Create OrgRobotCreateCmd `cmd:"" help:"Create a robot and mint its first token. The token is shown once and never again."`
+	List   OrgRobotListCmd   `cmd:"" help:"List an org's robots, each with its tokens (live and revoked). Metadata only."`
+	Revoke OrgRobotRevokeCmd `cmd:"" help:"Revoke one of a robot's tokens, without deleting the robot."`
+	Delete OrgRobotDeleteCmd `cmd:"" help:"Delete a robot, cascading every token it holds."`
+}
+
+// OrgRobotListCmd lists an org's robots and their tokens, live and revoked.
+type OrgRobotListCmd struct {
+	Org string `arg:"" help:"Organization slug."`
+}
+
+// OrgRobotCreateCmd creates a robot AND mints its first token in one step: a
+// robot with no tokens authorizes nothing, so a bare `robot create` with
+// nothing usable at the end of it would not be the one-step credential-minting
+// verb every other `create` in this CLI is.
+type OrgRobotCreateCmd struct {
+	Org  string `arg:"" help:"Organization slug."`
+	Name string `arg:"" help:"Robot name, unique within the org."`
+
+	Description string `help:"What this robot is for." name:"description"`
+
+	// TokenName is separate from Name: org_tokens.name is unique per ROBOT, not
+	// per org, and a robot is meant to be rotated (create-new-then-revoke-old,
+	// same as every credential in this system) -- so a second token needs its
+	// own label from the day the robot is created.
+	TokenName string `default:"default" help:"Name for the token minted with this robot." name:"token-name"`
+
+	Scope string `default:"write" enum:"read,write" help:"read or write." name:"scope"`
+
+	// REQUIRED, unlike KeyCreateCmd's and TokenCreateCmd's --expires-in: a
+	// robot token cannot be "never" (auth.MaxOrgTokenLifetime caps it at 365
+	// days server-side) -- see CLAUDE.md: a robot deliberately outlives its
+	// creator, so expiry is the countervailing control. The default here is a
+	// starting point to type over, not a claim that 90 days is always right.
+	ExpiresIn time.Duration `default:"2160h" help:"Token lifetime, e.g. 2160h (90 days). Required; capped at 365 days." name:"expires-in"`
+
+	Store bool `default:"true" negatable:"" help:"Save the minted token to credentials.json for this org." name:"store"`
+}
+
+// OrgRobotRevokeCmd revokes one of a robot's tokens. The robot itself, and any
+// other live token it holds, are untouched.
+type OrgRobotRevokeCmd struct {
+	Org   string `arg:"" help:"Organization slug."`
+	Robot string `arg:"" help:"Robot id, as shown by bakery org robot list."`
+	Token string `arg:"" help:"Token id, as shown by bakery org robot list."`
+}
+
+// OrgRobotDeleteCmd deletes a robot outright, cascading every token it holds.
+type OrgRobotDeleteCmd struct {
+	Org   string `arg:"" help:"Organization slug."`
+	Robot string `arg:"" help:"Robot id, as shown by bakery org robot list."`
+	Yes   bool   `help:"Required. Confirms that every token this robot holds is revoked immediately." name:"yes"`
 }
 
 // ProjectCmd groups the project verbs.
@@ -213,6 +357,12 @@ type KeyCreateCmd struct {
 	// A duration, not a date: `--expires-in 720h` is what a human types, and it
 	// cannot be off by a timezone.
 	ExpiresIn time.Duration `help:"Lifetime, e.g. 720h. Omit for a key that never expires." name:"expires-in"`
+
+	// Store defaults ON: a minted key is useless until it lands in a build
+	// config anyway, and resolveCacheCredential's precedence chain means an
+	// immediate `bakery sstate push` in the same org/project just works.
+	// --no-store mints and prints without touching credentials.json.
+	Store bool `default:"true" negatable:"" help:"Save the minted key to credentials.json for this org/project." name:"store"`
 }
 
 // KeyRevokeCmd revokes an API key.
@@ -239,7 +389,7 @@ type SstatePushCmd struct {
 	Dir     string `arg:"" help:"Local SSTATE_DIR to walk." type:"existingdir"`
 
 	Concurrency int    `default:"8" help:"Parallel HEAD/PUT operations." name:"concurrency" short:"j"`
-	Key         string `env:"BAKERY_API_KEY" help:"API key (bkry_...). Omit to use the logged-in session." name:"key"`
+	Key         string `env:"BAKERY_API_KEY" help:"Credential to present (bkry_ project key, bkru_ personal token, or bkro_ robot token). Omit to use, in order: a stored project key, a stored org robot token, your stored personal token, then the logged-in session." name:"key"`
 	DryRun      bool   `help:"Report what would upload; PUT nothing." name:"dry-run"`
 }
 
@@ -257,7 +407,7 @@ type DownloadsPushCmd struct {
 	Dir     string `arg:"" help:"Local DL_DIR to walk." type:"existingdir"`
 
 	Concurrency int    `default:"8" help:"Parallel HEAD/PUT operations." name:"concurrency" short:"j"`
-	Key         string `env:"BAKERY_API_KEY" help:"API key (bkry_...). Omit to use the logged-in session." name:"key"`
+	Key         string `env:"BAKERY_API_KEY" help:"Credential to present (bkry_ project key, bkru_ personal token, or bkro_ robot token). Omit to use, in order: a stored project key, a stored org robot token, your stored personal token, then the logged-in session." name:"key"`
 	DryRun      bool   `help:"Report what would upload; PUT nothing." name:"dry-run"`
 }
 
@@ -364,9 +514,42 @@ type ServeCmd struct {
 	// not for scale-out.
 	AllowMultiInstance bool `env:"ALLOW_MULTI_INSTANCE" help:"Boot even if another instance holds the database boot lock. You are asserting that only one instance writes."`
 
-	// Local disk. S3 is explicitly deferred: there is no storage-backend column in
-	// the schema and no S3 driver in the binary.
+	// Helps ONLY the timing hazards where the lock HOLDER is on its way out:
+	// a node drain/eviction outside the tidy SIGTERM sequence, or a
+	// slow-terminating old pod still inside its termination grace period. It
+	// CANNOT rescue a k8s Deployment left on the default `RollingUpdate`
+	// strategy -- that is a circular wait against a holder k8s itself is
+	// waiting on, and no finite wait resolves it. `strategy: Recreate` is the
+	// only fix; see docs/deploy/k8s.md. Default 0s preserves today's
+	// fail-fast behavior on a laptop and in CI.
+	BootLockWait time.Duration `default:"0s" env:"BOOT_LOCK_WAIT" help:"Poll for the boot lock this long before giving up if another instance holds it. Does not help a RollingUpdate deployment -- see docs/deploy/k8s.md."`
+
+	// The byte store. An ENUM, not a free string: the value becomes the `driver`
+	// label on bakery_storage_operations_total, and Kong refusing an unknown value
+	// at parse time is what keeps that label set closed. It is a SERVER-WIDE
+	// choice, not a per-backend column -- there is no storage-backend column in the
+	// schema, and a deployment that moved half its digests to another store would
+	// have no way to know which half.
+	StorageDriver string `default:"local" env:"STORAGE_DRIVER" enum:"local,s3" help:"Byte store driver." name:"storage-driver"`
+
+	// Local disk. Read only when --storage-driver=local.
 	StorageDir string `default:"./data" env:"STORAGE_DIR" help:"Directory the local storage driver writes blobs to." type:"path"`
+
+	// S3 (or any S3-compatible gateway: minio, Ceph, Garage, R2). Read only when
+	// --storage-driver=s3, and validated at boot by a HeadBucket probe so a
+	// misspelled bucket or an unresolvable credential chain is a refused boot
+	// rather than a 500 on the first cache write.
+	//
+	// THERE ARE DELIBERATELY NO CREDENTIAL FLAGS. The standard AWS chain
+	// (environment, shared config files, IMDS / IRSA / EKS pod identity) resolves
+	// them, which is the same stance the OCI backend takes for upstream registry
+	// credentials: server-level environment, never a flag and never plaintext in
+	// the database.
+	S3Bucket         string `env:"S3_BUCKET" help:"Bucket the s3 storage driver writes blobs to." name:"s3-bucket"`
+	S3Region         string `env:"S3_REGION" help:"Region for the s3 storage driver." name:"s3-region"`
+	S3Endpoint       string `env:"S3_ENDPOINT" help:"Override the S3 endpoint (minio, Ceph, Garage, R2)." name:"s3-endpoint"`
+	S3ForcePathStyle bool   `env:"S3_FORCE_PATH_STYLE" help:"Address the bucket as {endpoint}/{bucket}/{key} rather than as a virtual host. Required by minio and most self-hosted gateways." name:"s3-force-path-style"`
+	S3Prefix         string `env:"S3_PREFIX" help:"Key prefix, so one bucket can hold several environments." name:"s3-prefix"`
 
 	// The hashserv upstream-chaining KILL SWITCH. Server-wide, and it overrides every
 	// backend: when set, a backend whose cache_backends.config names an upstream behaves

@@ -39,6 +39,18 @@ const (
 	// AccessAuthenticated needs a verified principal and nothing more (/me). It is
 	// the ONLY level an API key may reach -- see guard.
 	AccessAuthenticated
+	// AccessUserScoped needs a principal that ACTS AS A USER: a session, a CLI
+	// login, or a personal access token. Never a bare machine credential.
+	//
+	// It exists for routes whose whole response is derived from the caller's own
+	// memberships -- GET /orgs is the one -- where a credential that IS its owner
+	// gets a meaningful answer and a credential that is a GRANT gets an empty list
+	// it had no business asking for. AccessAuthenticated would admit the latter,
+	// and then "a robot may reach GET /api/v1/me and nothing else" would be false;
+	// AccessUser would exclude the former, and then `bakery org list` would not
+	// work with a personal access token, which is the friction that credential
+	// exists to remove. Neither existing level says the right thing.
+	AccessUserScoped
 	// AccessUser needs a verified HUMAN principal: a session or a CLI login, never
 	// an API key. Creating an organization is the one route at this level.
 	//
@@ -58,6 +70,29 @@ const (
 	AccessOrgOwner
 	// AccessProjectRead needs {org} and {project} and CanReadProject.
 	AccessProjectRead
+	// AccessProjectCredential needs exactly what AccessProjectRead needs --
+	// {org}, {project}, CanReadProject -- and admits only a credential a HUMAN is
+	// behind. It is the level the three CREDENTIAL-MANAGING project routes sit
+	// on: POST .../keys, DELETE .../keys/{key}, POST .../snippet.
+	//
+	// It exists because the capability question and the door question have
+	// different answers here, and the door's was wrong. A project reader may
+	// legitimately mint a read-scoped key and generate a read snippet -- that is
+	// the console's headline flow, and the write-scope cap lives in
+	// auth.CreateAPIKey, not in the ladder -- so the capability floor is
+	// deliberately ProjectRead. But `methodMayReach` opens ProjectRead to a
+	// personal access token, and a PAT that can enumerate its owner's key ids
+	// (GET .../keys, which stays at ProjectRead) and then DELETE each one is a
+	// denial-of-service primitive against every CI job in the org, attributed in
+	// the audit log to its owner.
+	//
+	// The mints were already refused one layer in, by requireMintAuthority, and
+	// the revoke was not refused at all. Closing the DOOR rather than leaning on
+	// the inner check is the shape the rest of this file uses: `/user/tokens` is
+	// AccessUser for exactly this reason ("a token that could REVOKE them would
+	// hand it a denial of service"), and a credential route reachable by a
+	// credential contradicts that rule one file away from where it is written.
+	AccessProjectCredential
 	// AccessProjectAdmin needs {org} and {project} and CanAdminProject.
 	AccessProjectAdmin
 )
@@ -79,6 +114,8 @@ func (a Access) String() string {
 		return "public"
 	case AccessAuthenticated:
 		return "authenticated"
+	case AccessUserScoped:
+		return "user_scoped"
 	case AccessUser:
 		return "user"
 	case AccessSiteAdmin:
@@ -91,6 +128,8 @@ func (a Access) String() string {
 		return "org_owner"
 	case AccessProjectRead:
 		return "project_read"
+	case AccessProjectCredential:
+		return "project_credential"
 	case AccessProjectAdmin:
 		return "project_admin"
 	default:
@@ -119,6 +158,7 @@ type Principal interface {
 	OrgRole(orgID pgtype.UUID) (auth.OrgRole, bool)
 	ProjectRole(projectID pgtype.UUID) (auth.ProjectRole, bool)
 	APIKey() (auth.KeyGrant, bool)
+	Robot() (auth.RobotGrant, bool)
 
 	CanViewOrg(orgID pgtype.UUID) bool
 	CanAdminOrg(orgID pgtype.UUID) bool
@@ -235,7 +275,7 @@ type handlerFunc func(w http.ResponseWriter, r *http.Request) error
 //  2. enforces the JSON content type on state-changing methods (CSRF) --
 //     BEFORE the public branch below, so a public route is covered too;
 //  3. requires a principal on any non-public route;
-//  4. refuses an API-key principal anywhere but /me (see below);
+//  4. refuses a MACHINE principal anywhere but /me (see below);
 //  5. resolves {org} / {project} from slugs to database ids;
 //  6. asks the principal whether it may act at this Access level;
 //  7. only then calls the handler, with the resolved scope in the context.
@@ -252,6 +292,15 @@ type handlerFunc func(w http.ResponseWriter, r *http.Request) error
 // CLI, and a key that could enumerate a project's other keys and its members is a
 // lateral-movement primitive for no benefit. /me stays open so `bakery whoami`
 // works with a key.
+//
+// It is written as an ALLOWLIST of interactive methods, matching
+// principal.isInteractive, and for the same reason: keyed the other way round --
+// "refuse auth.MethodAPIKey" -- every credential kind added later would be
+// admitted to the whole control plane by default, silently, with no compiler
+// error and no failing test. A new Method is refused here until someone
+// deliberately admits it. (Stage 3 of the credential wave admits
+// auth.MethodUserToken to the routes a personal access token is meant to reach;
+// a robot stays refused everywhere but /me.)
 func (a *API) guard(access Access, h handlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
@@ -283,9 +332,8 @@ func (a *API) guard(access Access, h handlerFunc) http.HandlerFunc {
 			return
 		}
 
-		if p.Method() == auth.MethodAPIKey && access != AccessAuthenticated {
-			a.writeError(w, r, errForbidden(
-				"an API key authorizes cache traffic only; use a session or a CLI login for the control plane"))
+		if !methodMayReach(p.Method(), access) {
+			a.writeError(w, r, errForbidden(methodRefusal(p.Method())))
 
 			return
 		}
@@ -368,11 +416,13 @@ func (a *API) resolve(ctx context.Context, r *http.Request, access Access, p Pri
 		if !p.CanOwnOrg(org.ID) {
 			return scope{}, errForbidden("this action requires the organization owner")
 		}
-	case AccessPublic, AccessAuthenticated, AccessUser, AccessSiteAdmin, AccessOrgView,
-		AccessProjectRead, AccessProjectAdmin:
-		// AccessOrgView: satisfied by CanViewOrg above. AccessProjectRead and
-		// AccessProjectAdmin are checked after project resolution. The rest cannot
-		// reach here (needsOrg already returned for them).
+	case AccessPublic, AccessAuthenticated, AccessUserScoped, AccessUser, AccessSiteAdmin,
+		AccessOrgView, AccessProjectRead, AccessProjectCredential, AccessProjectAdmin:
+		// AccessOrgView: satisfied by CanViewOrg above. AccessProjectRead,
+		// AccessProjectCredential and AccessProjectAdmin are checked after project
+		// resolution -- and the first two by the SAME check, CanReadProject: the
+		// credential level narrows the DOOR (methodMayReach), not the capability.
+		// The rest cannot reach here (needsOrg already returned for them).
 	}
 
 	// Resolve {project} whenever the ROUTE carries it -- keyed on the path pattern,
@@ -447,4 +497,101 @@ func requireJSON(r *http.Request) error {
 	}
 
 	return nil
+}
+
+// methodMayReach is THE CONTROL-PLANE DOOR: which Access levels each credential
+// kind may come through at all.
+//
+// It is separate from -- and coarser than -- the capability methods on the
+// principal. Those decide what a caller may DO; this decides whether the request
+// gets as far as asking. An API key COULD read its own project, but a key that
+// can enumerate that project's other keys and its members is a lateral-movement
+// primitive for no benefit, so the door is shut before any capability is
+// consulted. That is a policy, not a second opinion.
+//
+// EVERY ARM IS AN ALLOWLIST, with no default and a trailing `return false`. Keyed
+// the other way round -- "refuse auth.MethodAPIKey" -- every credential kind
+// added later would be admitted to the whole control plane by default, silently,
+// with no compiler error and no failing test. That is exactly the bug this shape
+// was inverted to prevent, and it must not be reintroduced by writing an
+// exception for one Method instead of an entry for each.
+//
+// The three rows, and why:
+//
+//   - INTERACTIVE (session, bearer, dev): everything. A human is present.
+//   - USER TOKEN: the READ ladder only -- /me, org view, project read. A personal
+//     access token acts as its owner on the cache plane and for `bakery org
+//     list`, which is the friction the credential exists to remove. It may not
+//     create an organization (AccessUser hands the creator a local OWNER grant),
+//     administer one, act as a site admin, or MANAGE CREDENTIALS
+//     (AccessProjectCredential: minting one is refused by requireMintAuthority
+//     anyway, but revoking one was not refused anywhere, and a leaked PAT that
+//     can revoke its owner's API keys breaks every CI job in the org) -- so those
+//     doors stay shut even though its principal would answer the capability
+//     question the same way a session's would for the read levels.
+//   - API KEY and ROBOT: /me and nothing else, so `bakery whoami` can verify a
+//     credential without performing a push. Everything else is cache traffic.
+func methodMayReach(m auth.Method, access Access) bool {
+	switch m {
+	case auth.MethodSession, auth.MethodBearer, auth.MethodDev:
+		return true
+
+	case auth.MethodUserToken:
+		switch access {
+		case AccessPublic, AccessAuthenticated, AccessUserScoped, AccessOrgView, AccessProjectRead:
+			return true
+		case AccessUser, AccessSiteAdmin, AccessOrgAdmin, AccessOrgOwner,
+			AccessProjectCredential, AccessProjectAdmin:
+			return false
+		}
+
+		return false
+
+	case auth.MethodAPIKey, auth.MethodOrgToken:
+		return access == AccessPublic || access == AccessAuthenticated
+	}
+
+	return false
+}
+
+// methodRefusal is the 403 body. It names what the credential IS for rather than
+// what it is not, because the caller is a script and the message is the only
+// instruction its operator will read.
+func methodRefusal(m auth.Method) string {
+	if m == auth.MethodUserToken {
+		return "a personal access token may read the control plane but not administer it; " +
+			"use a browser session or a CLI login"
+	}
+
+	return "this credential authorizes cache traffic only; " +
+		"use a session or a CLI login for the control plane"
+}
+
+// interactiveMethod mirrors auth's own interactive/non-interactive split. It is
+// used by this package's test double so the fake principal can never be MORE
+// permissive than production, and by nothing else -- the door above is
+// methodMayReach.
+func interactiveMethod(m auth.Method) bool {
+	switch m {
+	case auth.MethodSession, auth.MethodBearer, auth.MethodDev:
+		return true
+	case auth.MethodAPIKey, auth.MethodUserToken, auth.MethodOrgToken:
+		return false
+	}
+
+	return false
+}
+
+// actsAsUserMethod mirrors auth's principal.actsAsUser: which methods read the
+// owner's LIVE role maps. Same duplication rationale as interactiveMethod, and
+// the same closed-allowlist shape.
+func actsAsUserMethod(m auth.Method) bool {
+	switch m {
+	case auth.MethodSession, auth.MethodBearer, auth.MethodDev, auth.MethodUserToken:
+		return true
+	case auth.MethodAPIKey, auth.MethodOrgToken:
+		return false
+	}
+
+	return false
 }

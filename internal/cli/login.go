@@ -8,12 +8,14 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
 	"golang.org/x/oauth2"
 
 	"github.com/jsmith212/bakery/internal/auth"
+	"github.com/jsmith212/bakery/internal/config"
 )
 
 // The RFC 8628 §3.5 poll errors we must handle rather than surface.
@@ -59,14 +61,102 @@ var (
 	errDeviceExpired = errors.New("the code expired before it was approved: run bakery login again")
 )
 
-// Login runs the OIDC device grant (RFC 8628) and caches the resulting tokens.
+// Login signs in: the OIDC device grant by default, or -- with cmd.Token set
+// -- the headless path a build host uses instead of ever opening a browser.
+func Login(ctx context.Context, c *Client, out io.Writer, cmd config.LoginCmd) error {
+	if cmd.Token != "" {
+		if err := loginWithToken(ctx, c, out, cmd.Token); err != nil {
+			return err
+		}
+	} else if err := loginDeviceGrant(ctx, c, out); err != nil {
+		return err
+	}
+
+	// --set-default applies to EITHER path: a headless `--token` login on a
+	// build host is exactly the case that most wants a remembered default (no
+	// human is ever going to type --server again on that box), so it must not
+	// be silently dropped by returning early out of the token branch above.
+	if cmd.SetDefault {
+		if err := c.tokens.SetDefaultServer(c.server); err != nil {
+			return err
+		}
+
+		fmt.Fprintf(out, "%s is now the default server\n", c.server)
+	}
+
+	return nil
+}
+
+// loginWithToken is the headless path (spec §5): a bkru_ personal access
+// token, or `-` to read one from stdin so it never touches shell history or a
+// process list (`ps aux` on a shared build host). It is VALIDATED against
+// GET /me before a single byte is written to credentials.json -- a typo'd or
+// already-revoked token is caught here, loudly, instead of being cached and
+// failing silently on the first real push.
+//
+// Only bkru_ is accepted. A bkro_ (robot) token has no natural "signed in as"
+// -- its /me grant names an org, not a user -- and belongs under `bakery org
+// robot`'s own --store, not this general-purpose login verb.
+func loginWithToken(ctx context.Context, c *Client, out io.Writer, raw string) error {
+	token, err := readTokenArg(raw)
+	if err != nil {
+		return err
+	}
+
+	if !strings.HasPrefix(token, auth.UserTokenPrefix) {
+		return fmt.Errorf(
+			"--token must be a personal access token (%s...); got a value with a different shape",
+			auth.UserTokenPrefix)
+	}
+
+	me, err := c.meWithBearer(ctx, token)
+	if err != nil {
+		if errors.Is(err, ErrNeedsLogin) {
+			return fmt.Errorf("%s rejected this token: it may be invalid, expired, or revoked", c.server)
+		}
+
+		return err
+	}
+
+	if err := c.tokens.PutUserToken(c.server, token); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(out, "signed in as %s, using a personal access token stored in %s\n",
+		me.Email, c.tokens.Path())
+
+	return nil
+}
+
+// readTokenArg resolves --token's value: verbatim, or read from stdin when it
+// is exactly "-".
+func readTokenArg(raw string) (string, error) {
+	if raw != "-" {
+		return strings.TrimSpace(raw), nil
+	}
+
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return "", fmt.Errorf("read the token from stdin: %w", err)
+	}
+
+	token := strings.TrimSpace(string(data))
+	if token == "" {
+		return "", errors.New("no token was read from stdin")
+	}
+
+	return token, nil
+}
+
+// loginDeviceGrant runs the OIDC device grant (RFC 8628) and caches the
+// resulting tokens.
 //
 // The device grant, and not a local callback listener: a `bakery login` is
 // routinely run over ssh on a build host, where there is no browser to redirect
 // to and no way to reach a loopback port on the machine the user is sitting at.
 // The device grant is the flow designed for exactly that, and it means the CLI
 // never handles the user's password or sees the authorization code.
-func Login(ctx context.Context, c *Client, out io.Writer) error {
+func loginDeviceGrant(ctx context.Context, c *Client, out io.Writer) error {
 	cfg, err := c.AuthConfig(ctx)
 	if err != nil {
 		return err

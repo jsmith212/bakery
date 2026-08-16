@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -105,6 +106,15 @@ type Provider struct {
 	scopes        []string
 }
 
+// discoveryTimeout bounds OIDC discovery (the GET to
+// {issuer}/.well-known/openid-configuration). Boot passes its own
+// server-lifetime ctx here with NO deadline of its own -- an unreachable or
+// black-holing IdP would otherwise hang Boot forever, BEFORE any listener
+// binds, so no startupProbe could ever connect and an operator would see an
+// eternally-failing probe on a container that printed no error at all. See
+// docs/deploy/k8s.md.
+const discoveryTimeout = 30 * time.Second
+
 // NewProvider performs OIDC discovery and builds the verifier and OAuth2 client.
 //
 // It is a boot-time call: a failure here must stop the process, not be retried
@@ -114,7 +124,10 @@ func NewProvider(ctx context.Context, cfg OIDCConfig) (*Provider, error) {
 		return nil, ErrNoProvider
 	}
 
-	provider, err := oidc.NewProvider(ctx, cfg.Issuer)
+	discoveryCtx, cancel := context.WithTimeout(ctx, discoveryTimeout)
+	defer cancel()
+
+	provider, err := oidc.NewProvider(discoveryCtx, cfg.Issuer)
 	if err != nil {
 		return nil, fmt.Errorf("oidc discovery for %q: %w", cfg.Issuer, err)
 	}
@@ -228,7 +241,13 @@ type Identity struct {
 	Subject     string
 	Email       string
 	DisplayName string
-	Groups      []string
+	// AvatarURL is the `picture` claim, already filtered to `https://` (see
+	// verify) -- it is rendered straight into an <img src>, so anything else
+	// (data:, http:, scheme-relative) is dropped before it ever reaches here,
+	// not sanitized here. Empty means the IdP asserted none, or the value it
+	// asserted was not an https URL.
+	AvatarURL string
+	Groups    []string
 
 	// GroupsPresent says whether Groups is the IdP's ANSWER or merely our
 	// FAILURE TO READ ONE. It is the whole point of this struct.
@@ -265,6 +284,10 @@ type idTokenClaims struct {
 	EmailVerified     bool   `json:"email_verified"`
 	Name              string `json:"name"`
 	PreferredUsername string `json:"preferred_username"`
+	// Picture is a standard claim under the `profile` scope, which is already
+	// in the default scope set -- no config or scope change is needed to
+	// receive it.
+	Picture string `json:"picture"`
 }
 
 // AuthRequest is one browser authorization attempt. State, Nonce and Verifier
@@ -370,11 +393,30 @@ func (p *Provider) verify(ctx context.Context, raw, wantNonce string) (Identity,
 		Subject:       tok.Subject,
 		Email:         strings.TrimSpace(claims.Email),
 		DisplayName:   displayName(claims),
+		AvatarURL:     avatarURL(claims.Picture),
 		Groups:        groups,
 		GroupsPresent: present,
 		IssuedAt:      tok.IssuedAt,
 		RefreshToken:  "",
 	}, nil
+}
+
+// avatarURL filters the `picture` claim to https-only.
+//
+// The claim is verified-but-attacker-influenceable at the IdP (any org's own
+// IdP admin, or a compromised account, can set it to whatever they like), and
+// it is rendered straight into an <img src>. Anything but https is dropped
+// here: no data:, no http:, no scheme-relative -- one `if` closes the whole
+// weird-URL class. The database CHECK on `users.avatar_url` (migration 000014)
+// is the structural half of this guarantee; this is the friendly path that
+// keeps a non-https claim from ever reaching it.
+func avatarURL(picture string) string {
+	u, err := url.Parse(strings.TrimSpace(picture))
+	if err != nil || u.Scheme != "https" || u.Host == "" {
+		return ""
+	}
+
+	return u.String()
 }
 
 // verifyNonce compares the ID token's nonce against the one we sent.

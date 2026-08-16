@@ -526,6 +526,11 @@ type Me struct {
 	Email       string `json:"email"`
 	DisplayName string `json:"display_name"`
 
+	// AvatarURL is the IdP `picture` claim, already https-filtered at login
+	// (internal/auth/oidc.go's verify()) and re-guaranteed by a schema CHECK.
+	// Omitted (not empty string) when the IdP asserted none, or on dev login.
+	AvatarURL string `json:"avatar_url,omitempty"`
+
 	// Method is session|bearer|api_key|dev: how this request proved who it is.
 	Method string `json:"method"`
 
@@ -540,6 +545,12 @@ type Me struct {
 	// org roles, so SiteRole reads "user" and Orgs is empty even when the owning
 	// human is a site admin -- a delegation must not become a master key.
 	APIKey *MeKeyGrant `json:"api_key,omitempty"`
+
+	// Robot is present only when this request authenticated with an org token. When
+	// it is set, UserID, Email and DisplayName are EMPTY -- a robot has no users
+	// row, so there is no identity to report and inventing one would be a lie about
+	// what the credential is.
+	Robot *MeRobotGrant `json:"robot,omitempty"`
 }
 
 // MeOrg is one of the caller's org memberships.
@@ -563,6 +574,99 @@ type MeKeyGrant struct {
 	KeyID     string `json:"key_id"`
 	ProjectID string `json:"project_id"`
 	Scope     string `json:"scope"`
+}
+
+// MeRobotGrant is what a `bkro_` request reports about itself.
+//
+// Note there is no project id, and that is the credential's defining property:
+// the grant is one ORG at one scope, covering every project in it, present and
+// future. `bakery whoami` and a CI job's smoke check read this to verify a token
+// without performing a push.
+type MeRobotGrant struct {
+	RobotID string `json:"robot_id"`
+	OrgID   string `json:"org_id"`
+	Scope   string `json:"scope"`
+}
+
+// UserToken is a personal access token as METADATA ONLY.
+//
+// Same three-layer guarantee as APIKey: the Store interface exposes no query
+// returning token_sha256, this type has no field a secret could live in, and the
+// schema has no plaintext column at all.
+type UserToken struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+
+	// TokenPrefix is `bkru_` plus the first 8 characters of the random part -- a
+	// greppable, non-secret handle so the console can tell tokens apart after the
+	// one-time reveal.
+	TokenPrefix string `json:"token_prefix"`
+
+	// MaxScope is read|write: the CEILING on what this token may be used for, not a
+	// grant. Its real authority is its owner's live roles, narrowed by this.
+	MaxScope string `json:"max_scope"`
+
+	CreatedAt  time.Time  `json:"created_at"`
+	ExpiresAt  *time.Time `json:"expires_at"`
+	LastUsedAt *time.Time `json:"last_used_at"`
+	RevokedAt  *time.Time `json:"revoked_at"`
+}
+
+// CreatedUserToken carries the plaintext, exactly once.
+type CreatedUserToken struct {
+	UserToken
+
+	// Token is the plaintext `bkru_...`. It exists in this response and NOWHERE
+	// else, ever.
+	Token string `json:"token"`
+}
+
+// Robot is an org-owned machine identity.
+//
+// CreatedByEmail is a SNAPSHOT, not a join: the FK behind CreatedBy is ON DELETE
+// SET NULL, and a robot deliberately outlives its creator, so the audit trail has
+// to survive the human or the row an auditor most wants attributed is the one
+// that goes blank.
+type Robot struct {
+	ID          string `json:"id"`
+	OrgID       string `json:"org_id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+
+	CreatedBy      string    `json:"created_by"`
+	CreatedByEmail string    `json:"created_by_email"`
+	CreatedAt      time.Time `json:"created_at"`
+
+	// Tokens is this robot's tokens, live and revoked, metadata only.
+	Tokens []OrgToken `json:"tokens"`
+}
+
+// OrgToken is a robot's credential as METADATA ONLY.
+type OrgToken struct {
+	ID          string `json:"id"`
+	RobotID     string `json:"robot_id"`
+	OrgID       string `json:"org_id"`
+	Name        string `json:"name"`
+	TokenPrefix string `json:"token_prefix"`
+	Scope       string `json:"scope"` // read|write
+
+	// ExpiresAt is NOT a pointer: org_tokens.expires_at is NOT NULL. A robot
+	// survives its creator, so expiry is the countervailing control and "never" is
+	// not representable.
+	ExpiresAt time.Time `json:"expires_at"`
+
+	CreatedBy      string     `json:"created_by"`
+	CreatedByEmail string     `json:"created_by_email"`
+	CreatedAt      time.Time  `json:"created_at"`
+	LastUsedAt     *time.Time `json:"last_used_at"`
+	RevokedAt      *time.Time `json:"revoked_at"`
+}
+
+// CreatedOrgToken carries the plaintext, exactly once.
+type CreatedOrgToken struct {
+	OrgToken
+
+	Token string `json:"token"`
 }
 
 // uuidString renders a pgtype.UUID as canonical 8-4-4-4-12 hex.

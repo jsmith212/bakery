@@ -256,6 +256,12 @@ The plan above is what M1 aimed at. This is what it *is*, so the next session on
 | `GET|POST|DELETE /orgs/{org}/projects/{project}/keys[/{key}]` | project read |
 | `GET|POST|GET|PATCH|DELETE /orgs/{org}/projects/{project}/backends[/{kind}]` | project read · project admin |
 
+> **⚠ AMENDED BY FEEDBACK WAVE 1** ([spec](specs/2026-08-16-feedback-wave-1.md)). The table above is the **M1** surface. Three rows moved, and the wave added eight routes and two credential kinds that are recorded in the spec rather than restated here:
+>
+> - `GET /orgs` is **`user_scoped`**, not `authenticated`. It is derived entirely from the caller's own memberships, so a bare machine credential (`bkry_` project key, `bkro_` robot token) now gets a **403 instead of a 200 with an empty list** — which is also what makes "a robot may reach `GET /api/v1/me` and nothing else" true of the shipped route table and not merely of the door's table. `POST /orgs` is `user` (a verified human): it grants the creator a local **owner** role, and a delegation must not become a master key.
+> - `POST .../keys`, `DELETE .../keys/{key}` and `POST .../snippet` are **`project_credential`**, not `project_read`. Same capability floor — a project reader still mints a read key and a read snippet — but a door no credential of any kind may come through. `GET .../keys` stays at `project_read`. The rule is the one `/user/tokens` already states: a leaked credential that can *revoke* credentials is a denial of service against every CI job in the org without needing any capability at all.
+> - New in the wave: `GET|POST /user/tokens`, `DELETE /user/tokens/{token}` (`user`), and `GET|POST /orgs/{org}/robots`, `DELETE /orgs/{org}/robots/{robot}`, `POST|DELETE /orgs/{org}/robots/{robot}/tokens[/{token}]` (`org_admin`) — plus the `bkru_` (personal access token) and `bkro_` (robot) credential kinds and `users.authz_epoch`. See the spec's §2–§4.
+
 Every non-2xx carries the same envelope, `{"error":{"code","message","field?"}}`, with a **closed** code vocabulary. Branch on `code`, never on `message`.
 
 **The auth model, as built.**

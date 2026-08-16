@@ -174,6 +174,7 @@ type claims struct {
 	sub      string
 	email    string
 	name     string
+	picture  string
 	groups   []string
 	aud      string
 	nonce    string
@@ -257,6 +258,10 @@ func (f *fakeIDP) sign(t *testing.T, c claims, key *rsa.PrivateKey, kid string) 
 
 	if c.name != "" {
 		payload["name"] = c.name
+	}
+
+	if c.picture != "" {
+		payload["picture"] = c.picture
 	}
 
 	if c.groups != nil {

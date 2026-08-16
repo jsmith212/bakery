@@ -292,7 +292,7 @@ func TestEndToEnd(t *testing.T) {
 
 	// ---- login: the device grant, end to end.
 	out := new(strings.Builder)
-	if err := Login(ctx, c, out); err != nil {
+	if err := Login(ctx, c, out, config.LoginCmd{}); err != nil {
 		t.Fatalf("Login: %v", err)
 	}
 

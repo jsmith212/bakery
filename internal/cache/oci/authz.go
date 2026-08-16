@@ -113,8 +113,22 @@ func credentialToken(r *http.Request) (string, bool) {
 
 // isBakeryToken is the shape gate that keeps a foreign credential from ever costing a
 // database round trip -- or appearing anywhere we could accidentally record it.
+//
+// It asks auth for the FAMILY answer rather than reimplementing a bkry_ prefix test,
+// and that is the whole reason the family gate exists. Reimplemented here, this gate
+// silently defined "a Bakery credential" as "an api_keys row", so the day a second
+// credential kind was minted -- a personal access token, a robot for CI -- every
+// registry pull carrying one was discarded as a foreign credential: on an open backend
+// that is served anonymously (no upstream fetch, 404 on a miss), and on a closed one it
+// is a 401. Both look exactly like a misconfigured client and neither logs anything,
+// because not logging is the point of this gate.
+//
+// What it still rejects, it still rejects without a round trip: a forwarded Docker Hub
+// PAT is not bkr*_-shaped, so it never reaches the Authenticator, a database probe, an
+// error metric, or a log line. That invariant is unchanged and is asserted by
+// TestForeignCredentialsAreAnonymousAndUnlogged.
 func isBakeryToken(s string) bool {
-	return strings.HasPrefix(s, auth.TokenPrefix) && len(s) > len(auth.TokenPrefix)
+	return auth.LooksLikeBakeryToken(s)
 }
 
 // authorize resolves the caller's identity for a read.

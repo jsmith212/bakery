@@ -56,6 +56,12 @@ func TestRouteTable(t *testing.T) {
 
 		{AccessAuthenticated, "GET /api/v1/me"},
 
+		// Personal access tokens. AccessUser, i.e. a verified HUMAN: no credential of
+		// any kind may list or revoke the tokens of the human who holds it.
+		{AccessUser, "GET /api/v1/user/tokens"},
+		{AccessUser, "POST /api/v1/user/tokens"},
+		{AccessUser, "DELETE /api/v1/user/tokens/{token}"},
+
 		// Site admins. All three are AccessSiteAdmin, which the guard admits no API key
 		// to -- an API-key principal can never grant a site role. There is deliberately
 		// no route that can mint the FIRST site admin; that is `bakery user site-admin`,
@@ -64,7 +70,10 @@ func TestRouteTable(t *testing.T) {
 		{AccessSiteAdmin, "PUT /api/v1/site-admins/{user}"},
 		{AccessSiteAdmin, "DELETE /api/v1/site-admins/{user}"},
 
-		{AccessAuthenticated, "GET /api/v1/orgs"},
+		// AccessUserScoped, not AccessAuthenticated: the response is derived entirely
+		// from the caller's own memberships, so a personal access token gets a real
+		// answer and a bare machine credential gets nothing it should have asked for.
+		{AccessUserScoped, "GET /api/v1/orgs"},
 		{AccessUser, "POST /api/v1/orgs"},
 		{AccessOrgView, "GET /api/v1/orgs/{org}"},
 		{AccessOrgAdmin, "PATCH /api/v1/orgs/{org}"},
@@ -73,6 +82,14 @@ func TestRouteTable(t *testing.T) {
 		{AccessOrgView, "GET /api/v1/orgs/{org}/members"},
 		{AccessOrgAdmin, "PUT /api/v1/orgs/{org}/members/{user}"},
 		{AccessOrgAdmin, "DELETE /api/v1/orgs/{org}/members/{user}"},
+
+		// Robots. AccessOrgAdmin throughout, which the control-plane door admits only
+		// an interactive human to -- so no token manages machine identities.
+		{AccessOrgAdmin, "GET /api/v1/orgs/{org}/robots"},
+		{AccessOrgAdmin, "POST /api/v1/orgs/{org}/robots"},
+		{AccessOrgAdmin, "DELETE /api/v1/orgs/{org}/robots/{robot}"},
+		{AccessOrgAdmin, "POST /api/v1/orgs/{org}/robots/{robot}/tokens"},
+		{AccessOrgAdmin, "DELETE /api/v1/orgs/{org}/robots/{robot}/tokens/{token}"},
 
 		{AccessOrgView, "GET /api/v1/orgs/{org}/projects"},
 		{AccessOrgAdmin, "POST /api/v1/orgs/{org}/projects"},
@@ -85,10 +102,10 @@ func TestRouteTable(t *testing.T) {
 		{AccessProjectAdmin, "DELETE /api/v1/orgs/{org}/projects/{project}/members/{user}"},
 
 		{AccessProjectRead, "GET /api/v1/orgs/{org}/projects/{project}/keys"},
-		{AccessProjectRead, "POST /api/v1/orgs/{org}/projects/{project}/keys"},
-		{AccessProjectRead, "DELETE /api/v1/orgs/{org}/projects/{project}/keys/{key}"},
+		{AccessProjectCredential, "POST /api/v1/orgs/{org}/projects/{project}/keys"},
+		{AccessProjectCredential, "DELETE /api/v1/orgs/{org}/projects/{project}/keys/{key}"},
 
-		{AccessProjectRead, "POST /api/v1/orgs/{org}/projects/{project}/snippet"},
+		{AccessProjectCredential, "POST /api/v1/orgs/{org}/projects/{project}/snippet"},
 
 		{AccessProjectRead, "GET /api/v1/orgs/{org}/projects/{project}/backends"},
 		{AccessProjectAdmin, "POST /api/v1/orgs/{org}/projects/{project}/backends"},

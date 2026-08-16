@@ -33,7 +33,7 @@ var _ = auth.principal{}
 
 // ATTACK 3: implement the interface ourselves.
 //
-// impostor implements EVERY exported method of auth.Principal -- all seventeen of
+// impostor implements EVERY exported method of auth.Principal -- all eighteen of
 // them, faithfully, returning site-admin for everything. It is still not an
 // auth.Principal, because the interface carries an unexported method that only a
 // type declared inside internal/auth can supply.
@@ -58,7 +58,8 @@ func (impostor) ProjectRole(pgtype.UUID) (auth.ProjectRole, bool) {
 	return auth.ProjectRoleAdmin, true
 }
 
-func (impostor) APIKey() (auth.KeyGrant, bool) { return auth.KeyGrant{}, false }
+func (impostor) APIKey() (auth.KeyGrant, bool)  { return auth.KeyGrant{}, false }
+func (impostor) Robot() (auth.RobotGrant, bool) { return auth.RobotGrant{}, false }
 
 func (impostor) CanViewOrg(pgtype.UUID) bool                   { return true }
 func (impostor) CanAdminOrg(pgtype.UUID) bool                  { return true }

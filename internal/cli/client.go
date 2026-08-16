@@ -174,6 +174,16 @@ func (c *Client) bearer(ctx context.Context) (string, error) {
 
 	tok, ok := c.tokens.Get(c.server)
 	if !ok {
+		// No OIDC session for this server. A stored personal access token (bkru_,
+		// written by `bakery login --token`) is a full control-plane credential --
+		// the server's Bearer arm dispatches it by prefix -- and it is exactly the
+		// headless-host case that flow exists for. Without this fallback a host
+		// provisioned with `login --token` can push caches but `bakery org list`
+		// says "run bakery login", which is the friction the credential removes.
+		if pat, found := c.tokens.GetUserToken(c.server); found {
+			return pat, nil
+		}
+
 		return "", ErrNeedsLogin
 	}
 
@@ -230,8 +240,29 @@ func (c *Client) refresh(ctx context.Context, cfg auth.AuthConfig, old Token) (T
 	return fresh, nil
 }
 
-// do performs one API call and decodes the result.
+// do performs one API call and decodes the result, authenticating with the
+// cached OIDC session bearer when mode == withAuth.
 func (c *Client) do(ctx context.Context, method, path string, body, out any, mode authMode) error {
+	var bearer string
+
+	if mode == withAuth {
+		token, err := c.bearer(ctx)
+		if err != nil {
+			return err
+		}
+
+		bearer = token
+	}
+
+	return c.doBearer(ctx, method, path, body, out, bearer)
+}
+
+// doBearer is do's mechanics with an EXPLICIT bearer token (empty means none),
+// bypassing the cached session entirely. Its one caller outside do is
+// loginWithToken, which must validate a bkru_/bkro_ token against GET /me
+// BEFORE it is cached -- so a typo'd or already-revoked token is caught here,
+// rather than silently cached and failing on first later use.
+func (c *Client) doBearer(ctx context.Context, method, path string, body, out any, bearer string) error {
 	var reader io.Reader
 
 	if body != nil {
@@ -256,13 +287,8 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any, mod
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	if mode == withAuth {
-		token, err := c.bearer(ctx)
-		if err != nil {
-			return err
-		}
-
-		req.Header.Set("Authorization", "Bearer "+token)
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
 
 	resp, err := c.http.Do(req)
@@ -341,6 +367,86 @@ func (c *Client) Me(ctx context.Context) (api.Me, error) {
 	err := c.do(ctx, http.MethodGet, "/me", nil, &me, withAuth)
 
 	return me, err
+}
+
+// meWithBearer is GET /me presenting an EXPLICIT token rather than the cached
+// OIDC session -- see doBearer. This is how loginWithToken validates a
+// bkru_/bkro_ token before it is ever written to disk.
+func (c *Client) meWithBearer(ctx context.Context, token string) (api.Me, error) {
+	var me api.Me
+	err := c.doBearer(ctx, http.MethodGet, "/me", nil, &me, token)
+
+	return me, err
+}
+
+// ListUserTokens is GET /user/tokens. Metadata only: this response type has no
+// field a secret could live in.
+func (c *Client) ListUserTokens(ctx context.Context) ([]api.UserToken, error) {
+	var out api.ListResponse[api.UserToken]
+	err := c.do(ctx, http.MethodGet, "/user/tokens", nil, &out, withAuth)
+
+	return out.Items, err
+}
+
+// CreateUserToken is POST /user/tokens. The ONLY call whose response carries a
+// personal access token's plaintext.
+func (c *Client) CreateUserToken(
+	ctx context.Context, name, scope string, expiresAt *time.Time,
+) (api.CreatedUserToken, error) {
+	var out api.CreatedUserToken
+	err := c.do(ctx, http.MethodPost, "/user/tokens",
+		api.CreateUserTokenRequest{Name: name, Scope: scope, ExpiresAt: expiresAt}, &out, withAuth)
+
+	return out, err
+}
+
+// RevokeUserToken is DELETE /user/tokens/{id}.
+func (c *Client) RevokeUserToken(ctx context.Context, id string) error {
+	return c.do(ctx, http.MethodDelete, "/user/tokens/"+seg(id), nil, nil, withAuth)
+}
+
+// ListRobots is GET /orgs/{org}/robots. Each robot carries its tokens (live
+// and revoked), metadata only -- one call, not one per robot.
+func (c *Client) ListRobots(ctx context.Context, org string) ([]api.Robot, error) {
+	var out api.ListResponse[api.Robot]
+	err := c.do(ctx, http.MethodGet, "/orgs/"+seg(org)+"/robots", nil, &out, withAuth)
+
+	return out.Items, err
+}
+
+// CreateRobot is POST /orgs/{org}/robots. It mints no token: a robot with no
+// tokens authorizes nothing, which is the right thing for the object that
+// merely names one.
+func (c *Client) CreateRobot(ctx context.Context, org, name, description string) (api.Robot, error) {
+	var out api.Robot
+	err := c.do(ctx, http.MethodPost, "/orgs/"+seg(org)+"/robots",
+		api.CreateRobotRequest{Name: name, Description: description}, &out, withAuth)
+
+	return out, err
+}
+
+// DeleteRobot is DELETE /orgs/{org}/robots/{robot}. Cascades every token the
+// robot holds.
+func (c *Client) DeleteRobot(ctx context.Context, org, robot string) error {
+	return c.do(ctx, http.MethodDelete, "/orgs/"+seg(org)+"/robots/"+seg(robot), nil, nil, withAuth)
+}
+
+// CreateOrgToken is POST /orgs/{org}/robots/{robot}/tokens. expiresAt is
+// REQUIRED, unlike a personal token or an API key -- see api.OrgToken.
+func (c *Client) CreateOrgToken(
+	ctx context.Context, org, robot, name, scope string, expiresAt time.Time,
+) (api.CreatedOrgToken, error) {
+	var out api.CreatedOrgToken
+	err := c.do(ctx, http.MethodPost, "/orgs/"+seg(org)+"/robots/"+seg(robot)+"/tokens",
+		api.CreateOrgTokenRequest{Name: name, Scope: scope, ExpiresAt: &expiresAt}, &out, withAuth)
+
+	return out, err
+}
+
+// RevokeOrgToken is DELETE /orgs/{org}/robots/{robot}/tokens/{token}.
+func (c *Client) RevokeOrgToken(ctx context.Context, org, robot, token string) error {
+	return c.do(ctx, http.MethodDelete,
+		"/orgs/"+seg(org)+"/robots/"+seg(robot)+"/tokens/"+seg(token), nil, nil, withAuth)
 }
 
 // ListOrgs is GET /orgs.

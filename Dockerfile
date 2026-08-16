@@ -41,7 +41,11 @@ FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=build /bakery /bakery
 
-EXPOSE 8080
+# Public HTTP (8080), Prometheus metrics (9090, loopback by default -- see
+# METRICS_ADDR), Bazel REAPI gRPC (9092, loopback by default -- see
+# GRPC_ADDR). Documentation only: EXPOSE does not publish a port by itself,
+# and a k8s Deployment's containerPort list is authoritative regardless.
+EXPOSE 8080 9090 9092
 
 ENTRYPOINT ["/bakery"]
 CMD ["serve"]

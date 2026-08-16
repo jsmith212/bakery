@@ -19,13 +19,29 @@ hotlink with monogram fallback (air-gapped installs degrade gracefully).
 
 ## 2. THE AUTH SEAM (lands first; gates everything credential-shaped)
 
-1. **Allowlist inversion (F3), BEFORE any new Method exists:** one unexported
-   `principal.isInteractive()` (`MethodSession|MethodBearer|MethodDev`), and every
-   capability guard currently keyed `p.method == MethodAPIKey` (all seven:
-   IsSiteAdmin, CanViewOrg, CanAdminOrg, CanOwnOrg, CanAdminProject, CanReadProject's
-   API-key arm, CanWriteProject's API-key arm) rewritten to `!p.isInteractive()`.
-   A new Method then defaults CLOSED. Gate: `TestEveryMethodIsExplicitlyClassified`
-   (table over every declared Method constant; adding one unclassified fails).
+1. **Allowlist inversion (F3), BEFORE any new Method exists:** the seven capability
+   guards currently keyed `p.method == MethodAPIKey` (IsSiteAdmin, CanViewOrg,
+   CanAdminOrg, CanOwnOrg, CanAdminProject, CanReadProject's API-key arm,
+   CanWriteProject's API-key arm) are rewritten onto **two unexported allowlists**,
+   not one, and which guard takes which is the substance of the change:
+
+   - `principal.isInteractive()` (`MethodSession|MethodBearer|MethodDev`) — "a human
+     is at a console". It gates **IsSiteAdmin, CanAdminOrg, CanOwnOrg,
+     CanAdminProject** and the org-admin short-circuit inside CanWriteProject.
+   - `principal.actsAsUser()` (the three above **plus `MethodUserToken`**) — "this
+     credential IS its owner, and reads their live role maps". It gates **CanViewOrg,
+     CanReadProject and CanWriteProject's role-map arms**.
+
+   Written with `isInteractive` everywhere, a personal access token could not read
+   its owner's orgs at all — which contradicts §3 (`bakery org list` working with a
+   PAT is the whole point) and §5's precedence chain. Both are closed switches with
+   a trailing `return false` and no `default`, so a new Method defaults CLOSED under
+   either. Gate: `TestEveryMethodIsExplicitlyClassified` (a table over every Method
+   constant declared **anywhere in package `auth`**, read out of the source by an AST
+   scan; adding one unclassified fails). `internal/api` mirrors both allowlists
+   (`interactiveMethod`, `actsAsUserMethod`) for its test double, and drives its own
+   door gates from the same AST scan so a Method declared in `internal/auth` fails a
+   test in `internal/api` with no edit there.
 2. **Prefix family:** `bkry_` (api_keys, unchanged) / `bkru_` (user_tokens) / `bkro_`
    (org_tokens). `looksLikeAPIKey` stays bkry_-only. New `auth.LooksLikeBakeryToken`
    (family gate) + `auth.tokenKind` (dispatch switch).
@@ -39,10 +55,27 @@ hotlink with monogram fallback (air-gapped installs degrade gracefully).
    `TestUserTokenNeverReachesProjectKeyProbe`, `TestForeignCredentialStillDiscarded`.
 4. **No token mints a token:** CreateAPIKey/CreateUserToken/CreateOrgToken all refuse
    every non-interactive method.
+5. **Two route levels move, and both are behaviour changes for existing `bkry_`
+   keys.** Recorded here because they are not derivable from the items above, and
+   noted in DESIGN.md's route table:
+   - `GET /orgs` goes from `AccessAuthenticated` to **`AccessUserScoped`**. The old
+     level admitted an API key, which then received `200 + []` (the list is filtered
+     by CanViewOrg, false for a key). It is now a **403**. Without the move, "a robot
+     may reach `GET /api/v1/me` and nothing else" is true of the door's table and
+     false of the shipped routes.
+   - `POST .../keys`, `DELETE .../keys/{key}` and `POST .../snippet` go from
+     `AccessProjectRead` to **`AccessProjectCredential`** — same capability floor
+     (CanReadProject: a reader mints a read key and a read snippet), a door no
+     credential may come through. `GET .../keys` stays at `AccessProjectRead`.
+     The two mints were already refused by `requireMintAuthority`; **the revoke was
+     refused nowhere**, so a leaked PAT could enumerate its owner's key ids and
+     delete every one of them — no escalation, every CI job in the org broken, logged
+     as the owner. It is the rule `/user/tokens` already states, applied one file
+     over. Gate: `TestUserTokenCannotManageAPIKeys`, driving the real route table.
 
 ## 3. USER TOKENS (`bkru_`)
 
-Memo §2 stands (table `user_tokens` in migration `000014` with the sha256 covering
+Memo §2 stands (table `user_tokens` in migration `000015` with the sha256 covering
 index, soft revoke, `max_scope read|write`, 90d default expiry with never allowed,
 one-time reveal, `/api/v1/user/tokens` CRUD session-only, /user UI in the project-Keys
 idiom, CLI §5) **with the critique's amendments**:
@@ -59,6 +92,22 @@ idiom, CLI §5) **with the critique's amendments**:
   (grant/revoke org role, project role, site role — next request sees new authority,
   no eviction code involved), `TestUserTokenRevocationIsInstant`, plan test on the
   probe (index scan + PK join, one round trip), sharded-cache parallel benchmark.
+- **The epoch triggers impose a LOCK ORDER, and every authority-mutating transaction
+  obeys it.** The trigger body is `UPDATE users SET authz_epoch = ...`, taken AFTER
+  the membership row; the login reconciler takes `users` FIRST and has no choice
+  (it needs a user id before it can name a membership). So the reconciler is the
+  fixed order and every membership writer in `internal/api` agrees with it:
+  `lockUserFirst` (`SELECT … FOR NO KEY UPDATE`) opens each of those transactions,
+  the previously-autocommit single statements are wrapped in one, and the two
+  cascading deletes (org, project) lock every affected member's row in id order.
+  `Reconcile` additionally carries `deletebatch.go`'s bounded 40P01 retry as belt.
+  The membership triggers are SPLIT — unguarded on INSERT/DELETE, `WHEN (… IS
+  DISTINCT FROM …)` on UPDATE — and `ReconcileOrgMembershipUpsert` carries the same
+  guard on its `DO UPDATE`, so an ordinary login (which re-upserts every mapped org
+  on every request that reconciles) bumps nothing and evicts nothing. Gates:
+  `TestMembershipGrantTakesTheUsersLockFirst` (deterministic: hold `users(U)`, fire
+  the PUT, prove the membership row is still lockable by a third transaction) and
+  `TestConcurrentLoginAndMembershipGrantDoNotDeadlock`.
 - **Never admin, never site admin** (falls out of F3's allowlist): CanWriteProject for a
   PAT requires an explicit project writer/admin role AND `max_scope=write` — the
   org-admin short-circuit does not apply to non-interactive methods. Documented in the
@@ -68,7 +117,7 @@ idiom, CLI §5) **with the critique's amendments**:
 
 ## 4. ROBOTS (`bkro_`)
 
-Memo §3 stands (separate `robots` + `org_tokens` tables in `000015` — NOT users rows;
+Memo §3 stands (separate `robots` + `org_tokens` tables in `000016` — NOT users rows;
 reconciler safety is structural because no login-path SQL names these tables; principal
 carries only {robotID, orgID, scope}; CanRead/CanWrite = org match (+scope); everything
 else false; cache plane + `GET /api/v1/me` only; org-admin-managed CRUD under
@@ -82,6 +131,15 @@ else false; cache plane + `GET /api/v1/me` only; org-admin-managed CRUD under
   the ROBOTS card shows created_by/created_at/expires_at/last_used_at (it is the audit
   surface).
 - `org_tokens_revoked_after_created` CHECK added (parity with user_tokens).
+- **`org_tokens.org_id` is the entire authorization decision** — the hot probe returns
+  it and `principal.robotGrants` compares it to the routed org and reads nothing else
+  — so it gets a **composite FK**: `robots` carries `UNIQUE (id, org_id)` and
+  `org_tokens` carries `FOREIGN KEY (robot_id, org_id) REFERENCES robots (id, org_id)
+  ON DELETE CASCADE` in place of the plain `robot_id` FK. Two independent FKs let any
+  future writer that supplies `org_id` as a parameter mint a live token granting
+  org-wide write on org B backed by a robot in org A — not dangling, simply
+  cross-tenant, and nothing would notice. Same leg `api_keys`' composite FK onto
+  `project_memberships` provides.
 - Gates: memo §3.2's five + `TestOrgTokenOutlivesItsCreator` (documenting) +
   `TestDeletingRobotRevokesEveryToken` + cascade-on-org-delete.
 
@@ -89,7 +147,9 @@ else false; cache plane + `GET /api/v1/me` only; org-admin-managed CRUD under
 
 Memo §2.7 wholesale: widen `credentials.json` (embedded Token compat; `default_server`;
 per-server `user_token` + `keys` map keyed "org" / "org/project"), `bakery login --token`
-(headless, validates via /me), `bakery token {create,list,revoke}`,
+(headless, validates via /me; bound to **`BAKERY_USER_TOKEN`**, and NOT to `BAKERY_TOKEN`,
+which the moon snippet already defines as a project API key — the help names the env
+var and `-` (stdin) before the argv form, which leaks into `ps aux` and shell history), `bakery token {create,list,revoke}`,
 `bakery org robot {create,list,revoke,delete}`, `--store` defaulting on with reveal copy
 naming the file, precedence flag > env > project key > org token > user token > bearer >
 ErrNeedsLogin, server resolution --server > BAKERY_SERVER > default_server > localhost.
@@ -118,11 +178,26 @@ ErrNeedsLogin, server resolution --server > BAKERY_SERVER > default_server > loc
   wait against a healthy holder k8s is waiting on; F6) and the flag's error text at
   budget exhaustion names RollingUpdate as the likely cause. Manifest policy gate in
   `just check`: kubeconform + a script asserting `strategy.type: Recreate` and the
-  NetworkPolicy's presence — shipping manifests that violate either fails CI.
+  NetworkPolicy's presence — shipping manifests that violate either fails CI. The
+  kubeconform half asserts a **positive valid count and a skip budget of one**, not
+  merely `Invalid: 0, Errors: 0`: with `-ignore-missing-schemas` a schema the catalog
+  cannot serve is *Skipped*, so a version bump that skips all eight manifests would
+  otherwise exit 0 having validated nothing. The schemas are **vendored** under
+  `docs/deploy/schemas/` and `-schema-location` points at them, because `check` is
+  the recipe that gates every other CI job and it must not need
+  `raw.githubusercontent.com` to run.
 - **OIDC discovery bounded**: `context.WithTimeout(ctx, 30s)` inside `NewProvider`.
 - **NetworkPolicy is the control, Services are discovery (F8):**
   `docs/deploy/k8s/networkpolicy.yaml` — default-deny ingress; 8080 from the ingress
-  namespace; 9090 ONLY from monitoring; 9092 only if remote gRPC clients exist.
+  namespace; 9090 ONLY from monitoring; 9092 only if remote gRPC clients exist; and
+  **8080 from an `ipBlock` naming the node CIDR**, because health probes come from
+  the KUBELET on the node rather than from a namespace and no selector can admit
+  them. Without it, on every CNI that enforces host→pod traffic (Calico, Weave,
+  Antrea, kube-router) all three probes are dropped, the startupProbe burns its
+  60×5s budget, and the pod CrashLoopBackOffs with a healthy process and an empty
+  log — indistinguishable from the boot-lock wedge the same doc explains. `k8s.md`
+  names the CNIs; `k8s-check` asserts the probe port is admitted from something
+  other than a namespaceSelector.
   `METRICS_ADDR=0.0.0.0:9090` + separate `bakery-metrics` Service remains required and
   invariant-clean (listener separation, not bind interface).
 - Manifest set per memo §5.6 + networkpolicy.yaml; `terminationGracePeriodSeconds: 60`;
@@ -140,7 +215,11 @@ none added; copy diffs exactly as written — delete the avatar apology, both hi
 become "Managed by {idpLabel}" with idpLabel = issuer host or the generic fallback)
 with two amendments:
 - **Migration CHECK** `avatar_url IS NULL OR avatar_url LIKE 'https://%'` — the schema
-  is the guarantee, the verify()-side https filter is the friendly path (F10).
+  is the guarantee, the verify()-side https filter is the friendly path (F10). It lands
+  in `000014_user_avatar`, ahead of the two credential migrations: the three are
+  contiguous as `000014_user_avatar` / `000015_user_tokens` (with the `authz_epoch`
+  column and its triggers, which belong with the cache they invalidate) /
+  `000016_robots`.
 - **`AvatarURL` does NOT join the sealed Principal interface** — `handleMe` reads it
   from the user row it already loads; the authz type stays about authorization (F10).
 - Gates: memo §8.2 avatar row + fixture-key updates (tscontract gates the Me change).
@@ -167,10 +246,13 @@ staging/ + AbortIncompleteMultipartUpload documented) **except Commit semantics 
 - The `storage.go` Writer doc gains the amended contract line (bytes durable at the
   content address strictly before any metadata row names them; Local publishes at
   Commit, S3 publishes at Sync **and re-asserts at Commit under the lock**).
-- Gates: shared conformance suite green on both drivers; `TestCommitRepublishesAfterAReap`
+- Gates: shared conformance suite green on both drivers; `TestS3_CommitRepublishesAfterAReap`
   (the F1 interleaving as a test: Sync → reap the digest → Commit → object present,
-  GET succeeds); `TestCommitIssuesOnlyConstantTimeCallsWhenObjectPresent` (replaces the
-  memo's zero-request gate, which would have enforced the bug); orphan-direction test;
+  GET succeeds); `TestS3_CommitIssuesOnlyConstantTimeCallsWhenObjectPresent` (replaces the
+  memo's zero-request gate, which would have enforced the bug) and
+  `TestS3_CommitHeadIsBoundedByTheInLockRetryCeiling` (constant time PER ATTEMPT is half
+  a bound: the head runs on the tight-retry client, `s3InLockMaxAttempts`, which now names
+  BOTH in-lock calls — ReapDigest's DELETE and Commit's HeadObject); orphan-direction test;
   skip-fails recipe.
 
 ## 10. Implementation order
@@ -178,7 +260,7 @@ staging/ + AbortIncompleteMultipartUpload documented) **except Commit semantics 
 Stage 1 (parallel-safe bundle): sticky nav + avatars/copy + k8s (code + CI tags +
 manifests + policy gate) + storage conformance-suite extraction.
 Stage 2: the auth seam (§2) — gates 3/4/5.
-Stage 3: user tokens + robots backends (migrations 000014/000015 + epoch triggers,
+Stage 3: user tokens + robots backends (migrations 000015/000016 + epoch triggers,
 validators, APIs).
 Stage 4: consoles (/user tokens UI, ROBOTS card) + CLI (§5).
 Stage 5: S3 driver + minio gate + CI job.

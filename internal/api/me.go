@@ -19,16 +19,53 @@ func (a *API) handleMe(w http.ResponseWriter, r *http.Request) error {
 		return errUnauthorized("authentication required")
 	}
 
+	// A ROBOT IS ANSWERED FIRST, before any user read.
+	//
+	// It has no row in `users` -- that is the whole point of robots being separate
+	// tables -- so p.UserID() is the zero UUID and the GetUser below would 404 a
+	// perfectly valid credential. There is nothing to look up and nothing to
+	// report but the grant itself.
+	if grant, isRobot := p.Robot(); isRobot {
+		writeJSON(w, http.StatusOK, Me{
+			UserID: "", Email: "", DisplayName: "", AvatarURL: "",
+			Method:      string(p.Method()),
+			SiteRole:    string(p.SiteRole()),
+			IsSiteAdmin: false,
+			Orgs:        []MeOrg{}, Projects: []MeProject{},
+			APIKey: nil,
+			Robot: &MeRobotGrant{
+				RobotID: uuidString(grant.RobotID),
+				OrgID:   uuidString(grant.OrgID),
+				Scope:   string(grant.Scope),
+			},
+		})
+
+		return nil
+	}
+
+	// AvatarURL is read from the user row directly, not from the Principal
+	// interface: `auth.Principal` is sealed and its whole vocabulary is
+	// authorization (see forgery/) -- a rendering-only field has no business
+	// joining it. handleMe already owns a store and already loads the user
+	// implicitly via p.UserID(), so one more read here keeps the authz type
+	// unchanged.
+	user, err := a.store.GetUser(ctx, p.UserID())
+	if err != nil {
+		return fmt.Errorf("get user: %w", err)
+	}
+
 	me := Me{
 		UserID:      uuidString(p.UserID()),
 		Email:       p.Email(),
 		DisplayName: p.DisplayName(),
+		AvatarURL:   user.AvatarURL.String,
 		Method:      string(p.Method()),
 		SiteRole:    string(p.SiteRole()),
 		IsSiteAdmin: p.IsSiteAdmin(),
 		Orgs:        []MeOrg{},
 		Projects:    []MeProject{},
 		APIKey:      nil,
+		Robot:       nil,
 	}
 
 	if grant, isKey := p.APIKey(); isKey {

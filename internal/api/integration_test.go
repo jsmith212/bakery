@@ -2,14 +2,22 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jsmith212/bakery/internal/auth"
+	"github.com/jsmith212/bakery/internal/config"
 	"github.com/jsmith212/bakery/internal/db"
 	"github.com/jsmith212/bakery/internal/db/dbtest"
 	"github.com/jsmith212/bakery/internal/metrics"
@@ -52,18 +60,46 @@ type harness struct {
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 
+	return newHarnessWithGroups(t, "")
+}
+
+// newHarnessWithGroups is newHarness plus a real group mapping, so a test can
+// drive auth.Service.Reconcile -- the login path -- against the same database
+// the HTTP handlers are writing to. With no mapping the reconciler resolves zero
+// claim-derived orgs and writes no membership at all, which is right for every
+// other test here and useless for the one that needs the two writers to collide.
+func newHarnessWithGroups(t *testing.T, groupMapJSON string) *harness {
+	t.Helper()
+
 	pool := dbtest.New(t)
 	store := db.NewStore(pool)
 	log := discardLogger()
 
 	sessions := auth.NewSessionManager(auth.NewSessionStore(pool, log), false)
 
+	var groups *config.GroupMap
+
+	if groupMapJSON != "" {
+		parsed, err := config.ParseGroupMap([]byte(groupMapJSON))
+		if err != nil {
+			t.Fatalf("parse the test group map: %v", err)
+		}
+
+		groups = parsed
+	}
+
 	svc, err := auth.New(auth.Deps{
-		Store: store, Sessions: sessions, Provider: nil, Groups: nil,
+		Store: store, Sessions: sessions, Provider: nil, Groups: groups,
 		Metrics: nil, Log: log, DevLogin: true,
 	})
 	if err != nil {
 		t.Fatalf("auth.New: %v", err)
+	}
+
+	// Boot calls this, so the harness must start from the same state: every org
+	// the mapping names exists before anyone logs in.
+	if err := svc.EnsureOrgs(t.Context()); err != nil {
+		t.Fatalf("EnsureOrgs: %v", err)
 	}
 
 	if err := svc.SeedDevLogin(t.Context()); err != nil {
@@ -558,4 +594,253 @@ func TestEndToEndLogoutDestroysTheSession(t *testing.T) {
 	if status, _ := h.req(http.MethodGet, Prefix+"/me", "", nil); status != http.StatusUnauthorized {
 		t.Errorf("/me after logout: status = %d, want 401 -- the session survived logout", status)
 	}
+}
+
+// concurrencyGroupMap maps one group to one org, which is all the deadlock test
+// needs: a login that writes an org_memberships row for the same user an admin's
+// PUT is writing one for.
+const concurrencyGroupMap = `{
+  "orgs": [
+    { "slug": "acme", "groups": { "acme-devs": "member" } }
+  ]
+}`
+
+// TestConcurrentLoginAndMembershipGrantDoNotDeadlock is the gate on the
+// authority plane's LOCK ORDERING, and it is the only kind of test that can be.
+//
+// 000015's epoch triggers gave every writer of a membership row a second,
+// invisible lock: `UPDATE users SET authz_epoch = authz_epoch + 1`, taken AFTER
+// the membership row. The login reconciler takes the same two the other way round
+// -- UpsertUser first, because it needs a user id before it can name a membership
+// -- so before api.lockUserFirst existed, a console login and an admin's
+// `PUT /orgs/{org}/members/{user}` for the same human were a textbook ABBA
+// deadlock. Postgres aborts one of them at deadlock_timeout: the login redirects
+// to /login?denied=auth_failed and the PUT 500s, intermittently, in production,
+// with nothing on either path expecting it and no single-threaded test able to
+// see it.
+//
+// The assertion that actually detects a regression is the one on the PUT. The
+// reconciler carries a bounded 40P01 retry (reconcileTx) which would paper over
+// its own half; the HTTP handler carries none, deliberately, because the ordering
+// rule is supposed to make the retry unnecessary. So a lockUserFirst that goes
+// missing shows up here as a 500, roughly half the time, per iteration -- which
+// over the iteration count below is a certainty rather than a flake.
+func TestConcurrentLoginAndMembershipGrantDoNotDeadlock(t *testing.T) {
+	h := newHarnessWithGroups(t, concurrencyGroupMap)
+	h.devLogin()
+
+	ctx := t.Context()
+
+	const (
+		email  = "concurrent@acme.example"
+		rounds = 24
+	)
+
+	id := auth.Identity{
+		Issuer: "https://idp.example.com", Subject: "concurrent-1", Email: email,
+		DisplayName: email, AvatarURL: "", Groups: []string{"acme-devs"}, GroupsPresent: true,
+		IssuedAt: time.Now(), RefreshToken: "",
+	}
+
+	// Provision the user once, so the PUT below has somebody to name. Every
+	// subsequent Reconcile takes the UPDATE path, which is the contended one.
+	if _, err := h.auth.Reconcile(ctx, id); err != nil {
+		t.Fatalf("seed Reconcile: %v", err)
+	}
+
+	member := Prefix + "/orgs/acme/members/" + email
+
+	for round := range rounds {
+		// Alternate the role so the grant is a real value change every time: an
+		// UPDATE that changes nothing still takes the row lock, but alternating
+		// keeps the epoch trigger firing as it would in production.
+		role := "member"
+		if round%2 == 1 {
+			role = "admin"
+		}
+
+		var (
+			wg        sync.WaitGroup
+			loginErr  error
+			putStatus int
+			putBody   []byte
+		)
+
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+
+			_, loginErr = h.auth.Reconcile(ctx, id)
+		}()
+
+		go func() {
+			defer wg.Done()
+
+			putStatus, putBody = h.req(http.MethodPut, member, `{"role":"`+role+`"}`, nil)
+		}()
+
+		wg.Wait()
+
+		if loginErr != nil {
+			t.Fatalf("round %d: the login failed while a membership was being granted: %v.\n"+
+				"A 40P01 here means the two writers disagree about lock order: the reconciler "+
+				"takes users -> memberships, so every membership writer must too (api.lockUserFirst).",
+				round, loginErr)
+		}
+
+		if putStatus != http.StatusOK {
+			t.Fatalf("round %d: PUT %s = %d (body %s), want 200.\n"+
+				"A 500 here is the other half of the same deadlock: the handler has no retry, "+
+				"by design, because lockUserFirst is supposed to make one unnecessary.",
+				round, member, putStatus, putBody)
+		}
+	}
+}
+
+// TestMembershipGrantTakesTheUsersLockFirst is the DETERMINISTIC half of the
+// ordering gate above, and it is the one that actually fails when lockUserFirst
+// is removed.
+//
+// A racing test can only ever say "no deadlock happened this time": the ABBA
+// window in `PUT /orgs/{org}/members/{user}` is a single statement wide, because
+// GrantOrgMembershipLocal takes the membership row lock and the epoch trigger's
+// `UPDATE users` inside the SAME statement. So this observes the ORDER directly
+// instead of waiting for the collision:
+//
+//  1. an outside transaction takes `users(U) FOR NO KEY UPDATE` and holds it;
+//  2. the PUT is fired, and blocks -- it needs that same row, one way or another;
+//  3. a third transaction, with a short lock_timeout, asks for the MEMBERSHIP row.
+//
+// If the handler takes users FIRST, it is blocked before it has touched
+// org_memberships, so step 3 succeeds immediately. If it takes the membership row
+// first (the shape before lockUserFirst), it is holding that row while it waits,
+// and step 3 times out with 55P03 -- which is exactly the state that deadlocks
+// against a concurrent login, made observable without having to win a race.
+func TestMembershipGrantTakesTheUsersLockFirst(t *testing.T) {
+	h := newHarnessWithGroups(t, concurrencyGroupMap)
+	h.devLogin()
+
+	ctx := t.Context()
+
+	const email = "ordering@acme.example"
+
+	if _, err := h.auth.Reconcile(ctx, auth.Identity{
+		Issuer: "https://idp.example.com", Subject: "ordering-1", Email: email,
+		DisplayName: email, AvatarURL: "", Groups: []string{"acme-devs"}, GroupsPresent: true,
+		IssuedAt: time.Now(), RefreshToken: "",
+	}); err != nil {
+		t.Fatalf("seed Reconcile: %v", err)
+	}
+
+	user, err := h.store.GetUserByEmail(ctx, email)
+	if err != nil {
+		t.Fatalf("load the seeded user: %v", err)
+	}
+
+	org, err := h.store.GetOrganizationBySlug(ctx, "acme")
+	if err != nil {
+		t.Fatalf("load acme: %v", err)
+	}
+
+	// The membership row must ALREADY EXIST, or the handler's write is an INSERT
+	// and there is no row for step 3 to find -- the probe would pass for the wrong
+	// reason. Reconcile above created it.
+	member := Prefix + "/orgs/acme/members/" + email
+
+	pool := h.store.Pool()
+
+	// Step 1: hold users(U).
+	holder, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin the holding transaction: %v", err)
+	}
+
+	defer func() { _ = holder.Rollback(ctx) }()
+
+	if _, err := holder.Exec(ctx,
+		"SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE", user.ID); err != nil {
+		t.Fatalf("hold the users row: %v", err)
+	}
+
+	// Step 2: the PUT, which must now block on that row.
+	done := make(chan int, 1)
+
+	go func() {
+		status, _ := h.req(http.MethodPut, member, `{"role":"admin"}`, nil)
+		done <- status
+	}()
+
+	waitForBlockedBackend(t, pool)
+
+	// Step 3: can a third transaction still take the MEMBERSHIP row?
+	probe, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin the probe transaction: %v", err)
+	}
+
+	if _, err := probe.Exec(ctx, "SET LOCAL lock_timeout = '2s'"); err != nil {
+		t.Fatalf("set lock_timeout: %v", err)
+	}
+
+	_, probeErr := probe.Exec(ctx,
+		"SELECT 1 FROM org_memberships WHERE user_id = $1 AND org_id = $2 FOR NO KEY UPDATE",
+		user.ID, org.ID)
+
+	_ = probe.Rollback(ctx)
+
+	if probeErr != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(probeErr, &pgErr) && pgErr.Code == pgerrcode.LockNotAvailable {
+			t.Fatalf("the membership row is locked while the handler waits for the users row.\n" +
+				"That is the ABBA: this transaction holds org_memberships and wants users, " +
+				"while a concurrent login holds users and wants org_memberships. Take the " +
+				"users row FIRST (api.lockUserFirst).")
+		}
+
+		t.Fatalf("probe for the membership row: %v", probeErr)
+	}
+
+	// Release, and the PUT completes normally.
+	if err := holder.Rollback(ctx); err != nil {
+		t.Fatalf("release the users row: %v", err)
+	}
+
+	select {
+	case status := <-done:
+		if status != http.StatusOK {
+			t.Errorf("PUT %s = %d, want 200 once the users row was released", member, status)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the PUT never completed after the users row was released")
+	}
+}
+
+// waitForBlockedBackend blocks until some backend in this database is waiting on
+// a lock -- i.e. until the request under test has actually reached the statement
+// the test needs it to be stuck on. A fixed sleep here would be a flake generator
+// in both directions.
+func waitForBlockedBackend(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+
+	deadline := time.Now().Add(30 * time.Second)
+
+	for time.Now().Before(deadline) {
+		var n int
+
+		err := pool.QueryRow(t.Context(),
+			`SELECT count(*) FROM pg_stat_activity
+			  WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&n)
+		if err != nil {
+			t.Fatalf("poll pg_stat_activity: %v", err)
+		}
+
+		if n > 0 {
+			return
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatal("no backend ever blocked on a lock; the request under test never reached the write")
 }

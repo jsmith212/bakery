@@ -1,0 +1,19 @@
+# Backs STORAGE_DIR=/data (deployment.yaml). Local disk only -- S3 support is
+# a separate, optional driver (STORAGE_DRIVER=s3); when using it, this PVC is
+# unnecessary and the volume/volumeMount pair in deployment.yaml can be
+# dropped. Size and storageClassName are deployment-specific; pick a class
+# with the durability an operator's sstate/downloads/OCI cache actually
+# needs -- this is cache data, not source of truth, but losing it means every
+# client re-populates from scratch.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bakery-data
+  labels:
+    app.kubernetes.io/name: bakery
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi

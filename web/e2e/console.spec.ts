@@ -220,4 +220,160 @@ test.describe('console: dev-login through config snippets', () => {
 			expect(machineLines[0]).not.toMatch(/\bwss?:\/\//);
 		});
 	});
+
+	test('sticky nav: a global page still shows and routes through the remembered org/project', async ({
+		page
+	}) => {
+		const orgSlug = unique('e2e-org-sticky');
+		const projectSlug = 'fw';
+
+		await test.step('dev-login, create org and project', async () => {
+			await signInWithoutAuth(page);
+			await createOrg(page, orgSlug);
+			// createProject lands on .../overview -- the write that remembers this
+			// org/project (o/[org]/+layout.ts, .../p/[project]/+layout.ts) has
+			// already fired by the time we navigate away below.
+			await createProject(page, orgSlug, projectSlug);
+		});
+
+		await test.step('/user has no [org]/[project] segment, but the switcher remembers both', async () => {
+			await page.goto('/user');
+			await expect(
+				consoleNav(page).getByRole('button', { name: `Org ${orgSlug}` })
+			).toBeVisible();
+			await expect(
+				consoleNav(page).getByRole('button', { name: `Proj ${projectSlug}` })
+			).toBeVisible();
+		});
+
+		await test.step('the project nav still routes back into the remembered project', async () => {
+			await consoleNav(page).getByRole('link', { name: 'Overview' }).click();
+			await page.waitForURL(`**/o/${orgSlug}/p/${projectSlug}/overview`);
+		});
+
+		await test.step('a second org with nothing remembered under it does not inherit the first project', async () => {
+			// The entire reason `bakery-project` is namespaced per org
+			// (storage.ts#lastProject): visiting a DIFFERENT org, with no
+			// project of its own ever remembered, must render "none" -- never
+			// the first org's project leaking across via a flat key. This is
+			// the one assertion of the whole suite that exercises a real
+			// localStorage write from a real `+layout.ts`, not the pure
+			// Vitest of `resolveNavScope`/`storage.test.ts`.
+			const orgSlugB = unique('e2e-org-sticky-b');
+			await createOrg(page, orgSlugB);
+
+			await page.goto('/user');
+			await expect(
+				consoleNav(page).getByRole('button', { name: `Org ${orgSlugB}` })
+			).toBeVisible();
+			await expect(
+				consoleNav(page).getByRole('button', { name: 'Proj none' })
+			).toBeVisible();
+		});
+	});
+});
+
+test.describe('console: personal access tokens and robots (wave 1)', () => {
+	test('/user: mint a personal access token, one-time reveal, bkru_ prefix', async ({ page }) => {
+		await test.step('dev-login', async () => {
+			await signInWithoutAuth(page);
+		});
+
+		await test.step('mint a token from /user', async () => {
+			await page.goto('/user');
+			await page.getByRole('button', { name: 'Create token' }).click();
+
+			const createDialog = page.getByRole('dialog');
+			// unique(): user_tokens_active_name_key is UNIQUE (user_id, name) WHERE
+			// revoked_at IS NULL, and the dev user persists across local runs -- a
+			// literal name makes the second run fail opaquely at the reveal assert.
+			const tokenName = unique('e2e-token');
+			await createDialog.locator('input[placeholder="build-host-1"]').fill(tokenName);
+			// Scope and expiry keep their defaults (write, 90 days).
+			await createDialog.getByRole('button', { name: 'Create token' }).click();
+
+			const revealDialog = page.getByRole('dialog');
+			await expect(
+				revealDialog.getByText('this is the only time you will see the secret')
+			).toBeVisible();
+
+			const token = (await revealDialog.locator('pre').first().textContent())?.trim() ?? '';
+			expect(token).toMatch(/^bkru_/);
+
+			// The one-time-reveal safety property, both halves: `Done` is
+			// disabled until the ack is checked, and the modal is NOT
+			// dismissible out from under an un-acknowledged secret -- a
+			// regression to `dismissible` on this Modal would pass every
+			// other assertion in this test.
+			await expect(revealDialog.getByRole('button', { name: 'Done' })).toBeDisabled();
+			await page.keyboard.press('Escape');
+			await expect(revealDialog).toBeVisible();
+
+			await revealDialog.getByLabel(/I have stored the secret/).check();
+			await revealDialog.getByRole('button', { name: 'Done' }).click();
+			await expect(revealDialog).toBeHidden();
+		});
+
+		await test.step('the token now appears live in the table', async () => {
+			await expect(page.getByText(tokenName)).toBeVisible();
+			await expect(page.getByText('live')).toBeVisible();
+		});
+	});
+
+	test('org members: create a robot, mint its token, one-time reveal, bkro_ prefix', async ({
+		page
+	}) => {
+		const orgSlug = unique('e2e-org-robot');
+
+		await test.step('dev-login, create org', async () => {
+			await signInWithoutAuth(page);
+			// The org creator is granted a local OWNER role in the same
+			// transaction as the org, which is what makes the ROBOTS card
+			// (canAdminOrg-gated) visible on the very next screen.
+			await createOrg(page, orgSlug);
+		});
+
+		await test.step('open members and create a robot', async () => {
+			await page.goto(`/o/${orgSlug}/members`);
+			await page.getByRole('button', { name: 'Create robot' }).click();
+
+			const createDialog = page.getByRole('dialog');
+			await createDialog.locator('input[placeholder="ci-runner"]').fill('e2e-robot');
+			await createDialog.getByRole('button', { name: 'Create robot' }).click();
+			await expect(createDialog).toBeHidden();
+
+			await expect(page.getByText('e2e-robot')).toBeVisible();
+		});
+
+		await test.step('mint the robot a token', async () => {
+			await page.getByRole('button', { name: 'New token' }).click();
+
+			const tokenDialog = page.getByRole('dialog');
+			await tokenDialog.locator('input[placeholder="ci-2026"]').fill('e2e-robot-token');
+			// Scope and expiry keep their defaults (write, 90 days).
+			await tokenDialog.getByRole('button', { name: 'Create token' }).click();
+
+			const revealDialog = page.getByRole('dialog');
+			await expect(
+				revealDialog.getByText('this is the only time you will see the secret')
+			).toBeVisible();
+
+			const token = (await revealDialog.locator('pre').first().textContent())?.trim() ?? '';
+			expect(token).toMatch(/^bkro_/);
+
+			// Same one-time-reveal safety property as the personal-token
+			// modal: disabled Done before the ack, undismissable throughout.
+			await expect(revealDialog.getByRole('button', { name: 'Done' })).toBeDisabled();
+			await page.keyboard.press('Escape');
+			await expect(revealDialog).toBeVisible();
+
+			await revealDialog.getByLabel(/I have stored the secret/).check();
+			await revealDialog.getByRole('button', { name: 'Done' }).click();
+			await expect(revealDialog).toBeHidden();
+		});
+
+		await test.step('the token now appears live under the robot', async () => {
+			await expect(page.getByText('e2e-robot-token')).toBeVisible();
+		});
+	});
 });

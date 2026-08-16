@@ -419,6 +419,15 @@ func TestForeignCredentialsAreAnonymousAndUnlogged(t *testing.T) {
 		{
 			name: "an unrelated bearer token", header: "Bearer " + hubPAT,
 		},
+		{
+			// The family gate widened from bkry_ to bkry_/bkru_/bkro_. A near miss is
+			// still foreign: the gate matches whole prefixes, not "starts with bkr".
+			name: "a near miss on the family prefix", header: "Bearer bkr_" + hubPAT,
+		},
+		{
+			// A bare prefix with no body carries no secret and must not be probed.
+			name: "a bare family prefix", header: "Bearer bkru_",
+		},
 	}
 
 	for _, tt := range tests {
@@ -505,6 +514,70 @@ func TestReadAuthRequiredAdmitsAValidKey(t *testing.T) {
 
 	if seen := f.authn.tokens(); len(seen) != 1 || seen[0] != "bkry_valid_key" {
 		t.Errorf("authenticator saw %v, want exactly the bkry_ token", seen)
+	}
+}
+
+// TestEveryBakeryTokenKindReachesTheAuthenticator is this package's half of the
+// credential-family gate.
+//
+// isBakeryToken used to be a locally reimplemented bkry_ prefix test, which quietly
+// defined "a Bakery credential" as "an api_keys row". The day a second kind was minted
+// -- a personal access token for a developer, a robot for CI -- every registry pull
+// carrying one was discarded here as a foreign credential and never reached the
+// Authenticator at all. On an OPEN backend that is not an error anyone sees: the caller
+// is downgraded to anonymous, served from cache, and 404s on a miss, so the symptom is
+// a 0% hit rate on a green build. This asserts all three kinds get through, in every
+// field a client puts them in.
+//
+// Its twin is TestForeignCredentialsAreAnonymousAndUnlogged, which asserts the
+// converse -- that widening the gate did not let a forwarded Docker Hub PAT through.
+func TestEveryBakeryTokenKindReachesTheAuthenticator(t *testing.T) {
+	t.Parallel()
+
+	kinds := []struct{ name, token string }{
+		{"bkry_ api key", "bkry_projectscopedkey"},
+		{"bkru_ user token", "bkru_personalaccesstoken"},
+		{"bkro_ org token", "bkro_cirobottoken"},
+	}
+
+	fields := []struct {
+		name   string
+		header func(token string) string
+	}{
+		{"bearer", func(tok string) string { return "Bearer " + tok }},
+		{"basic password", func(tok string) string {
+			return "Basic " + base64.StdEncoding.EncodeToString([]byte("bakery:"+tok))
+		}},
+		{"basic username", func(tok string) string {
+			return "Basic " + base64.StdEncoding.EncodeToString([]byte(tok+":"))
+		}},
+	}
+
+	for _, k := range kinds {
+		for _, field := range fields {
+			t.Run(k.name+"/"+field.name, func(t *testing.T) {
+				t.Parallel()
+
+				f := newFixture(t)
+				f.resolver.route.ReadAuthRequired = true
+				f.authn.principal = fakePrincipal{canRead: true, canWrite: true}
+				f.authn.err = nil
+
+				raw := testIndex(t)
+				f.seedTag(t, "docker.io", "library/alpine", "3.20", raw)
+
+				w := f.do(http.MethodGet, tenantPrefix+"library/alpine/manifests/3.20",
+					map[string]string{"Authorization": field.header(k.token)})
+
+				if w.Code != http.StatusOK {
+					t.Fatalf("= %d, want 200: a %s was discarded by the shape gate", w.Code, k.name)
+				}
+
+				if seen := f.authn.tokens(); len(seen) != 1 || seen[0] != k.token {
+					t.Errorf("authenticator saw %v, want exactly [%s]", seen, k.token)
+				}
+			})
+		}
 	}
 }
 

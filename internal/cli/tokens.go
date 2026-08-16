@@ -68,8 +68,35 @@ func (t Token) Stale(now time.Time) bool {
 //
 // Keyed by server URL, because one workstation talks to a staging Bakery and a
 // production Bakery, and logging into one must not sign you out of the other.
+//
+// DefaultServer is set by `bakery login --set-default` (or left empty) and is
+// the third link in the server-resolution chain (--server > BAKERY_SERVER >
+// this > http://localhost:8080) -- see resolveServer.
 type credentials struct {
-	Servers map[string]Token `json:"servers"`
+	DefaultServer string                 `json:"default_server,omitempty"`
+	Servers       map[string]serverCreds `json:"servers"`
+}
+
+// serverCreds is everything cached for one server.
+//
+// Token is EMBEDDED, anonymous, so a credentials.json written by a version of
+// this CLI that predates user tokens and robot keys parses unchanged: its
+// `{"servers": {"url": {"id_token": ..., "expiry": ...}}}` shape decodes
+// straight into the promoted fields below, with UserToken and Keys simply
+// absent (their zero values) -- no forced re-login on upgrade.
+type serverCreds struct {
+	Token
+
+	// UserToken is a cached bkru_ personal access token, put here by
+	// `bakery login --token` or `bakery token create --store` (the default).
+	UserToken string `json:"user_token,omitempty"`
+
+	// Keys maps "org" (a robot/org token, bkro_) or "org/project" (a project
+	// key, bkry_) to the credential itself. Both live in one map because the
+	// precedence chain (resolveCacheCredential) looks up the more specific key
+	// first regardless of which kind minted it -- the key's SHAPE, not this
+	// map, is what a server call ultimately cares about.
+	Keys map[string]string `json:"keys,omitempty"`
 }
 
 // TokenStore is the credential cache on disk.
@@ -107,39 +134,135 @@ func configDir() (string, error) {
 // what was cleared.
 func (s *TokenStore) Path() string { return s.path }
 
-// Get returns the cached token for a server.
+// Get returns the cached OIDC session token for a server.
 func (s *TokenStore) Get(server string) (Token, bool) {
 	creds, err := s.load()
 	if err != nil {
 		return Token{}, false
 	}
 
-	t, ok := creds.Servers[canonicalServer(server)]
-	if !ok || t.IDToken == "" {
+	sc, ok := creds.Servers[canonicalServer(server)]
+	if !ok || sc.IDToken == "" {
 		return Token{}, false
 	}
 
-	return t, true
+	return sc.Token, true
 }
 
-// Put writes a server's token, creating the cache with 0600 / 0700 if absent.
+// Put writes a server's OIDC session token, creating the cache with 0600 /
+// 0700 if absent. Any cached user token or project/robot keys already on this
+// server entry are preserved -- an ordinary `bakery login` must not evict a
+// build host's `bakery token create --store`d credential.
 func (s *TokenStore) Put(server string, t Token) error {
+	return s.mutate(server, func(sc *serverCreds) { sc.Token = t })
+}
+
+// GetUserToken returns the cached personal access token (bkru_) for a server,
+// put there by `bakery login --token` or `bakery token create --store`.
+func (s *TokenStore) GetUserToken(server string) (string, bool) {
+	creds, err := s.load()
+	if err != nil {
+		return "", false
+	}
+
+	sc, ok := creds.Servers[canonicalServer(server)]
+	if !ok || sc.UserToken == "" {
+		return "", false
+	}
+
+	return sc.UserToken, true
+}
+
+// PutUserToken caches a personal access token for a server.
+func (s *TokenStore) PutUserToken(server, token string) error {
+	return s.mutate(server, func(sc *serverCreds) { sc.UserToken = token })
+}
+
+// GetKey returns a cached project key ("org/project") or org/robot token
+// ("org") for a server. See serverCreds.Keys.
+func (s *TokenStore) GetKey(server, scope string) (string, bool) {
+	creds, err := s.load()
+	if err != nil {
+		return "", false
+	}
+
+	sc, ok := creds.Servers[canonicalServer(server)]
+	if !ok {
+		return "", false
+	}
+
+	k, ok := sc.Keys[scope]
+
+	return k, ok && k != ""
+}
+
+// PutKey caches a project key or org/robot token under scope ("org" or
+// "org/project") for a server.
+func (s *TokenStore) PutKey(server, scope, key string) error {
+	return s.mutate(server, func(sc *serverCreds) {
+		if sc.Keys == nil {
+			sc.Keys = make(map[string]string)
+		}
+
+		sc.Keys[scope] = key
+	})
+}
+
+// DefaultServer returns the server `bakery login --set-default` last recorded,
+// the third link in the server-resolution chain.
+func (s *TokenStore) DefaultServer() (string, bool) {
+	creds, err := s.load()
+	if err != nil {
+		return "", false
+	}
+
+	return creds.DefaultServer, creds.DefaultServer != ""
+}
+
+// SetDefaultServer records the default server for future commands run with no
+// --server and no BAKERY_SERVER.
+func (s *TokenStore) SetDefaultServer(server string) error {
+	creds, err := s.load()
+	if err != nil {
+		return err
+	}
+
+	creds.DefaultServer = canonicalServer(server)
+
+	return s.save(creds)
+}
+
+// mutate reads, applies fn to one server's entry (creating it if absent), and
+// writes back. It is the shared plumbing behind Put/PutUserToken/PutKey: each
+// touches a different field of serverCreds and none may clobber the others.
+func (s *TokenStore) mutate(server string, fn func(*serverCreds)) error {
 	creds, err := s.load()
 	if err != nil {
 		return err
 	}
 
 	if creds.Servers == nil {
-		creds.Servers = make(map[string]Token)
+		creds.Servers = make(map[string]serverCreds)
 	}
 
-	creds.Servers[canonicalServer(server)] = t
+	key := canonicalServer(server)
+	sc := creds.Servers[key]
+	fn(&sc)
+	creds.Servers[key] = sc
 
 	return s.save(creds)
 }
 
-// Delete drops a server's token. It is idempotent: logging out twice is not an
-// error, and neither is logging out when you were never logged in.
+// Delete drops a server's OIDC session token. It is idempotent: logging out
+// twice is not an error, and neither is logging out when you were never
+// logged in.
+//
+// It clears ONLY the session half. A cached user token or project/robot keys
+// on the same server entry survive: `bakery logout` ends a browser-derived
+// session, and ending the IdP session is the IdP's business (see Logout's own
+// doc) -- it must not also destroy an unrelated, independently-lived
+// credential a CI job depends on. The whole entry, and the file itself if it
+// is now the last one, is removed only once nothing is left in it.
 func (s *TokenStore) Delete(server string) (bool, error) {
 	creds, err := s.load()
 	if err != nil {
@@ -148,11 +271,18 @@ func (s *TokenStore) Delete(server string) (bool, error) {
 
 	key := canonicalServer(server)
 
-	if _, ok := creds.Servers[key]; !ok {
+	sc, ok := creds.Servers[key]
+	if !ok || sc.IDToken == "" {
 		return false, nil
 	}
 
-	delete(creds.Servers, key)
+	sc.Token = Token{}
+
+	if sc.UserToken == "" && len(sc.Keys) == 0 {
+		delete(creds.Servers, key)
+	} else {
+		creds.Servers[key] = sc
+	}
 
 	if len(creds.Servers) == 0 {
 		if err := os.Remove(s.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -171,7 +301,7 @@ func (s *TokenStore) load() (credentials, error) {
 
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		return credentials{Servers: map[string]Token{}}, nil
+		return credentials{Servers: map[string]serverCreds{}}, nil
 	case err != nil:
 		return credentials{}, fmt.Errorf("read %s: %w", s.path, err)
 	}
@@ -182,7 +312,7 @@ func (s *TokenStore) load() (credentials, error) {
 	}
 
 	if creds.Servers == nil {
-		creds.Servers = map[string]Token{}
+		creds.Servers = map[string]serverCreds{}
 	}
 
 	return creds, nil

@@ -1,0 +1,17 @@
+# Optional: only applies if the Prometheus Operator is installed in this
+# cluster. Points at bakery-metrics, never at the public Service.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: bakery
+  labels:
+    app.kubernetes.io/name: bakery
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bakery
+      app.kubernetes.io/component: metrics
+  endpoints:
+    - port: metrics
+      interval: 30s
+      path: /metrics

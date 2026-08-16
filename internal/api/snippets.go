@@ -1078,7 +1078,7 @@ func hashservNetrcLine(hashserveURL, token string) string {
 // has stated it -- a header cannot then move a live credential to a host of the
 // sender's choosing. Headers remain the fallback because behind a TLS-terminating
 // proxy the binary sees plain http on a private hop and its own Host is the internal
-// name; the snippet route is AccessProjectRead, so a spoofed header can at worst
+// name; the snippet route is AccessProjectCredential, so a spoofed header can at worst
 // mislead the caller about their own snippet.
 //
 // THE SCHEME FAILS CLOSED TO https (the oci/token.go posture, and for the same
@@ -1095,7 +1095,7 @@ func hashservNetrcLine(hashserveURL, token string) string {
 // caller sends becomes the literal `scheme://` prefix on a response that carries a
 // live credential), and even restricted to "http" alone, taking it unconditionally
 // lets a caller on a public host downgrade their own snippet's bearer credential to
-// plaintext by sending one spoofable header. AccessProjectRead means only the
+// plaintext by sending one spoofable header. AccessProjectCredential means only the
 // requester's own snippet is at risk either way, but "at most self-inflicted" is
 // not a reason to skip the same rule the default arm already enforces.
 func (a *API) externalOrigin(r *http.Request) (scheme, host string) {

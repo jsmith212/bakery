@@ -119,8 +119,10 @@ func (a *API) owners(ctx context.Context, orgID pgtype.UUID) (map[string][2]stri
 // The scope is capped at the caller's project role INSIDE auth.CreateAPIKey (a
 // reader cannot mint a write key), and an API-key principal cannot mint keys at
 // all -- both are enforced there, not here, which is why this handler can be this
-// short. The route is AccessProjectRead because a reader minting a read key for
-// themselves is the normal case; the cap does the rest.
+// short. The route is AccessProjectCredential, whose CAPABILITY floor is exactly
+// CanReadProject (a reader minting a read key for themselves is the normal case;
+// the cap does the rest) and whose DOOR admits no credential at all -- a route
+// that mints a credential is not reachable by one.
 func (a *API) handleCreateKey(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 

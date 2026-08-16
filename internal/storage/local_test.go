@@ -2,9 +2,7 @@ package storage
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"errors"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -25,131 +23,40 @@ func newTestStore(t *testing.T) *Local {
 	return s
 }
 
-// put is the whole write protocol in one line, for tests that are not about the
-// protocol.
-func put(t *testing.T, s Store, content []byte) Key {
-	t.Helper()
-
-	w, err := s.Create(t.Context())
-	if err != nil {
-		t.Fatalf("Create() error = %v", err)
-	}
-
-	defer func() { _ = w.Abort() }()
-
-	if _, err := w.Write(content); err != nil {
-		t.Fatalf("Write() error = %v", err)
-	}
-
-	info, err := w.Commit(t.Context())
-	if err != nil {
-		t.Fatalf("Commit() error = %v", err)
-	}
-
-	if want := sha256.Sum256(content); info.Key != want {
-		t.Fatalf("Commit() key = %s, want %s", info.Key, Key(want))
-	}
-
-	if info.Size != int64(len(content)) {
-		t.Errorf("Commit() size = %d, want %d", info.Size, len(content))
-	}
-
-	return info.Key
+// TestLocal_Conformance runs the Store-interface-only suite (conformance_test.go)
+// against Local. This is what proves the extraction in feedback wave 1 (spec
+// section 9's prerequisite) is non-regressive: every assertion Local used to
+// make inline, it still makes here, driven through the shared suite instead.
+func TestLocal_Conformance(t *testing.T) {
+	runConformance(t, func(t *testing.T) Store { return newTestStore(t) }, metrics.DriverLocal)
 }
 
-func TestLocal_RoundTrip(t *testing.T) {
-	tests := []struct {
-		name    string
-		content []byte
-	}{
-		// The REAPI empty blob. It MUST round-trip: every Bazel client asks for it
-		// and a store that treats zero bytes as "absent" breaks all of them.
-		{name: "empty", content: []byte{}},
-		{name: "small", content: []byte("sstate:busybox")},
-		{name: "binary", content: bytes.Repeat([]byte{0x00, 0xff, 0x7f}, 4096)},
-		{name: "multi chunk", content: bytes.Repeat([]byte("a"), 1<<20)},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s := newTestStore(t)
-			k := put(t, s, tt.content)
-
-			ok, err := s.Exists(t.Context(), k)
-			if err != nil || !ok {
-				t.Fatalf("Exists() = %v, %v; want true, nil", ok, err)
-			}
-
-			info, err := s.Stat(t.Context(), k)
-			if err != nil {
-				t.Fatalf("Stat() error = %v", err)
-			}
-
-			if info.Size != int64(len(tt.content)) {
-				t.Errorf("Stat() size = %d, want %d", info.Size, len(tt.content))
-			}
-
-			rc, err := s.Get(t.Context(), k)
-			if err != nil {
-				t.Fatalf("Get() error = %v", err)
-			}
-
-			got, err := io.ReadAll(rc)
-			_ = rc.Close()
-
-			if err != nil {
-				t.Fatalf("ReadAll() error = %v", err)
-			}
-
-			if !bytes.Equal(got, tt.content) {
-				t.Errorf("Get() returned %d bytes, want %d", len(got), len(tt.content))
-			}
-		})
-	}
-}
-
-func TestLocal_MissesAreErrNotFound(t *testing.T) {
+// TestLocal_FanOutLayout is LOCAL'S OWN on-disk layout choice (2/2-hex
+// fan-out directories), not part of the Store interface's contract -- a
+// driver with no filesystem at all (S3) has nothing analogous to assert.
+func TestLocal_FanOutLayout(t *testing.T) {
 	s := newTestStore(t)
-	k := KeyOf([]byte("never written"))
+	k := put(t, s, []byte("layout"))
+	h := k.String()
 
-	if _, err := s.Get(t.Context(), k); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Get() error = %v, want ErrNotFound", err)
-	}
-
-	if _, err := s.Stat(t.Context(), k); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Stat() error = %v, want ErrNotFound", err)
-	}
-
-	ok, err := s.Exists(t.Context(), k)
-	if ok || err != nil {
-		t.Errorf("Exists() = %v, %v; want false, nil", ok, err)
-	}
-
-	// Idempotent: the GC re-drives its queue after a crash, and the second unlink
-	// must not be an error.
-	if err := s.Delete(t.Context(), k); err != nil {
-		t.Errorf("Delete(absent) error = %v, want nil", err)
+	want := filepath.Join(s.Root(), objectsDir, h[0:2], h[2:4], h)
+	if _, err := os.Stat(want); err != nil {
+		t.Errorf("object not at %s: %v", want, err)
 	}
 }
 
-func TestLocal_Delete(t *testing.T) {
-	s := newTestStore(t)
-	k := put(t, s, []byte("bytes"))
-
-	if err := s.Delete(t.Context(), k); err != nil {
-		t.Fatalf("Delete() error = %v", err)
-	}
-
-	ok, err := s.Exists(t.Context(), k)
-	if ok || err != nil {
-		t.Errorf("after Delete, Exists() = %v, %v; want false, nil", ok, err)
-	}
-}
-
-// The atomicity claim, tested by looking at the filesystem rather than by trusting
-// rename(2): while a write is staged, NOTHING is observable at the object's key,
-// and the partial bytes live outside objects/ entirely.
-func TestLocal_TornFileIsNeverObservable(t *testing.T) {
+// TestLocal_NotObservableBeforeCommit is Local's stronger, driver-specific
+// guarantee: nothing is observable at the object's key until Commit RETURNS,
+// and the partial bytes live outside objects/ entirely while staged. S3
+// publishes at Sync instead (storage.go's Writer doc carries the amended,
+// driver-aware property -- see feedback wave 1 spec section 9), so this
+// assertion would fail a compliant S3 driver for being more permissive in a
+// documented way, and stays out of the shared conformance suite.
+//
+// The interface-safe half of the old combined test -- "after Commit, the
+// object reads back whole" -- is conformance_test.go's
+// CommittedObjectReadsBackWhole, and runs against every driver.
+func TestLocal_NotObservableBeforeCommit(t *testing.T) {
 	s := newTestStore(t)
 	content := bytes.Repeat([]byte("z"), 1<<16)
 	k := KeyOf(content)
@@ -205,7 +112,12 @@ func TestLocal_TornFileIsNeverObservable(t *testing.T) {
 	}
 }
 
-func TestLocal_AbortLeavesNothing(t *testing.T) {
+// TestLocal_AbortLeavesNoStagingFiles is the staging-DIRECTORY-listing half of
+// the old combined "AbortLeavesNothing" test -- Local-specific because
+// staging/ is a Local implementation detail. The driver-generic half (Abort
+// leaves no object reachable at the key) is
+// conformance_test.go's AbortLeavesNoObject, and runs against every driver.
+func TestLocal_AbortLeavesNoStagingFiles(t *testing.T) {
 	s := newTestStore(t)
 
 	w, err := s.Create(t.Context())
@@ -221,16 +133,6 @@ func TestLocal_AbortLeavesNothing(t *testing.T) {
 		t.Fatalf("Abort() error = %v", err)
 	}
 
-	// Abort is idempotent -- `defer w.Abort()` alongside an explicit Abort must not
-	// be an error.
-	if err := w.Abort(); err != nil {
-		t.Fatalf("second Abort() error = %v", err)
-	}
-
-	if ok, err := s.Exists(t.Context(), KeyOf([]byte("discard me"))); ok || err != nil {
-		t.Errorf("Exists() = %v, %v; want false, nil", ok, err)
-	}
-
 	entries, err := os.ReadDir(filepath.Join(s.Root(), stagingDir))
 	if err != nil {
 		t.Fatalf("read staging dir: %v", err)
@@ -238,105 +140,6 @@ func TestLocal_AbortLeavesNothing(t *testing.T) {
 
 	if len(entries) != 0 {
 		t.Errorf("staging/ holds %d files after Abort, want 0", len(entries))
-	}
-}
-
-// Abort after Commit is a no-op, which is what makes `defer w.Abort()` safe on the
-// happy path. If it removed the object, every successful PUT would delete its own
-// bytes and every subsequent GET would be a permanent 500.
-func TestLocal_AbortAfterCommitIsANoop(t *testing.T) {
-	s := newTestStore(t)
-
-	w, err := s.Create(t.Context())
-	if err != nil {
-		t.Fatalf("Create() error = %v", err)
-	}
-
-	if _, err := w.Write([]byte("keep me")); err != nil {
-		t.Fatalf("Write() error = %v", err)
-	}
-
-	info, err := w.Commit(t.Context())
-	if err != nil {
-		t.Fatalf("Commit() error = %v", err)
-	}
-
-	if err := w.Abort(); err != nil {
-		t.Errorf("Abort() after Commit error = %v, want nil", err)
-	}
-
-	if ok, err := s.Exists(t.Context(), info.Key); !ok || err != nil {
-		t.Errorf("Exists() after post-Commit Abort = %v, %v; want true, nil", ok, err)
-	}
-
-	if _, err := w.Commit(t.Context()); !errors.Is(err, ErrCommitted) {
-		t.Errorf("second Commit() error = %v, want ErrCommitted", err)
-	}
-}
-
-// Two writers staging identical content must both succeed and land on one object.
-// This is the dedup path at the byte layer, and it is why Commit onto an existing
-// object is a no-op rather than an error.
-func TestLocal_CommitIsIdempotentAcrossWriters(t *testing.T) {
-	s := newTestStore(t)
-
-	k1 := put(t, s, []byte("identical"))
-	k2 := put(t, s, []byte("identical"))
-
-	if k1 != k2 {
-		t.Fatalf("keys differ: %s vs %s", k1, k2)
-	}
-
-	info, err := s.Stat(t.Context(), k1)
-	if err != nil {
-		t.Fatalf("Stat() error = %v", err)
-	}
-
-	if info.Size != int64(len("identical")) {
-		t.Errorf("size = %d, want %d", info.Size, len("identical"))
-	}
-}
-
-func TestLocal_FanOutLayout(t *testing.T) {
-	s := newTestStore(t)
-	k := put(t, s, []byte("layout"))
-	h := k.String()
-
-	want := filepath.Join(s.Root(), objectsDir, h[0:2], h[2:4], h)
-	if _, err := os.Stat(want); err != nil {
-		t.Errorf("object not at %s: %v", want, err)
-	}
-}
-
-// Digest must be available BEFORE Commit -- that is the seam blob.Service uses to
-// take the digest advisory lock and decide whether to commit these bytes at all.
-func TestLocal_DigestBeforeCommit(t *testing.T) {
-	s := newTestStore(t)
-	content := []byte("hash me")
-
-	w, err := s.Create(t.Context())
-	if err != nil {
-		t.Fatalf("Create() error = %v", err)
-	}
-
-	defer func() { _ = w.Abort() }()
-
-	if _, err := io.Copy(w, bytes.NewReader(content)); err != nil {
-		t.Fatalf("Copy() error = %v", err)
-	}
-
-	k, n := w.Digest()
-	if k != KeyOf(content) {
-		t.Errorf("Digest() = %s, want %s", k, KeyOf(content))
-	}
-
-	if n != int64(len(content)) {
-		t.Errorf("Digest() size = %d, want %d", n, len(content))
-	}
-
-	// ...and nothing is durable yet.
-	if ok, _ := s.Exists(t.Context(), k); ok {
-		t.Error("Digest() made the object visible; only Commit may do that")
 	}
 }
 
@@ -397,115 +200,8 @@ func TestKeyFromBytes(t *testing.T) {
 	}
 }
 
-func TestInstrumented_EmitsStorageMetrics(t *testing.T) {
-	m := metrics.New()
-	s := NewInstrumented(newTestStore(t), m, metrics.DriverLocal)
-
-	k := put(t, s, []byte("instrumented"))
-
-	rc, err := s.Get(t.Context(), k)
-	if err != nil {
-		t.Fatalf("Get() error = %v", err)
-	}
-
-	_ = rc.Close()
-
-	if _, err := s.Get(t.Context(), KeyOf([]byte("absent"))); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("Get(absent) error = %v, want ErrNotFound", err)
-	}
-
-	if err := s.Delete(t.Context(), k); err != nil {
-		t.Fatalf("Delete() error = %v", err)
-	}
-
-	tests := []struct {
-		op, result string
-		want       float64
-	}{
-		{op: opPut, result: string(metrics.ResultHit), want: 1},
-		{op: opGet, result: string(metrics.ResultHit), want: 1},
-		// A cold cache is nothing but misses. ErrNotFound MUST NOT count as an
-		// error, or a healthy first build reports a 100% storage error rate.
-		{op: opGet, result: string(metrics.ResultMiss), want: 1},
-		{op: opGet, result: string(metrics.ResultError), want: 0},
-		{op: opDelete, result: string(metrics.ResultHit), want: 1},
-	}
-
-	for _, tt := range tests {
-		got := counterValue(t, m, "bakery_storage_operations_total", map[string]string{
-			"driver": metrics.DriverLocal, "op": tt.op, "result": tt.result,
-		})
-		if got != tt.want {
-			t.Errorf("storage_operations_total{op=%q,result=%q} = %v, want %v", tt.op, tt.result, got, tt.want)
-		}
-	}
-}
-
-// An aborted write records NO put: dedup elided it, and blob.Service already counts
-// that on the headline series as put/hit. Counting it here too would double-count
-// every deduped upload.
-func TestInstrumented_AbortRecordsNoPut(t *testing.T) {
-	m := metrics.New()
-	s := NewInstrumented(newTestStore(t), m, metrics.DriverLocal)
-
-	w, err := s.Create(t.Context())
-	if err != nil {
-		t.Fatalf("Create() error = %v", err)
-	}
-
-	if _, err := w.Write([]byte("elided")); err != nil {
-		t.Fatalf("Write() error = %v", err)
-	}
-
-	if err := w.Abort(); err != nil {
-		t.Fatalf("Abort() error = %v", err)
-	}
-
-	got := counterValue(t, m, "bakery_storage_operations_total", map[string]string{
-		"driver": metrics.DriverLocal, "op": opPut, "result": string(metrics.ResultHit),
-	})
-	if got != 0 {
-		t.Errorf("aborted write recorded %v puts, want 0", got)
-	}
-}
-
-// TestInstrumented_PreRegistersSeriesAtZero proves the store's operation series
-// EXIST the moment it is constructed, before any call. This is the storage half of
-// the "STORAGE_DIR is not dead config" guarantee: bakery_storage_operations_total
-// must be present from boot so a rate() alert can distinguish "no storage traffic
-// yet" from "the store was never wired up at all". counterValue reads zero for both
-// an absent series and a present-but-zero one, so this test counts series instead.
-func TestInstrumented_PreRegistersSeriesAtZero(t *testing.T) {
-	m := metrics.New()
-
-	// Construct and discard: the series live in the registry, not on the store.
-	_ = NewInstrumented(newTestStore(t), m, metrics.DriverLocal)
-
-	ops := []string{opGet, opPut, opStat, opExists, opDelete}
-	results := []string{string(metrics.ResultHit), string(metrics.ResultMiss), string(metrics.ResultError)}
-
-	want := len(ops) * len(results)
-
-	got := seriesCount(t, m, "bakery_storage_operations_total")
-	if got != want {
-		t.Fatalf("bakery_storage_operations_total has %d series after construction, want %d "+
-			"(op x result, pre-registered at zero) -- the store's series were not initialized at boot", got, want)
-	}
-
-	// Every one of them must be exactly zero: pre-registration seeds the labels,
-	// it must never fabricate traffic.
-	for _, op := range ops {
-		for _, res := range results {
-			if v := counterValue(t, m, "bakery_storage_operations_total", map[string]string{
-				"driver": metrics.DriverLocal, "op": op, "result": res,
-			}); v != 0 {
-				t.Errorf("pre-registered series {op=%q,result=%q} = %v, want 0", op, res, v)
-			}
-		}
-	}
-}
-
 // seriesCount returns how many series a metric family currently exposes.
+// Shared with conformance_test.go.
 func seriesCount(t *testing.T, m *metrics.Metrics, name string) int {
 	t.Helper()
 
@@ -524,6 +220,7 @@ func seriesCount(t *testing.T, m *metrics.Metrics, name string) int {
 }
 
 // counterValue reads one series out of the registry by name and exact label set.
+// Shared with conformance_test.go.
 func counterValue(t *testing.T, m *metrics.Metrics, name string, labels map[string]string) float64 {
 	t.Helper()
 

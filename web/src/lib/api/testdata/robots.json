@@ -1,0 +1,43 @@
+{
+  "items": [
+    {
+      "id": "b2c3d4e5-5f6a-4b7c-8d9e-0f1a2b3c4d5e",
+      "org_id": "1c9c9e2a-3e4f-4a5b-8c7d-6e5f4a3b2c1d",
+      "name": "ci-runner",
+      "description": "Bazel remote cache for the CI fleet",
+      "created_by": "8f2b1d40-1f7a-4c9d-9a7a-0d2c3b4e5f60",
+      "created_by_email": "anna@acme.dev",
+      "created_at": "2026-07-20T10:00:00.000Z",
+      "tokens": [
+        {
+          "id": "c3d4e5f6-6a7b-4c8d-9e0f-1a2b3c4d5e6f",
+          "robot_id": "b2c3d4e5-5f6a-4b7c-8d9e-0f1a2b3c4d5e",
+          "org_id": "1c9c9e2a-3e4f-4a5b-8c7d-6e5f4a3b2c1d",
+          "name": "ci-2026",
+          "token_prefix": "bkro_2c3d4e5f",
+          "scope": "write",
+          "expires_at": "2027-07-20T10:00:00.000Z",
+          "created_by": "8f2b1d40-1f7a-4c9d-9a7a-0d2c3b4e5f60",
+          "created_by_email": "anna@acme.dev",
+          "created_at": "2026-07-20T10:00:00.000Z",
+          "last_used_at": "2026-08-15T04:12:09.000Z",
+          "revoked_at": null
+        },
+        {
+          "id": "d4e5f6a7-7b8c-4d9e-9f0a-2b3c4d5e6f70",
+          "robot_id": "b2c3d4e5-5f6a-4b7c-8d9e-0f1a2b3c4d5e",
+          "org_id": "1c9c9e2a-3e4f-4a5b-8c7d-6e5f4a3b2c1d",
+          "name": "old-ci",
+          "token_prefix": "bkro_1a2b3c4d",
+          "scope": "read",
+          "expires_at": "2026-09-01T00:00:00.000Z",
+          "created_by": "",
+          "created_by_email": "bo@acme.dev",
+          "created_at": "2026-01-05T09:00:00.000Z",
+          "last_used_at": null,
+          "revoked_at": "2026-06-10T08:30:00.000Z"
+        }
+      ]
+    }
+  ]
+}

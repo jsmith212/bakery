@@ -1,0 +1,27 @@
+# A SEPARATE Service on purpose -- do not fold this port into service.yaml.
+#
+# /metrics exposes every org and project slug and how many bytes each
+# stores. A Kubernetes Service is discovery (a name and a load-balancing
+# rule), not a firewall: once the container listens on 0.0.0.0:9090 (see
+# deployment.yaml's METRICS_ADDR), any pod in the cluster that can resolve
+# this Service's ClusterIP -- or the pod IP directly -- can read the customer
+# list, regardless of how many Services exist. The NetworkPolicy
+# (networkpolicy.yaml) is the actual access control; this Service is only
+# how Prometheus finds the port. Never route this through an Ingress -- see
+# ingress.example.yaml's comment.
+apiVersion: v1
+kind: Service
+metadata:
+  name: bakery-metrics
+  labels:
+    app.kubernetes.io/name: bakery
+    # A distinct label from service.yaml's, so servicemonitor.yaml's selector
+    # can target this Service specifically rather than matching both.
+    app.kubernetes.io/component: metrics
+spec:
+  selector:
+    app.kubernetes.io/name: bakery
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics

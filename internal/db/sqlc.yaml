@@ -29,3 +29,7 @@ sql:
         sql_package: "pgx/v5"
         emit_interface: true
         emit_empty_slices: true
+        # sqlc's default initialism list does not include URL, so avatar_url
+        # would otherwise generate as the non-idiomatic AvatarUrl.
+        rename:
+          avatar_url: AvatarURL

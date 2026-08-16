@@ -98,9 +98,12 @@ const (
 	BackendOCI       Backend = "oci"
 )
 
-// Storage driver labels. M1 ships local only; S3 is deferred.
+// Storage driver labels. A CLOSED set: --storage-driver is a Kong enum over
+// exactly these two, so bakery_storage_operations_total can never gain a series
+// for a driver that does not exist.
 const (
 	DriverLocal = "local"
+	DriverS3    = "s3"
 )
 
 // LRU event labels.

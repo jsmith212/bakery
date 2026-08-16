@@ -55,6 +55,49 @@ func TestReconcileJITProvisions(t *testing.T) {
 	}
 }
 
+// TestReconcileWritesAvatarFromPictureClaim: avatar_url is claim-sourced and
+// machine-owned exactly like email and display_name -- it joins the
+// reconciler's keep-set unconditionally, on every login, and tracks the
+// CURRENT claim rather than accumulating (a later login that drops the
+// claim must reconcile the column back to NULL, not leave a stale URL).
+func TestReconcileWritesAvatarFromPictureClaim(t *testing.T) {
+	t.Parallel()
+
+	ts := newTestService(t, testGroupMap, false)
+	ctx := t.Context()
+
+	id := identity("s-avatar", "avatar@acme.example", "acme-devs")
+	id.AvatarURL = "https://cdn.example.dev/a.png"
+
+	userID, err := ts.Reconcile(ctx, id)
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	user, err := ts.store.GetUser(ctx, userID)
+	if err != nil {
+		t.Fatalf("GetUser: %v", err)
+	}
+
+	if !user.AvatarURL.Valid || user.AvatarURL.String != id.AvatarURL {
+		t.Errorf("AvatarURL = %+v, want %q", user.AvatarURL, id.AvatarURL)
+	}
+
+	id.AvatarURL = ""
+	if _, err := ts.Reconcile(ctx, id); err != nil {
+		t.Fatalf("Reconcile() (second login, claim withdrawn) error = %v", err)
+	}
+
+	user, err = ts.store.GetUser(ctx, userID)
+	if err != nil {
+		t.Fatalf("GetUser: %v", err)
+	}
+
+	if user.AvatarURL.Valid {
+		t.Errorf("AvatarURL = %+v, want NULL after the claim was withdrawn", user.AvatarURL)
+	}
+}
+
 // TestReconcileIsIdempotentAndTracksTheIdP: the IdP is the source of truth for org
 // and site roles, and reconciliation makes the database agree on EVERY login --
 // adding what appeared and removing what did not.
@@ -940,4 +983,88 @@ func nullRole(r repository.NullOrgRole) string {
 	}
 
 	return string(r.OrgRole)
+}
+
+// TestUnchangedLoginDoesNotBumpTheAuthzEpoch is the gate on the value-changed
+// guard, and the reason the guard is worth having.
+//
+// ReconcileOrgMembershipUpsert runs once per mapped org on EVERY login. Postgres
+// fires row triggers on an UPDATE regardless of value equality, so without a
+// guard an ordinary login -- which changes nothing on that row 99.9% of the time
+// -- increments users.authz_epoch once per membership. The epoch is the principal
+// cache's key, so that evicts the user's whole cached generation, on every
+// request that reconciles, for no change at all. It also widens the window for
+// the lock-order collision api.lockUserFirst closes.
+//
+// The guard is in two places on purpose: the `DO UPDATE ... WHERE` on the
+// statement (which skips the write entirely) and the `WHEN` clause on the UPDATE
+// trigger (which holds for writers that do not carry the first). This asserts the
+// property they exist for, not either mechanism.
+//
+// A REAL change must still bump -- otherwise the cheapest way to pass this test
+// would be to break invalidation -- so the second half moves the user to a
+// different group and requires the epoch to move with them.
+func TestUnchangedLoginDoesNotBumpTheAuthzEpoch(t *testing.T) {
+	t.Parallel()
+
+	ts := newTestService(t, testGroupMap, false)
+	ctx := t.Context()
+
+	id := identity("epoch-1", "epoch@acme.example", "acme-devs")
+
+	userID, err := ts.Reconcile(ctx, id)
+	if err != nil {
+		t.Fatalf("first Reconcile: %v", err)
+	}
+
+	epoch := func() int64 {
+		t.Helper()
+
+		var n int64
+
+		if err := ts.pool.QueryRow(ctx,
+			"SELECT authz_epoch FROM users WHERE id = $1", userID).Scan(&n); err != nil {
+			t.Fatalf("read authz_epoch: %v", err)
+		}
+
+		return n
+	}
+
+	before := epoch()
+
+	// Three more logins with the same claims. Email, display name and last_login_at
+	// are rewritten every time -- that is what the site-role trigger's own WHEN
+	// clause exists to ignore -- and the membership is re-upserted every time.
+	for range 3 {
+		if _, err := ts.Reconcile(ctx, id); err != nil {
+			t.Fatalf("repeat Reconcile: %v", err)
+		}
+	}
+
+	if after := epoch(); after != before {
+		t.Errorf("authz_epoch moved %d -> %d across three unchanged logins.\n"+
+			"Every bump evicts this user's whole principal-cache generation: the membership "+
+			"upsert needs its value-changed guard (and the UPDATE trigger its WHEN clause).",
+			before, after)
+	}
+
+	// And the other direction: a login that really does change the role must bump,
+	// or the cache would serve the old authority.
+	promoted := identity("epoch-1", "epoch@acme.example", "acme-leads")
+
+	if _, err := ts.Reconcile(ctx, promoted); err != nil {
+		t.Fatalf("promoting Reconcile: %v", err)
+	}
+
+	if after := epoch(); after <= before {
+		t.Errorf("authz_epoch = %d after a role change, want > %d.\n"+
+			"The guard must skip UNCHANGED writes only -- a changed role that does not bump "+
+			"leaves every cached principal for this user serving the old authority.",
+			after, before)
+	}
+
+	if role, ok := orgRoleOf(t, ts, userID, "acme"); !ok || role != OrgRoleAdmin {
+		t.Errorf("acme role = (%q, %v), want (admin, true): the guarded upsert must still WRITE "+
+			"a changed value", role, ok)
+	}
 }

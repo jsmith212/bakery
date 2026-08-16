@@ -138,6 +138,14 @@ func (a *API) handleCreateProject(w http.ResponseWriter, r *http.Request) error 
 	var project repository.Project
 
 	err := a.store.Tx(ctx, func(q *repository.Queries) error {
+		// Users first: the grant below writes a project_memberships row, and every
+		// membership writer takes the users row before the membership row (see
+		// lockUserFirst). A site admin whose grant is a no-op still takes it -- the
+		// ordering rule is about the transaction, not about whether it writes.
+		if err := lockUserFirst(ctx, q, p.UserID()); err != nil {
+			return err
+		}
+
 		created, err := q.CreateProject(ctx, repository.CreateProjectParams{
 			OrgID: s.OrgID, Slug: req.Slug, Name: req.Name,
 		})
@@ -249,13 +257,32 @@ func (a *API) handleUpdateProject(w http.ResponseWriter, r *http.Request) error 
 // the project, and a project admin is a role the org's admins hand out. Letting
 // the recipient of a delegated role destroy the thing it was delegated over is
 // the wrong default.
+//
+// The cascade deletes a project_memberships row per member, so it fires the epoch
+// trigger once per member and is subject to lockUserFirst's ordering rule at the
+// width of the project's roster.
 func (a *API) handleDeleteProject(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	s := scopeFrom(ctx)
 
-	n, err := a.store.DeleteProject(ctx, s.ProjectID)
+	var n int64
+
+	err := a.store.Tx(ctx, func(q *repository.Queries) error {
+		if err := q.LockProjectMemberUsersForAuthzUpdate(ctx, s.ProjectID); err != nil {
+			return fmt.Errorf("lock the project's members before deleting it: %w", err)
+		}
+
+		deleted, err := q.DeleteProject(ctx, s.ProjectID)
+		if err != nil {
+			return fmt.Errorf("delete project: %w", err)
+		}
+
+		n = deleted
+
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("delete project: %w", err)
+		return err
 	}
 
 	if n == 0 {

@@ -25,6 +25,37 @@ type PutOrgMemberRequest struct {
 	Role string `json:"role"` // member|admin|owner
 }
 
+// lockUserFirst is THE LOCK-ORDERING RULE of the authority plane, and it is the
+// opening statement of every transaction below that writes a membership row.
+//
+// 000015's epoch triggers gave every writer of org_memberships or
+// project_memberships a SECOND lock it does not name: the trigger body is
+// `UPDATE users SET authz_epoch = authz_epoch + 1`, taken AFTER the membership
+// row. internal/auth's login reconciler takes the same two in the opposite order
+// (UpsertUser, then the membership upsert), because it must -- it has to have a
+// user id before it can name a membership. So the two orders cannot both be
+// changed, and the one that has a choice is this one.
+//
+// The consequence of leaving it alone is a genuine ABBA: a console login and an
+// admin's `PUT /orgs/{org}/members/{user}` for the same human deadlock, Postgres
+// aborts one, and it surfaces as an intermittent 500 on the PUT and an
+// intermittent `/login?denied=auth_failed` on the login -- neither of which any
+// code on either path is expecting, and neither of which any single-threaded test
+// can produce.
+//
+// FOR NO KEY UPDATE, not FOR UPDATE: it is exactly the strength the trigger's own
+// UPDATE takes, it conflicts with itself (which is all the mutual exclusion this
+// needs), and it leaves concurrent foreign-key checks against users unblocked.
+//
+// The gate is TestConcurrentLoginAndMembershipGrantDoNotDeadlock.
+func lockUserFirst(ctx context.Context, q *repository.Queries, userID pgtype.UUID) error {
+	if err := q.LockUserForAuthzUpdate(ctx, userID); err != nil {
+		return fmt.Errorf("lock the user row before writing their memberships: %w", err)
+	}
+
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // Org memberships: HYBRID. An OIDC half the reconciler owns, a local half this
 // API owns, and a database-generated effective role = greatest(oidc, local).
@@ -84,6 +115,13 @@ func (a *API) handleListOrgMembers(w http.ResponseWriter, r *http.Request) error
 // greater than the caller's, and (before the local role model, when every org role
 // was claim-derived) it was not a reachable write at all. So the TARGET's effective
 // role is checked, not only the requested one. See requireAuthorityOverTarget.
+//
+// # Why the write is a transaction that opens with a users row lock
+//
+// See lockUserFirst: the grant's own epoch trigger takes a `users` lock AFTER the
+// membership row, and the login reconciler takes the same two in the opposite
+// order. This statement used to be a bare autocommit INSERT, which is exactly the
+// half of the ABBA that has no chance to declare its ordering.
 func (a *API) handlePutOrgMember(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	s := scopeFrom(ctx)
@@ -116,14 +154,29 @@ func (a *API) handlePutOrgMember(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	membership, err := a.store.GrantOrgMembershipLocal(ctx, repository.GrantOrgMembershipLocalParams{
-		UserID:    user.ID,
-		OrgID:     s.OrgID,
-		LocalRole: repository.NullOrgRole{OrgRole: role, Valid: true},
-		GrantedBy: p.UserID(),
+	var membership repository.OrgMembership
+
+	err = a.store.Tx(ctx, func(q *repository.Queries) error {
+		if err := lockUserFirst(ctx, q, user.ID); err != nil {
+			return err
+		}
+
+		granted, err := q.GrantOrgMembershipLocal(ctx, repository.GrantOrgMembershipLocalParams{
+			UserID:    user.ID,
+			OrgID:     s.OrgID,
+			LocalRole: repository.NullOrgRole{OrgRole: role, Valid: true},
+			GrantedBy: p.UserID(),
+		})
+		if err != nil {
+			return fmt.Errorf("grant local org role: %w", err)
+		}
+
+		membership = granted
+
+		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("grant local org role: %w", err)
+		return err
 	}
 
 	a.log.InfoContext(ctx, "granted a local org role",
@@ -214,11 +267,26 @@ func (a *API) handleDeleteOrgMember(w http.ResponseWriter, r *http.Request) erro
 	// merely demotes them. Both statements are guarded on it in SQL, so this is a
 	// branch, not a race: whichever one matches, matches.
 	if current.OidcRole.Valid {
-		survived, err := a.store.RevokeOrgMembershipLocal(ctx, repository.RevokeOrgMembershipLocalParams{
-			UserID: user.ID, OrgID: s.OrgID,
+		var survived repository.OrgMembership
+
+		err := a.store.Tx(ctx, func(q *repository.Queries) error {
+			if err := lockUserFirst(ctx, q, user.ID); err != nil {
+				return err
+			}
+
+			row, err := q.RevokeOrgMembershipLocal(ctx, repository.RevokeOrgMembershipLocalParams{
+				UserID: user.ID, OrgID: s.OrgID,
+			})
+			if err != nil {
+				return fmt.Errorf("revoke local org role: %w", err)
+			}
+
+			survived = row
+
+			return nil
 		})
 		if err != nil {
-			return fmt.Errorf("revoke local org role: %w", err)
+			return err
 		}
 
 		member := newMembership(survived, user.Email, user.DisplayName, "")
@@ -241,11 +309,26 @@ func (a *API) handleDeleteOrgMember(w http.ResponseWriter, r *http.Request) erro
 		return nil
 	}
 
-	n, err := a.store.DeleteLocalOrgMembership(ctx, repository.DeleteLocalOrgMembershipParams{
-		UserID: user.ID, OrgID: s.OrgID,
+	var n int64
+
+	err = a.store.Tx(ctx, func(q *repository.Queries) error {
+		if err := lockUserFirst(ctx, q, user.ID); err != nil {
+			return err
+		}
+
+		deleted, err := q.DeleteLocalOrgMembership(ctx, repository.DeleteLocalOrgMembershipParams{
+			UserID: user.ID, OrgID: s.OrgID,
+		})
+		if err != nil {
+			return fmt.Errorf("delete org membership: %w", err)
+		}
+
+		n = deleted
+
+		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("delete org membership: %w", err)
+		return err
 	}
 
 	if n == 0 {
@@ -404,6 +487,10 @@ func (a *API) handlePutProjectMember(w http.ResponseWriter, r *http.Request) err
 	var out repository.ProjectMembership
 
 	err = a.store.Tx(ctx, func(q *repository.Queries) error {
+		if err := lockUserFirst(ctx, q, userID); err != nil {
+			return err
+		}
+
 		membership, err := q.UpsertProjectMembership(ctx, repository.UpsertProjectMembershipParams{
 			UserID: userID, ID: s.ProjectID, Role: role,
 		})
@@ -491,11 +578,26 @@ func (a *API) handleDeleteProjectMember(w http.ResponseWriter, r *http.Request) 
 		return err
 	}
 
-	n, err := a.store.DeleteProjectMembership(ctx, repository.DeleteProjectMembershipParams{
-		UserID: userID, ProjectID: s.ProjectID,
+	var n int64
+
+	err = a.store.Tx(ctx, func(q *repository.Queries) error {
+		if err := lockUserFirst(ctx, q, userID); err != nil {
+			return err
+		}
+
+		deleted, err := q.DeleteProjectMembership(ctx, repository.DeleteProjectMembershipParams{
+			UserID: userID, ProjectID: s.ProjectID,
+		})
+		if err != nil {
+			return fmt.Errorf("delete project membership: %w", err)
+		}
+
+		n = deleted
+
+		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("delete project membership: %w", err)
+		return err
 	}
 
 	if n == 0 {

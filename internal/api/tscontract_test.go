@@ -160,6 +160,49 @@ func listFixtureKeySet(t *testing.T, filename string) []string {
 	return keys
 }
 
+// nestedTokenKeySet returns the union of top-level key sets from a robots-list
+// fixture's `items[].tokens[]` -- the only place OrgToken's shape appears on the
+// wire outside CreatedOrgToken, since there is no standalone list route for a
+// robot's tokens (see robots.go: they ride along inside GET .../robots).
+func nestedTokenKeySet(t *testing.T, filename string) []string {
+	t.Helper()
+
+	raw := readTestdata(t, filename)
+
+	var envelope struct {
+		Items []struct {
+			Tokens []json.RawMessage `json:"tokens"`
+		} `json:"items"`
+	}
+
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatalf("unmarshal %s as a robots envelope: %v", filename, err)
+	}
+
+	union := map[string]struct{}{}
+
+	for _, item := range envelope.Items {
+		for _, tok := range item.Tokens {
+			for _, k := range objectKeySet(t, tok) {
+				union[k] = struct{}{}
+			}
+		}
+	}
+
+	if len(union) == 0 {
+		t.Fatalf("%s has no tokens; nothing to union", filename)
+	}
+
+	keys := make([]string, 0, len(union))
+	for k := range union {
+		keys = append(keys, k)
+	}
+
+	slices.Sort(keys)
+
+	return keys
+}
+
 // unionKeySet merges the top-level key sets of several fixtures -- SnippetResponse
 // needs both snippet-preview.json (local_conf/netrc/push_commands populated,
 // env/api_key/warnings absent) and snippet-minted.json (the reverse) to see every
@@ -317,20 +360,80 @@ func TestWireTypesMatchTSFixtures(t *testing.T) {
 	t.Run("Me", func(t *testing.T) {
 		// Me.APIKey is a known gap -- no fixture covers an API-key-authenticated
 		// /me response -- so it is deliberately left nil (omitempty drops it).
+		// Me.Robot is NOT a gap: me-robot.json covers it, and the field is
+		// populated below even though a real robot response would never also
+		// carry a display name -- this test asserts the WIRE SHAPE, not realism,
+		// same as the Member subtest combining provenance that never co-occurs.
 		me := Me{
 			UserID: "u1", Email: "anna@acme.dev", DisplayName: "Anna Roux",
-			Method: "session", SiteRole: "user", IsSiteAdmin: false,
+			AvatarURL: "https://lh3.googleusercontent.com/a/anna-roux",
+			Method:    "session", SiteRole: "user", IsSiteAdmin: false,
 			Orgs:     []MeOrg{{ID: "o1", Slug: "acme", Name: "Acme", Role: "admin"}},
 			Projects: []MeProject{{ID: "p1", Slug: "firmware", OrgSlug: "acme", Role: "admin"}},
+			Robot:    &MeRobotGrant{RobotID: "r1", OrgID: "o1", Scope: "write"},
 		}
 
 		// me.json and me-site-admin.json carry the SAME top-level key set (a site
 		// admin's orgs/projects are empty arrays, not absent keys) -- either alone
 		// is the whole contract, and unioning both documents that equivalence
-		// rather than assuming it.
-		want := unionKeySet(objectKeySet(t, readTestdata(t, "me.json")), objectKeySet(t, readTestdata(t, "me-site-admin.json")))
+		// rather than assuming it. me-robot.json adds the one key neither carries:
+		// `robot`.
+		want := unionKeySet(
+			objectKeySet(t, readTestdata(t, "me.json")),
+			objectKeySet(t, readTestdata(t, "me-site-admin.json")),
+			objectKeySet(t, readTestdata(t, "me-robot.json")),
+		)
 
 		assertSameKeySet(t, "Me", marshaledKeySet(t, me), want)
+	})
+
+	t.Run("UserToken", func(t *testing.T) {
+		tok := UserToken{
+			ID: "t1", Name: "build-host-1", TokenPrefix: "bkru_9d8c7b6a", MaxScope: "write",
+			CreatedAt: then, ExpiresAt: &now, LastUsedAt: &now, RevokedAt: &now,
+		}
+
+		assertSameKeySet(t, "UserToken", marshaledKeySet(t, tok), listFixtureKeySet(t, "user-tokens.json"))
+	})
+
+	t.Run("CreatedUserToken", func(t *testing.T) {
+		tok := CreatedUserToken{
+			UserToken: UserToken{
+				ID: "t1", Name: "yocto-2026-08-16", TokenPrefix: "bkru_5e6f7081", MaxScope: "write",
+				CreatedAt: then, ExpiresAt: &now,
+			},
+			Token: "bkru_" + "0123456789abcdef",
+		}
+
+		// created-user-token.json is a BARE object (the single response to POST
+		// /user/tokens), not a `{"items":[...]}` envelope like user-tokens.json.
+		assertSameKeySet(t, "CreatedUserToken",
+			marshaledKeySet(t, tok), objectKeySet(t, readTestdata(t, "created-user-token.json")))
+	})
+
+	t.Run("Robot", func(t *testing.T) {
+		robot := Robot{
+			ID: "r1", OrgID: "o1", Name: "ci-runner", Description: "CI fleet cache",
+			CreatedBy: "u1", CreatedByEmail: "anna@acme.dev", CreatedAt: then,
+			Tokens: []OrgToken{populatedOrgToken()},
+		}
+
+		assertSameKeySet(t, "Robot", marshaledKeySet(t, robot), listFixtureKeySet(t, "robots.json"))
+	})
+
+	t.Run("OrgToken", func(t *testing.T) {
+		// robots.json is the ONLY fixture carrying OrgToken's shape without the
+		// `token` field -- there is no standalone GET .../tokens list route, only
+		// the tokens NESTED inside each robot in the list response.
+		assertSameKeySet(t, "OrgToken",
+			marshaledKeySet(t, populatedOrgToken()), nestedTokenKeySet(t, "robots.json"))
+	})
+
+	t.Run("CreatedOrgToken", func(t *testing.T) {
+		tok := CreatedOrgToken{OrgToken: populatedOrgToken(), Token: "bkro_" + "0123456789abcdef"}
+
+		assertSameKeySet(t, "CreatedOrgToken",
+			marshaledKeySet(t, tok), objectKeySet(t, readTestdata(t, "created-org-token.json")))
 	})
 
 	t.Run("GCRun", func(t *testing.T) {
@@ -414,6 +517,19 @@ func TestWireTypesMatchTSFixtures(t *testing.T) {
 
 		assertSameKeySet(t, "AuthConfig", marshaledKeySet(t, cfg), objectKeySet(t, readTestdata(t, "auth-config.json")))
 	})
+}
+
+// populatedOrgToken is the shared fully-populated OrgToken literal the Robot,
+// OrgToken and CreatedOrgToken subtests all need.
+func populatedOrgToken() OrgToken {
+	now := time.Now().UTC()
+
+	return OrgToken{
+		ID: "t1", RobotID: "r1", OrgID: "o1", Name: "ci-2026",
+		TokenPrefix: "bkro_2c3d4e5f", Scope: "write", ExpiresAt: now.Add(365 * 24 * time.Hour),
+		CreatedBy: "u1", CreatedByEmail: "anna@acme.dev", CreatedAt: now,
+		LastUsedAt: &now, RevokedAt: &now,
+	}
 }
 
 // populatedAPIKey is the shared fully-populated APIKey literal CreatedAPIKey and

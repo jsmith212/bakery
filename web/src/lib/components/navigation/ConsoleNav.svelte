@@ -15,8 +15,14 @@
 		me: Me;
 		/** `GET /orgs` -- every org the caller can VIEW, not only their memberships. */
 		orgs: Org[];
-		/** `GET /orgs/{org}/projects`, empty on the global screens. */
-		projects: Project[];
+		/**
+		 * `GET /orgs/{org}/projects` -- `null`, not `[]`, on the global screens
+		 * (`/user`, `/gc`, `/orgs`, `/site-admins`), which have no org layout to
+		 * load it from. The distinction matters: `[]` means "this org has zero
+		 * projects", which the switcher is allowed to say; `null` means "this
+		 * page never asked", which it is not.
+		 */
+		projects: Project[] | null;
 		currentOrg: string | null;
 		currentProject: string | null;
 	}
@@ -24,6 +30,7 @@
 	let { me, orgs, projects, currentOrg, currentProject }: Props = $props();
 
 	let openMenu = $state<'org' | 'project' | null>(null);
+	const projectsLoaded = $derived(projects !== null);
 
 	const path = $derived(page.url.pathname);
 	const orgBase = $derived(currentOrg ? orgPath(currentOrg) : null);
@@ -35,9 +42,19 @@
 	// kind is, say, `oci` -- there is no sstate mount to land on. Point at the
 	// current project's own first configured kind instead, falling back to the
 	// "add a backend" screen when it has none yet.
-	const currentProjectObj = $derived(projects.find((p) => p.slug === currentProject) ?? null);
+	//
+	// That fallback is only honest when `projects` was actually loaded: on a
+	// global page (`/user`, `/gc`, ...) with a remembered project, `projects`
+	// is `null` and `currentProjectObj` can never resolve, so guessing
+	// "/backends/new" would point at the create-a-backend form for a project
+	// that may already have five. `!projectsLoaded` -> no href at all, and the
+	// nav below omits the link rather than guess -- same rule as the "an
+	// absent link says the same thing honestly" comment just below.
+	const currentProjectObj = $derived(
+		(projects ?? []).find((p) => p.slug === currentProject) ?? null
+	);
 	const backendsHref = $derived.by(() => {
-		if (!projectBase) return null;
+		if (!projectBase || !projectsLoaded) return null;
 		const kind = currentProjectObj?.backends[0];
 
 		return kind ? `${projectBase}/backends/${kind}` : `${projectBase}/backends/new`;
@@ -45,17 +62,21 @@
 
 	// Nav sections appear only when their scope exists. A "Backends" link with no
 	// project in the path would resolve to nothing; an absent link says the same
-	// thing honestly.
-	const projectNav = $derived(
-		projectBase && backendsHref
-			? [
-					{ label: 'Overview', href: `${projectBase}/overview` },
-					{ label: 'Backends', href: backendsHref },
-					{ label: 'API keys', href: `${projectBase}/keys` },
-					{ label: 'Config snippets', href: `${projectBase}/snippets` }
-				]
-			: []
-	);
+	// thing honestly. "Backends" itself is independently omitted when its href
+	// is unknown (see backendsHref) -- the other three links are still correct
+	// on a global page with a remembered project, so they stay.
+	const projectNav = $derived.by(() => {
+		if (!projectBase) return [];
+
+		const nav = [{ label: 'Overview', href: `${projectBase}/overview` }];
+		if (backendsHref) nav.push({ label: 'Backends', href: backendsHref });
+		nav.push(
+			{ label: 'API keys', href: `${projectBase}/keys` },
+			{ label: 'Config snippets', href: `${projectBase}/snippets` }
+		);
+
+		return nav;
+	});
 
 	const orgNav = $derived(
 		orgBase
@@ -108,6 +129,13 @@
 	}
 
 	let signingOut = $state(false);
+	// A dead avatar URL degrades to the monogram, never a broken-image glyph.
+	// Keyed to the URL that failed, not a bare flag: ConsoleNav is mounted
+	// once for the whole console session, so a bare boolean would latch a
+	// single transient failure (a captive portal, a rate-limited avatar host,
+	// an IdP rotating the picture URL between logins) until a full page
+	// reload, even after `me.avatar_url` changes to a working one.
+	let failedAvatarURL = $state<string | null>(null);
 
 	async function signOut() {
 		if (signingOut) return;
@@ -219,21 +247,46 @@
 			</button>
 			{#if openMenu === 'project' && currentOrg}
 				<div class={menu}>
-					{#each projects as p (p.id)}
+					{#if projectsLoaded}
+						{#each projects ?? [] as p (p.id)}
+							<a
+								href="{projectPath(currentOrg, p.slug)}/overview"
+								aria-current={p.slug === currentProject ? 'true' : undefined}
+								onclick={() => (openMenu = null)}
+								class="{itemChrome} h-7 {p.slug === currentProject ? itemActive : itemIdle}"
+							>
+								<span class="overflow-hidden text-ellipsis whitespace-nowrap font-mono text-sm"
+									>{p.slug}</span
+								>
+							</a>
+						{:else}
+							<div class="px-2 py-1.5 text-sm text-text-3">No projects yet</div>
+						{/each}
+					{:else if currentProject}
+						<!-- This page has no project list loaded (a global screen) -- we
+						     know only the remembered slug, not the org's real roster, so
+						     render exactly that one link rather than claiming "No
+						     projects yet" about an org we never asked. -->
 						<a
-							href="{projectPath(currentOrg, p.slug)}/overview"
-							aria-current={p.slug === currentProject ? 'true' : undefined}
+							href="{projectPath(currentOrg, currentProject)}/overview"
+							aria-current="true"
 							onclick={() => (openMenu = null)}
-							class="{itemChrome} h-7 {p.slug === currentProject ? itemActive : itemIdle}"
+							class="{itemChrome} h-7 {itemActive}"
 						>
 							<span class="overflow-hidden text-ellipsis whitespace-nowrap font-mono text-sm"
-								>{p.slug}</span
+								>{currentProject}</span
 							>
 						</a>
 					{:else}
-						<div class="px-2 py-1.5 text-sm text-text-3">No projects yet</div>
-					{/each}
-					<div class="my-[3px] border-t border-border-0"></div>
+						<!-- Neither a loaded roster nor a remembered project -- a global
+						     page with a remembered org and no project history. Render the
+						     honest "nothing to show" state rather than a bare divider
+						     floating above "All projects" with nothing above it. -->
+						<div class="px-2 py-1.5 text-sm text-text-3">No project selected</div>
+					{/if}
+					{#if projectsLoaded || currentProject}
+						<div class="my-[3px] border-t border-border-0"></div>
+					{/if}
 					<a
 						href="{orgPath(currentOrg)}/projects"
 						onclick={() => (openMenu = null)}
@@ -295,10 +348,20 @@
 			aria-current={userActive ? 'page' : undefined}
 			class="{itemChrome} h-9 {userActive ? itemActive : itemIdle}"
 		>
-			<span
-				class="inline-flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full border border-accent-border bg-accent-muted text-[10px] font-semibold text-accent-text"
-				>{initial}</span
-			>
+			{#if me.avatar_url && me.avatar_url !== failedAvatarURL}
+				<img
+					src={me.avatar_url}
+					alt=""
+					referrerpolicy="no-referrer"
+					onerror={() => (failedAvatarURL = me.avatar_url ?? null)}
+					class="h-[22px] w-[22px] shrink-0 rounded-full border border-accent-border object-cover"
+				/>
+			{:else}
+				<span
+					class="inline-flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full border border-accent-border bg-accent-muted text-[10px] font-semibold text-accent-text"
+					>{initial}</span
+				>
+			{/if}
 			<span class="overflow-hidden text-ellipsis whitespace-nowrap text-sm">{me.email}</span>
 		</a>
 	</div>

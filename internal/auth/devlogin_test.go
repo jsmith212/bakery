@@ -93,6 +93,14 @@ func TestDevLoginSeedsAndMintsASession(t *testing.T) {
 		t.Errorf("SiteRole = %q, want %q", user.SiteRole, SiteRoleAdmin)
 	}
 
+	// Dev login asserts no `picture` claim -- there is no IdP -- so the seeded
+	// user must have no avatar. The omitted AvatarURL field on
+	// UpsertUserParams zero-values to pgtype.Text{Valid:false}, which is NULL;
+	// this is the assertion that the zero value actually lands that way.
+	if user.AvatarURL.Valid {
+		t.Errorf("AvatarURL = %+v, want NULL for the dev user", user.AvatarURL)
+	}
+
 	route, err := ts.store.ResolveRoute(ctx, repository.ResolveRouteParams{
 		Slug: DevOrgSlug, Slug_2: DevProjectSlug,
 	})

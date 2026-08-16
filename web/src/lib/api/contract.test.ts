@@ -10,8 +10,10 @@ import * as membersApi from './members';
 import * as objectsApi from './objects';
 import * as orgsApi from './orgs';
 import * as projectsApi from './projects';
+import * as robotsApi from './robots';
 import * as siteAdminsApi from './siteAdmins';
 import * as snippetsApi from './snippets';
+import * as tokensApi from './tokens';
 import { getAuthConfig } from './auth';
 import { getMe } from './me';
 import { memberProvenance, siteAdminProvenance } from './types';
@@ -20,11 +22,15 @@ import { tri, TRI_STATE_EMPTY_STRING, omitUndefined } from './patch';
 import authConfigFixture from './testdata/auth-config.json';
 import backendsFixture from './testdata/backends.json';
 import createdKeyFixture from './testdata/created-key.json';
+import createdOrgTokenFixture from './testdata/created-org-token.json';
+import createdUserTokenFixture from './testdata/created-user-token.json';
 import gcActivityFixture from './testdata/gc-activity.json';
 import gcRunsFixture from './testdata/gc-runs.json';
 import instanceFixture from './testdata/instance.json';
 import keysFixture from './testdata/keys.json';
 import meFixture from './testdata/me.json';
+import meNoAvatarFixture from './testdata/me-no-avatar.json';
+import meRobotFixture from './testdata/me-robot.json';
 import meSiteAdminFixture from './testdata/me-site-admin.json';
 import objectsFixture from './testdata/objects.json';
 import orgMembersFixture from './testdata/org-members.json';
@@ -32,14 +38,19 @@ import orgUsageFixture from './testdata/org-usage.json';
 import orgsFixture from './testdata/orgs.json';
 import projectUsageFixture from './testdata/project-usage.json';
 import projectsFixture from './testdata/projects.json';
+import robotsFixture from './testdata/robots.json';
 import siteAdminsFixture from './testdata/site-admins.json';
 import snippetMintedFixture from './testdata/snippet-minted.json';
 import snippetPreviewFixture from './testdata/snippet-preview.json';
+import userTokensFixture from './testdata/user-tokens.json';
 
 import reqCreateBackend from './testdata/req-create-backend.json';
 import reqCreateKey from './testdata/req-create-key.json';
 import reqCreateOrg from './testdata/req-create-org.json';
+import reqCreateOrgToken from './testdata/req-create-org-token.json';
 import reqCreateProject from './testdata/req-create-project.json';
+import reqCreateRobot from './testdata/req-create-robot.json';
+import reqCreateUserToken from './testdata/req-create-user-token.json';
 import reqPutOrgMember from './testdata/req-put-org-member.json';
 import reqPutProjectMember from './testdata/req-put-project-member.json';
 import reqSnippetMint from './testdata/req-snippet-mint.json';
@@ -108,6 +119,7 @@ describe('response fixtures', () => {
 
 		expect(decoded).not.toBeNull();
 		expect(keys(decoded!)).toEqual([
+			'avatar_url',
 			'display_name',
 			'email',
 			'is_site_admin',
@@ -121,6 +133,17 @@ describe('response fixtures', () => {
 		expect(keys(decoded!.projects[0])).toEqual(['id', 'org_slug', 'role', 'slug']);
 	});
 
+	it('GET /me with no avatar_url: the default wire shape (dev-login, no picture claim)', async () => {
+		const { decoded } = await serve(meNoAvatarFixture, (fetch) => getMe({ fetch }));
+
+		// `avatar_url` is `json:"avatar_url,omitempty"` on the Go side, so an
+		// unset one is an ABSENT key, not a present null -- this is the shape
+		// most installs actually emit, and it is the branch that drives the
+		// monogram fallback the avatar `<img>` degrades to.
+		expect('avatar_url' in decoded!).toBe(false);
+		expect(decoded!.avatar_url).toBeUndefined();
+	});
+
 	it('GET /me for a site admin: no memberships, every visibility', async () => {
 		const { decoded } = await serve(meSiteAdminFixture, (fetch) => getMe({ fetch }));
 
@@ -129,6 +152,22 @@ describe('response fixtures', () => {
 		expect(decoded!.is_site_admin).toBe(true);
 		expect(decoded!.orgs).toEqual([]);
 		expect(decoded!.projects).toEqual([]);
+	});
+
+	it('GET /me for a robot: no identity fields, method org_token, a robot grant', async () => {
+		const { decoded } = await serve(meRobotFixture, (fetch) => getMe({ fetch }));
+
+		// A robot has no users row -- UserID/Email/DisplayName are empty, not
+		// absent, and inventing a display name would be a lie about what the
+		// credential is.
+		expect(decoded!.method).toBe('org_token');
+		expect(decoded!.user_id).toBe('');
+		expect(decoded!.email).toBe('');
+		expect(decoded!.robot).toEqual({
+			robot_id: 'b2c3d4e5-5f6a-4b7c-8d9e-0f1a2b3c4d5e',
+			org_id: '1c9c9e2a-3e4f-4a5b-8c7d-6e5f4a3b2c1d',
+			scope: 'write'
+		});
 	});
 
 	it('GET /orgs', async () => {
@@ -254,6 +293,73 @@ describe('response fixtures', () => {
 
 		expect(decoded.token.startsWith('bkry_')).toBe(true);
 		expect(decoded.token_prefix.startsWith('bkry_')).toBe(true);
+	});
+
+	it('GET /user/tokens returns metadata with no token field at all', async () => {
+		const { decoded } = await serve(userTokensFixture, (fetch) => tokensApi.listUserTokens({ fetch }));
+
+		expect(keys(decoded.items[0])).toEqual([
+			'created_at',
+			'expires_at',
+			'id',
+			'last_used_at',
+			'max_scope',
+			'name',
+			'revoked_at',
+			'token_prefix'
+		]);
+		expect('token' in decoded.items[0]).toBe(false);
+		expect(decoded.items[0].token_prefix.startsWith('bkru_')).toBe(true);
+	});
+
+	it('POST /user/tokens is the one response carrying a secret', async () => {
+		const { decoded } = await serve(createdUserTokenFixture, (fetch) =>
+			tokensApi.createUserToken({ name: 'x', scope: 'write' }, { fetch })
+		);
+
+		expect(decoded.token.startsWith('bkru_')).toBe(true);
+	});
+
+	it('GET .../robots carries each robot with its tokens, live and revoked, metadata only', async () => {
+		const { decoded } = await serve(robotsFixture, (fetch) => robotsApi.listRobots('acme', { fetch }));
+
+		const robot = decoded.items[0];
+		expect(keys(robot)).toEqual([
+			'created_at',
+			'created_by',
+			'created_by_email',
+			'description',
+			'id',
+			'name',
+			'org_id',
+			'tokens'
+		]);
+
+		// One live, one revoked -- and org_tokens.expires_at is NOT NULL, unlike
+		// every other credential expiry in the API.
+		const [live, revoked] = robot.tokens;
+		expect(live.revoked_at).toBeNull();
+		expect(revoked.revoked_at).not.toBeNull();
+		expect(live.expires_at).not.toBeNull();
+		expect('token' in live).toBe(false);
+		expect(live.token_prefix.startsWith('bkro_')).toBe(true);
+		// A robot deliberately outlives its creator: the FK behind created_by goes
+		// SET NULL, but created_by_email is a snapshot that survives it.
+		expect(revoked.created_by).toBe('');
+		expect(revoked.created_by_email).toBe('bo@acme.dev');
+	});
+
+	it('POST .../robots/{robot}/tokens is the one response carrying a secret', async () => {
+		const { decoded } = await serve(createdOrgTokenFixture, (fetch) =>
+			robotsApi.createOrgToken(
+				'acme',
+				'b2c3d4e5-5f6a-4b7c-8d9e-0f1a2b3c4d5e',
+				{ name: 'ci-2026', scope: 'write', expires_at: '2027-08-16T10:11:12.000Z' },
+				{ fetch }
+			)
+		);
+
+		expect(decoded.token.startsWith('bkro_')).toBe(true);
 	});
 
 	it('GET .../backends', async () => {
@@ -600,6 +706,46 @@ describe('request fixtures', () => {
 		expect(await bodyOf((fetch) => gcApi.triggerGCRun({ dry_run: true }, { fetch }))).toEqual(
 			reqTriggerGCRun
 		);
+	});
+
+	it('POST /user/tokens: "Never" omits expires_at entirely, not null', async () => {
+		// The interesting shape: `CreateUserTokenRequest.ExpiresAt` is a Go
+		// `*time.Time` with no `omitempty`, and the console's "Never" option
+		// (user/+page.svelte's expiresAtFromDays) returns `undefined` rather
+		// than `null` for it -- JSON.stringify drops an undefined key, so the
+		// wire body has no `expires_at` key at all. Both happen to decode the
+		// same way server-side; this pins the shape either was free to drift.
+		const body = await bodyOf((fetch) =>
+			tokensApi.createUserToken({ name: 'build-host-1', scope: 'write' }, { fetch })
+		);
+
+		expect(body).toEqual(reqCreateUserToken);
+		expect('expires_at' in (body as object)).toBe(false);
+	});
+
+	it('POST .../robots', async () => {
+		expect(
+			await bodyOf((fetch) =>
+				robotsApi.createRobot(
+					'acme',
+					{ name: 'ci-runner', description: 'Bazel remote cache for the CI fleet' },
+					{ fetch }
+				)
+			)
+		).toEqual(reqCreateRobot);
+	});
+
+	it('POST .../robots/{robot}/tokens: expires_at is REQUIRED, unlike a user token', async () => {
+		expect(
+			await bodyOf((fetch) =>
+				robotsApi.createOrgToken(
+					'acme',
+					'b2c3d4e5-5f6a-4b7c-8d9e-0f1a2b3c4d5e',
+					{ name: 'ci-2026', scope: 'write', expires_at: '2027-08-16T10:11:12.000Z' },
+					{ fetch }
+				)
+			)
+		).toEqual(reqCreateOrgToken);
 	});
 });
 
