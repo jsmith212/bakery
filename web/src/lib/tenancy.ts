@@ -85,3 +85,45 @@ export function resolveLanding(input: TenancyInput & { returnPath?: string | nul
 
 	return `${orgPath(org)}/projects`;
 }
+
+export interface NavScopeInput {
+	/** `page.params.org`, or `null` on a global screen (`/user`, `/gc`, ...). */
+	paramsOrg: string | null;
+	/** `page.params.project`, or `null` outside `/o/{org}/p/{project}/...`. */
+	paramsProject: string | null;
+	/** `GET /orgs` slugs -- the caller's live, authoritative visible set. */
+	visibleOrgs: string[];
+	rememberedOrg: string | null;
+	/** `storage.ts`'s `lastProject`, namespaced per org -- see its own doc. */
+	rememberedProject: (org: string) => string | null;
+}
+
+/**
+ * What `ConsoleNav`'s org/project switcher should show.
+ *
+ * The path wins whenever it has an answer -- that is what makes deep links
+ * and the back button correct. Only a segment the path leaves `null` falls
+ * back to the last-remembered scope, and only when it is still valid:
+ *
+ *  - `paramsOrg` absent -> fall back to `rememberedOrg`, but ONLY if it is
+ *    still in `visibleOrgs` (an org the caller lost access to must read
+ *    "none", not dangle a stale switcher entry forever).
+ *  - `paramsProject` absent -> fall back to the remembered project, but
+ *    ONLY when the org ALSO fell back. On `/o/acme/members` the missing
+ *    project param is legitimate (there is no project in that route) and
+ *    must read "none", not whatever project was last visited under a
+ *    DIFFERENT org -- `rememberedProject` is namespaced per org precisely
+ *    so this cannot happen even if this guard were removed.
+ */
+export function resolveNavScope(input: NavScopeInput): Tenancy {
+	const org =
+		input.paramsOrg ??
+		(input.rememberedOrg && input.visibleOrgs.includes(input.rememberedOrg)
+			? input.rememberedOrg
+			: null);
+
+	const project =
+		input.paramsProject ?? (input.paramsOrg ? null : org ? input.rememberedProject(org) : null);
+
+	return { org, project };
+}

@@ -24,7 +24,7 @@ export const load: LayoutLoad = async (event) => {
 		error(404, `no project ${event.params.project} in ${event.params.org}`);
 	}
 
-	setLastProject(project.slug);
+	setLastProject(event.params.org, project.slug);
 
 	return { project };
 };

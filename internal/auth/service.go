@@ -83,8 +83,22 @@ type Service struct {
 	// allowSelfServeOrgs: see Deps.AllowSelfServeOrgs. Read only by AuthConfig.
 	allowSelfServeOrgs bool
 
-	keys    keyStore
-	toucher *keyToucher
+	// The three credential tables, each behind a consumer-side interface so the hot
+	// path can be driven against a fake as well as a real Postgres, and each with
+	// its own coalescing last_used_at flusher.
+	keys       keyStore
+	userTokens userTokenStore
+	orgTokens  orgTokenStore
+
+	toucher          *keyToucher
+	userTokenToucher *keyToucher
+	orgTokenToucher  *keyToucher
+
+	// principals caches a user's LIVE role set, keyed by (user_id, authz_epoch).
+	// Only authenticateUserToken reads it -- the console's loadPrincipal stays
+	// uncached, because it is cold and a stale console is worse than a slow one.
+	// See principalcache.go for why the key carries the epoch.
+	principals *principalCache
 }
 
 // New builds the auth service.
@@ -102,7 +116,10 @@ func New(d Deps) (*Service, error) {
 		log = slog.Default()
 	}
 
-	keys := pgKeyStore{pool: d.Store.Pool()}
+	pool := d.Store.Pool()
+	keys := pgKeyStore{pool: pool}
+	userTokens := pgUserTokenStore{pool: pool}
+	orgTokens := pgOrgTokenStore{pool: pool}
 
 	// An absent mapping file IS a policy: "the IdP decides who authenticates, Bakery
 	// decides what they may do, and every role is an in-app grant." The empty
@@ -126,7 +143,12 @@ func New(d Deps) (*Service, error) {
 		devLogin:           d.DevLogin,
 		allowSelfServeOrgs: d.AllowSelfServeOrgs,
 		keys:               keys,
+		userTokens:         userTokens,
+		orgTokens:          orgTokens,
 		toucher:            newKeyToucher(keys),
+		userTokenToucher:   newToucher("user token", userTokens.touchUserTokens),
+		orgTokenToucher:    newToucher("org token", orgTokens.touchOrgTokens),
+		principals:         newPrincipalCache(),
 	}, nil
 }
 
@@ -364,13 +386,12 @@ func (s *Service) HandleLogout(w http.ResponseWriter, r *http.Request) {
 // re-deriving what a Principal is.
 func (s *Service) Authenticate(ctx context.Context, r *http.Request) (Principal, error) {
 	if token, ok := bearerToken(r); ok {
-		// One header, two credential kinds, told apart by the `bkry_` prefix. A key
-		// is not a JWT and a JWT is not a key, so there is no ambiguity to resolve.
-		if looksLikeAPIKey(token) {
-			p, err := s.authenticateKey(ctx, token)
-			s.observeErr(MethodAPIKey, err)
-
-			return p, err
+		// One header, two credential FAMILIES, told apart by the `bkr*_` prefix. A
+		// Bakery token is not a JWT and a JWT is not a Bakery token, so there is no
+		// ambiguity to resolve -- and within our family the prefix picks the table,
+		// so a bkru_ token presented as Bearer never probes api_keys.
+		if LooksLikeBakeryToken(token) {
+			return s.authenticateBakeryToken(ctx, token)
 		}
 
 		p, err := s.authenticateBearer(ctx, token)
@@ -431,18 +452,20 @@ func (s *Service) Authenticate(ctx context.Context, r *http.Request) (Principal,
 func (s *Service) AuthenticateCache(ctx context.Context, r *http.Request) (Principal, error) {
 	if user, pass, ok := r.BasicAuth(); ok {
 		// Prefer the password field (netrc, the documented client config) and fall
-		// back to the username field (URL-embedded credentials). looksLikeAPIKey is a
-		// cheap shape check, so a non-key in either field falls through to
-		// authenticateKey's own rejection rather than a second guess here.
+		// back to the username field (URL-embedded credentials).
+		//
+		// The field selection asks the FAMILY question (LooksLikeBakeryToken), never
+		// the api_keys one. Selecting with looksLikeAPIKey was correct while bkry_
+		// was the only credential, and became a silent bug the moment it was not: a
+		// stored bkru_ token presented as `Basic bakery:<token>` -- exactly what the
+		// CLI sends -- failed the bkry_-only shape test, fell back to the literal
+		// username "bakery", and 401'd with no way for the user to tell why.
 		token := pass
-		if !looksLikeAPIKey(token) {
+		if !LooksLikeBakeryToken(token) {
 			token = user
 		}
 
-		p, err := s.authenticateKey(ctx, token)
-		s.observeErr(MethodAPIKey, err)
-
-		return p, err
+		return s.authenticateBakeryToken(ctx, token)
 	}
 
 	return s.Authenticate(ctx, r)
@@ -575,14 +598,13 @@ type CreateKeyInput struct {
 // second probe on the sstate HEAD storm. Paid once, at human speed, instead of on
 // every request forever.
 func (s *Service) CreateAPIKey(ctx context.Context, p Principal, in CreateKeyInput) (NewAPIKey, repository.CreateAPIKeyRow, error) {
-	if p == nil {
-		return NewAPIKey{}, repository.CreateAPIKeyRow{}, ErrUnauthenticated
-	}
-
-	// An API key cannot mint another API key. Otherwise a read-scoped key for one
-	// project becomes a self-service credential factory.
-	if p.Method() == MethodAPIKey {
-		return NewAPIKey{}, repository.CreateAPIKeyRow{}, ErrKeyInvalid
+	// NO TOKEN MINTS A TOKEN. An API key, a personal access token and a robot are
+	// all refused: minting is an interactive act, always.
+	//
+	// CreateUserToken (usertoken.go) and CreateOrgToken (orgtoken.go) open with the
+	// same call, as their first statement. TestNoTokenMintsAToken drives all three.
+	if err := requireMintAuthority(p); err != nil {
+		return NewAPIKey{}, repository.CreateAPIKeyRow{}, err
 	}
 
 	// The membership FK means a key for a non-member cannot exist at all; reading

@@ -235,6 +235,39 @@ oci-conformance: generate
     fi; \
     echo "oci-conformance: containerd + crane + skopeo + the Docker Engine URL shape ran green" '
 
+# Run the shared storage conformance suite against BOTH drivers, S3 on a real minio (a skip FAILS)
+storage-conformance: generate
+  # Feedback wave 1's gate for the S3 driver. The suite in
+  # internal/storage/conformance_test.go is Store-interface-only and runs twice:
+  # against Local, and against a REAL minio the harness starts with `docker run`
+  # (path-style addressing, the mechanism DESIGN.md prescribes for
+  # minio/Ceph/Garage/R2).
+  #
+  # A FAKE S3 WOULD PASS EVERY ONE OF THESE TESTS AND PROVE NOTHING. What the
+  # driver has to get right IS S3's semantics -- read-after-write consistency, a
+  # DELETE of an absent key succeeding, a server-side copy, HeadObject's bodiless
+  # 404 -- and a fake agrees with whatever the driver happens to do.
+  #
+  # So a SKIP here is a failure, not a pass: it means the S3 half never ran a
+  # single assertion against real S3 semantics, which is exactly the trap every
+  # other conformance recipe documents. The suite skips (rather than fails) when
+  # it can find neither docker nor TEST_S3_ENDPOINT, which is right on a laptop
+  # and catastrophic in CI -- this recipe is where that distinction is made.
+  #
+  # bash + pipefail (not `sh`): with `sh` the exit status of `go test | tee` is
+  # TEE's, so a failing suite would report as a pass -- the same trap `test-db`,
+  # `conformance`, `hashserv-conformance`, `bazel-conformance` and
+  # `oci-conformance` document.
+  mkdir -p build
+  bash -euo pipefail -c ' \
+    go test -v -count=1 -race -timeout 15m ./internal/storage/... 2>&1 | tee build/storage-conformance.log; \
+    if grep -q -- "--- SKIP" build/storage-conformance.log; then \
+      grep -- "--- SKIP" build/storage-conformance.log; \
+      echo "FAIL: the storage conformance suite SKIPPED -- the S3 driver was never exercised against real S3 semantics. Ensure docker, or export TEST_S3_ENDPOINT / TEST_S3_ACCESS_KEY / TEST_S3_SECRET_KEY."; \
+      exit 1; \
+    fi; \
+    echo "storage-conformance: the shared suite ran green against local AND a real minio" '
+
 # Drive the REAL bakery binary + a real Chromium through the console (a skip FAILS)
 web-e2e: build
   # `build` gives this a fresh ./build/bakery, and playwright.config.ts's
@@ -311,13 +344,78 @@ db-up:
 db-down:
   -docker rm -f bakery-testdb
 
+# Validate the shipped k8s manifests against the Kubernetes API schema, plus
+# the three policy properties that a schema-valid manifest can still violate:
+# strategy: Recreate (feedback wave 1, spec section 7 -- see docs/deploy/k8s.md
+# for why RollingUpdate permanently wedges at replicas=1), a NetworkPolicy
+# actually shipping in the set (F8: a Service is discovery, not a firewall --
+# /metrics needs 0.0.0.0 to be reachable by its own Service, so the
+# NetworkPolicy is what keeps it off-limits to the rest of the cluster), and an
+# ipBlock allowance for the probe port (the kubelet is not in a namespace, so a
+# policy whose only allows are namespaceSelectors drops every health probe on
+# Calico/Weave/Antrea and CrashLoopBackOffs the pod).
+#
+# kubeconform via `go tool` (go.mod's tool directive), not a downloaded
+# platform release binary: it resolves through the same module-proxy cache
+# every other Go dependency does, and it needs no per-platform asset selection
+# logic.
+#
+# THE SCHEMAS ARE VENDORED (docs/deploy/schemas/) AND -schema-location POINTS AT
+# THEM. kubeconform's default schema location is raw.githubusercontent.com,
+# fetched per resource per run: this recipe is in `check`, the fastest and most
+# frequently run one and the CI job that gates everything else, so leaving it on
+# the network means `just check` hard-fails offline and a GitHub blip reds a
+# gate for a lint failure nobody wrote. See docs/deploy/schemas/README.md.
+#
+# THE SUMMARY GREP ASSERTS A POSITIVE COUNT AND A SKIP BUDGET, not merely the
+# absence of failures. With -ignore-missing-schemas a schema the catalog cannot
+# serve is Skipped, not Errored -- so `Valid: 0, Invalid: 0, Errors: 0,
+# Skipped: 8` matches "Invalid: 0, Errors: 0", exits 0, and reports success
+# having validated NOTHING. That is one -kubernetes-version bump or one schema
+# path change away at all times. The single tolerated skip is
+# servicemonitor.yaml, a Prometheus Operator CRD whose own controller validates
+# it at apply time; a second skip is a failure.
+k8s-check:
+  mkdir -p build
+  bash -euo pipefail -c ' \
+    go tool kubeconform -kubernetes-version 1.31.0 -strict -ignore-missing-schemas -summary \
+      -schema-location "docs/deploy/schemas/{{{{ .NormalizedKubernetesVersion }}-standalone{{{{ .StrictSuffix }}/{{{{ .ResourceKind }}{{{{ .KindSuffix }}.json" \
+      docs/deploy/k8s/*.yaml 2>&1 | tee build/k8s-check.log; \
+    grep -qE "Valid: [1-9][0-9]*, Invalid: 0, Errors: 0, Skipped: [01]$" build/k8s-check.log || { \
+      echo "FAIL: kubeconform validated nothing, skipped more than servicemonitor.yaml, or " \
+           "found an invalid manifest. A skip is NOT a pass: check that " \
+           "docs/deploy/schemas/ carries a schema for every kind shipped under " \
+           "docs/deploy/k8s/, at the -kubernetes-version this recipe pins"; \
+      exit 1; \
+    }; \
+    grep -A2 "^  strategy:" docs/deploy/k8s/deployment.yaml | grep -q "type: Recreate" || { \
+      echo "FAIL: deployment.yaml does not ship strategy: Recreate -- see docs/deploy/k8s.md " \
+           "for why the default RollingUpdate permanently wedges this singleton at replicas=1"; \
+      exit 1; \
+    }; \
+    grep -qr "^kind: NetworkPolicy" docs/deploy/k8s/ || { \
+      echo "FAIL: no NetworkPolicy manifest shipped -- the metrics Service is discovery, " \
+           "not a firewall, and 0.0.0.0:9090 is reachable by any pod in the cluster without one"; \
+      exit 1; \
+    }; \
+    grep -A6 "ipBlock:" docs/deploy/k8s/networkpolicy.yaml | grep -q "port: http" || { \
+      echo "FAIL: networkpolicy.yaml does not admit the probe port (http) from an ipBlock. " \
+           "Health probes come from the KUBELET on the node, not from a namespace, so a " \
+           "namespaceSelector cannot admit them: on Calico/Weave/Antrea every probe is " \
+           "dropped, the startupProbe burns its budget, and the pod CrashLoopBackOffs with " \
+           "a healthy process. See docs/deploy/k8s.md"; \
+      exit 1; \
+    }; \
+    echo "k8s-check: manifests are schema-valid (offline), Recreate, NetworkPolicy-guarded, " \
+         "and probe-reachable" '
+
 # Run all code checks
 #
 # web-test is in this list for SPEED, not coverage: vitest is already CI-gated
 # through `just coverage` in the build job, so this only moves a frontend
 # failure out of the slow job and into the fast one, where it costs half a
 # second instead of a full `go test -race`.
-check: check-format vet lint web-check web-test
+check: check-format vet lint web-check web-test k8s-check
 
 # Check the format of the code
 check-format:

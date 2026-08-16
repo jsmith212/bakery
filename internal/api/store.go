@@ -92,6 +92,28 @@ type Store interface {
 	) ([]repository.ListAPIKeysForProjectRow, error)
 	RevokeAPIKey(ctx context.Context, id pgtype.UUID) (int64, error)
 
+	// Personal access tokens. Same absence as above: no query here returns a hash.
+	//
+	// Both mutating queries are scoped by user_id IN THE STATEMENT, not by a check
+	// the handler remembers -- {id} is caller-supplied, and a revoke that took only
+	// an id would revoke any token in the installation given its uuid.
+	ListUserTokensForUser(
+		ctx context.Context, userID pgtype.UUID,
+	) ([]repository.ListUserTokensForUserRow, error)
+	RevokeUserToken(ctx context.Context, arg repository.RevokeUserTokenParams) (int64, error)
+
+	// Robots and their org tokens. Every query is scoped by org_id, which the guard
+	// resolved and authorized -- so a robot id from another tenant is simply not in
+	// the result and 404s, with no cross-tenant check for a handler to forget.
+	ListRobotsForOrg(ctx context.Context, orgID pgtype.UUID) ([]repository.Robot, error)
+	CreateRobot(ctx context.Context, arg repository.CreateRobotParams) (repository.Robot, error)
+	GetRobotForOrg(ctx context.Context, arg repository.GetRobotForOrgParams) (repository.Robot, error)
+	DeleteRobotForOrg(ctx context.Context, arg repository.DeleteRobotForOrgParams) (int64, error)
+	ListOrgTokensForOrg(
+		ctx context.Context, orgID pgtype.UUID,
+	) ([]repository.ListOrgTokensForOrgRow, error)
+	RevokeOrgToken(ctx context.Context, arg repository.RevokeOrgTokenParams) (int64, error)
+
 	// Cache backends. Reads go through ListBackendsForProject (a project has at most
 	// a handful of backends) so every row carries its full column set -- created_at
 	// and updated_at included. A single-kind GetBackend projection used to omit the
@@ -140,13 +162,24 @@ type Store interface {
 // to compile rather than at the first request.
 var _ Store = (*db.Store)(nil)
 
-// keyMinter mints an API key. It is an interface so the show-once semantics can be
-// tested against a fake, and so this package states its one privileged dependency
-// explicitly.
+// keyMinter mints a credential. It is an interface so the show-once semantics can
+// be tested against a fake, and so this package states its one privileged
+// dependency explicitly.
+//
+// All three mints live behind it, because all three share the one property that
+// makes them privileged: they are the only calls in the system that produce a
+// plaintext secret, and each refuses every non-interactive caller
+// (auth.requireMintAuthority) before doing anything else.
 type keyMinter interface {
 	CreateAPIKey(
 		ctx context.Context, p Principal, in auth.CreateKeyInput,
 	) (auth.NewAPIKey, repository.CreateAPIKeyRow, error)
+	CreateUserToken(
+		ctx context.Context, p Principal, in auth.CreateUserTokenInput,
+	) (auth.NewAPIKey, repository.CreateUserTokenRow, error)
+	CreateOrgToken(
+		ctx context.Context, p Principal, in auth.CreateOrgTokenInput,
+	) (auth.NewAPIKey, repository.CreateOrgTokenRow, error)
 }
 
 // errNotVerified is returned when something that is not a real, auth-issued
@@ -177,4 +210,26 @@ func (m serviceKeyMinter) CreateAPIKey(
 	}
 
 	return key, row, nil
+}
+
+func (m serviceKeyMinter) CreateUserToken(
+	ctx context.Context, p Principal, in auth.CreateUserTokenInput,
+) (auth.NewAPIKey, repository.CreateUserTokenRow, error) {
+	verified, ok := p.(auth.Principal)
+	if !ok {
+		return auth.NewAPIKey{}, repository.CreateUserTokenRow{}, errNotVerified
+	}
+
+	return m.svc.CreateUserToken(ctx, verified, in)
+}
+
+func (m serviceKeyMinter) CreateOrgToken(
+	ctx context.Context, p Principal, in auth.CreateOrgTokenInput,
+) (auth.NewAPIKey, repository.CreateOrgTokenRow, error) {
+	verified, ok := p.(auth.Principal)
+	if !ok {
+		return auth.NewAPIKey{}, repository.CreateOrgTokenRow{}, errNotVerified
+	}
+
+	return m.svc.CreateOrgToken(ctx, verified, in)
 }

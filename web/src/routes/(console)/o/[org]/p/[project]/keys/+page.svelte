@@ -203,6 +203,8 @@
 											>{formatDateTimeUTC(k.revoked_at)}</span
 										>
 									</div>
+								{:else if expiry.kind === 'expired'}
+									<Badge status="stale">expired</Badge>
 								{:else}
 									<Badge status="hit">live</Badge>
 								{/if}

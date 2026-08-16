@@ -314,8 +314,22 @@ func (a *API) mount(mux *http.ServeMux) {
 		a.raw(mux, AccessPublic, "POST "+p+"/auth/dev-login", a.auth.HandleDevLogin)
 	}
 
-	// ---- me
+	// ---- me. The ONE route every credential kind may reach, so `bakery whoami`
+	// works with a session, a key, a personal access token or a robot.
 	a.route(mux, AccessAuthenticated, "GET "+p+"/me", a.handleMe)
+
+	// ---- personal access tokens (`bkru_`).
+	//
+	// AccessUser: a verified HUMAN. A token that could list its owner's other tokens
+	// would hand a leaked credential a map of every credential that human holds, and
+	// one that could revoke them would hand it a denial of service -- neither needs a
+	// capability to be dangerous, so the door is shut rather than the capability.
+	//
+	// No {user} segment: a token is always the caller's, and the queries carry
+	// user_id in their own predicates so there is nothing to plumb another id into.
+	a.route(mux, AccessUser, "GET "+p+"/user/tokens", a.handleListUserTokens)
+	a.route(mux, AccessUser, "POST "+p+"/user/tokens", a.handleCreateUserToken)
+	a.route(mux, AccessUser, "DELETE "+p+"/user/tokens/{token}", a.handleRevokeUserToken)
 
 	// ---- site admins. HYBRID, like org membership: an OIDC half the reconciler owns
 	// and a local half these routes own.
@@ -337,7 +351,7 @@ func (a *API) mount(mux *http.ServeMux) {
 	a.route(mux, AccessSiteAdmin, "DELETE "+p+"/site-admins/{user}", a.handleDeleteSiteAdmin)
 
 	// ---- organizations
-	a.route(mux, AccessAuthenticated, "GET "+p+"/orgs", a.handleListOrgs)
+	a.route(mux, AccessUserScoped, "GET "+p+"/orgs", a.handleListOrgs)
 	// AccessUser, not AccessAuthenticated: creating an org grants the creator a local
 	// OWNER role on it, so an API key that could reach this route would become the
 	// owner of a brand-new tenant. AccessAuthenticated is the one level the guard
@@ -354,6 +368,20 @@ func (a *API) mount(mux *http.ServeMux) {
 	a.route(mux, AccessOrgView, "GET "+p+"/orgs/{org}/members", a.handleListOrgMembers)
 	a.route(mux, AccessOrgAdmin, "PUT "+p+"/orgs/{org}/members/{user}", a.handlePutOrgMember)
 	a.route(mux, AccessOrgAdmin, "DELETE "+p+"/orgs/{org}/members/{user}", a.handleDeleteOrgMember)
+
+	// ---- robots: org-owned machine identities and their `bkro_` tokens.
+	//
+	// AccessOrgAdmin throughout, and the control-plane door (methodMayReach) admits
+	// only an interactive human to that level -- so no token of any kind can manage
+	// robots. {robot} is resolved SCOPED BY THE ORG inside the handlers, exactly as
+	// the guard resolves {project}, so an id from another tenant 404s.
+	a.route(mux, AccessOrgAdmin, "GET "+p+"/orgs/{org}/robots", a.handleListRobots)
+	a.route(mux, AccessOrgAdmin, "POST "+p+"/orgs/{org}/robots", a.handleCreateRobot)
+	a.route(mux, AccessOrgAdmin, "DELETE "+p+"/orgs/{org}/robots/{robot}", a.handleDeleteRobot)
+	a.route(mux, AccessOrgAdmin, "POST "+p+"/orgs/{org}/robots/{robot}/tokens",
+		a.handleCreateOrgToken)
+	a.route(mux, AccessOrgAdmin, "DELETE "+p+"/orgs/{org}/robots/{robot}/tokens/{token}",
+		a.handleRevokeOrgToken)
 
 	// ---- projects
 	a.route(mux, AccessOrgView, "GET "+p+"/orgs/{org}/projects", a.handleListProjects)
@@ -373,16 +401,26 @@ func (a *API) mount(mux *http.ServeMux) {
 
 	// ---- API keys. Create returns the plaintext exactly once; nothing else ever
 	// returns it, and the schema cannot even store it.
+	//
+	// The two MUTATING routes are AccessProjectCredential, not AccessProjectRead:
+	// same capability floor (a reader may mint a read key), but a door no
+	// credential may come through. A leaked personal access token could otherwise
+	// list its owner's key ids here and DELETE each one -- no escalation, a clean
+	// denial of service against every CI job in the org, logged as its owner. The
+	// LISTING stays at ProjectRead: reading your own key metadata is what
+	// `bakery key list` does.
 	a.route(mux, AccessProjectRead, "GET "+p+"/orgs/{org}/projects/{project}/keys", a.handleListKeys)
-	a.route(mux, AccessProjectRead, "POST "+p+"/orgs/{org}/projects/{project}/keys", a.handleCreateKey)
-	a.route(mux, AccessProjectRead, "DELETE "+p+"/orgs/{org}/projects/{project}/keys/{key}",
+	a.route(mux, AccessProjectCredential, "POST "+p+"/orgs/{org}/projects/{project}/keys",
+		a.handleCreateKey)
+	a.route(mux, AccessProjectCredential, "DELETE "+p+"/orgs/{org}/projects/{project}/keys/{key}",
 		a.handleRevokeKey)
 
 	// ---- config-snippet generator. DESIGN.md's highest-value screen: it mints a key
-	// and emits a ready-to-paste client config with it embedded. ProjectRead is the
-	// floor -- the write-scope cap lives in auth.CreateAPIKey, exactly as for the raw
-	// key mint above -- so a reader can generate a read snippet but not a write one.
-	a.route(mux, AccessProjectRead, "POST "+p+"/orgs/{org}/projects/{project}/snippet",
+	// and emits a ready-to-paste client config with it embedded. AccessProjectCredential
+	// for the same reason as the mint above -- a project READER passes the capability
+	// check and gets a read snippet; the write-scope cap lives in auth.CreateAPIKey --
+	// and because a route that mints a credential must not be reachable BY one.
+	a.route(mux, AccessProjectCredential, "POST "+p+"/orgs/{org}/projects/{project}/snippet",
 		a.handleGenerateSnippet)
 
 	// ---- cache backends. Config rows only; no backend serves traffic in M1.

@@ -31,7 +31,7 @@ export function legacyTarget(ctx: LegacyContext, suffix: LegacySuffix): string {
 		me: ctx.me,
 		orgs: ctx.orgs,
 		lastOrg: lastOrg(),
-		lastProject: lastProject()
+		lastProject: lastProject(lastOrg())
 	});
 
 	if (!org) return '/orgs';

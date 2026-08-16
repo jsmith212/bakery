@@ -1,0 +1,31 @@
+# EXAMPLE ONLY. Routes the PUBLIC listener alone (service.yaml's http port).
+#
+# NEVER route /metrics or the gRPC port through this Ingress, or through any
+# Ingress at all. /metrics exposes every org and project slug and their
+# stored byte counts -- putting it behind a public HTTP path is handing the
+# customer list to anyone who can reach the cache, and it is exactly the
+# mistake the separate bakery-metrics Service (service-metrics.yaml) plus the
+# NetworkPolicy (networkpolicy.yaml) exist to make structurally hard to make.
+# gRPC (Bazel REAPI) is its own protocol on its own port for unrelated
+# reasons (see CLAUDE.md's h2c invariant) and does not belong behind an HTTP
+# Ingress either -- point remote Bazel/moon clients at the Service directly,
+# or a dedicated gRPC-aware Ingress/Gateway if your cluster needs one.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: bakery
+  labels:
+    app.kubernetes.io/name: bakery
+  annotations: {}
+spec:
+  rules:
+    - host: bakery.example.internal
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: bakery
+                port:
+                  name: http

@@ -1,10 +1,16 @@
 package api
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -188,6 +194,7 @@ func TestGuardAuthorizationMatrix(t *testing.T) {
 	patterns := map[Access]struct{ method, pattern, target string }{
 		AccessPublic:        {http.MethodGet, "GET /x", "/x"},
 		AccessAuthenticated: {http.MethodGet, "GET /x", "/x"},
+		AccessUserScoped:    {http.MethodGet, "GET /x", "/x"},
 		AccessUser:          {http.MethodPost, "POST /x", "/x"},
 		AccessSiteAdmin:     {http.MethodPost, "POST /x", "/x"},
 		AccessOrgView:       {http.MethodGet, "GET /orgs/{org}", "/orgs/acme"},
@@ -195,6 +202,9 @@ func TestGuardAuthorizationMatrix(t *testing.T) {
 		AccessOrgOwner:      {http.MethodDelete, "DELETE /orgs/{org}", "/orgs/acme"},
 		AccessProjectRead: {
 			http.MethodGet, "GET /orgs/{org}/projects/{project}", "/orgs/acme/projects/firmware",
+		},
+		AccessProjectCredential: {
+			http.MethodPut, "PUT /orgs/{org}/projects/{project}", "/orgs/acme/projects/firmware",
 		},
 		AccessProjectAdmin: {
 			http.MethodPost, "POST /orgs/{org}/projects/{project}", "/orgs/acme/projects/firmware",
@@ -211,6 +221,15 @@ func TestGuardAuthorizationMatrix(t *testing.T) {
 			"anonymous": anon, "site_admin": allow, "org_owner": allow, "org_admin": allow,
 			"org_member": allow, "proj_admin": allow, "proj_write": allow, "proj_read": allow,
 			"outsider": allow, "api_key": allow,
+		},
+		// Acts-as-a-user. Every human role passes and so would a personal access token;
+		// an API key does not, because its answer would be an empty list it had no
+		// business asking for -- and because "a robot reaches /me and nothing else"
+		// has to be true of the shipped route table, not just of the door's table.
+		AccessUserScoped: {
+			"anonymous": anon, "site_admin": allow, "org_owner": allow, "org_admin": allow,
+			"org_member": allow, "proj_admin": allow, "proj_write": allow, "proj_read": allow,
+			"outsider": allow, "api_key": denied,
 		},
 		// A verified HUMAN. Every role passes; an API KEY does not, and that is the
 		// whole reason the level exists: the one route on it (creating an org) hands
@@ -241,6 +260,15 @@ func TestGuardAuthorizationMatrix(t *testing.T) {
 			"outsider": hidden, "api_key": denied,
 		},
 		AccessProjectRead: {
+			"anonymous": anon, "site_admin": allow, "org_owner": allow, "org_admin": allow,
+			"org_member": allow, "proj_admin": allow, "proj_write": allow, "proj_read": allow,
+			"outsider": hidden, "api_key": denied,
+		},
+		// The CAPABILITY floor is CanReadProject, identical to AccessProjectRead
+		// above: a project reader may mint a read-scoped key for themselves, and the
+		// write cap lives in auth.CreateAPIKey. What this level narrows is the DOOR
+		// -- see TestControlPlaneDoorIsAnAllowlist and TestUserTokenCannotManageAPIKeys.
+		AccessProjectCredential: {
 			"anonymous": anon, "site_admin": allow, "org_owner": allow, "org_admin": allow,
 			"org_member": allow, "proj_admin": allow, "proj_write": allow, "proj_read": allow,
 			"outsider": hidden, "api_key": denied,
@@ -309,7 +337,7 @@ func TestEveryAccessIsInTheMatrix(t *testing.T) {
 	}
 
 	// If someone appends a constant after AccessProjectAdmin, this catches it.
-	if AccessProjectAdmin+1 != 9 {
+	if AccessProjectAdmin+1 != 11 {
 		t.Errorf("a new Access constant was added: extend patterns{} and matrix{} in "+
 			"TestGuardAuthorizationMatrix, then update this bound. Highest is now %d",
 			int(AccessProjectAdmin)+1)
@@ -517,5 +545,487 @@ func TestStateChangingRequestsRequireJSON(t *testing.T) {
 				t.Errorf("status = %d, want %d", w.Code, tt.want)
 			}
 		})
+	}
+}
+
+// TestControlPlaneDoorIsAnAllowlist is the api layer's half of the allowlist
+// inversion, stated as a full table: every Method x every Access, allowed or
+// refused, with no zero-valued row.
+//
+// The guard used to ask `p.Method() == auth.MethodAPIKey`, which is a denylist:
+// declaring a new credential kind admitted it to the ENTIRE control plane by
+// default -- member lists, key rosters, org settings -- with no compiler error and
+// no failing test. A robot token minted for CI would have been able to enumerate
+// every project's members on the day the constant landed.
+//
+// The principals below are deliberately maximal (site admin, org owner, project
+// admin) and their capability methods are the fake's, not production's. Even so
+// they must be stopped at the door where the table says so: this gate runs BEFORE
+// any capability is consulted, which is what makes it a policy rather than a
+// second opinion.
+//
+// The three rows are the product decision, in one place:
+//
+//   - a session/bearer/dev human: everything;
+//   - a personal access token: the READ ladder, because it acts as its owner and
+//     `bakery org list` is the friction it exists to remove -- but never the
+//     admin ladder, never AccessUser (creating an org grants the creator a local
+//     OWNER role) and never site admin;
+//   - an API key and a robot: /me and nothing else, so `bakery whoami` can verify
+//     a credential without performing a push.
+func TestControlPlaneDoorIsAnAllowlist(t *testing.T) {
+	acme := mustUUID(t, orgAcmeID)
+	firmware := mustUUID(t, projFirmwareID)
+
+	// Every Access, with a pattern the guard can actually resolve.
+	routes := map[Access]struct{ method, pattern, target string }{
+		AccessAuthenticated: {http.MethodGet, "GET /me", "/me"},
+		AccessUserScoped:    {http.MethodGet, "GET /x", "/x"},
+		AccessUser:          {http.MethodGet, "GET /x", "/x"},
+		AccessSiteAdmin:     {http.MethodGet, "GET /x", "/x"},
+		AccessOrgView:       {http.MethodGet, "GET /orgs/{org}", "/orgs/acme"},
+		AccessOrgAdmin:      {http.MethodGet, "GET /orgs/{org}", "/orgs/acme"},
+		AccessOrgOwner:      {http.MethodGet, "GET /orgs/{org}", "/orgs/acme"},
+		AccessProjectRead: {
+			http.MethodGet, "GET /orgs/{org}/projects/{project}", "/orgs/acme/projects/firmware",
+		},
+		AccessProjectCredential: {
+			http.MethodGet, "GET /orgs/{org}/projects/{project}", "/orgs/acme/projects/firmware",
+		},
+		AccessProjectAdmin: {
+			http.MethodGet, "GET /orgs/{org}/projects/{project}", "/orgs/acme/projects/firmware",
+		},
+	}
+
+	// `true` means the DOOR admits this method at this level. It does not mean the
+	// request succeeds -- the capability check still runs afterwards.
+	door := controlPlaneDoorTable()
+
+	store := fixtureStore(t)
+	a := testAPI(t, store, nil)
+
+	for method, expected := range door {
+		principal := &fakePrincipal{
+			userID: mustUUID(t, userAnnaID), email: "anna@example.com", displayName: "Anna",
+			method: method, siteRole: auth.SiteRoleAdmin,
+			orgs:     map[pgtype.UUID]auth.OrgRole{acme: auth.OrgRoleOwner},
+			projects: map[pgtype.UUID]auth.ProjectRole{firmware: auth.ProjectRoleAdmin},
+			key:      nil, robot: nil, maxScope: auth.ScopeWrite,
+		}
+
+		for access, route := range routes {
+			admit, stated := expected[access]
+			if !stated {
+				t.Fatalf("%s has no entry for %s; every Method must state every Access",
+					method, access)
+			}
+
+			t.Run(string(method)+"/"+access.String(), func(t *testing.T) {
+				var reached bool
+
+				mux := http.NewServeMux()
+				mux.HandleFunc(route.pattern,
+					a.guard(access, func(w http.ResponseWriter, _ *http.Request) error {
+						reached = true
+						w.WriteHeader(http.StatusOK)
+
+						return nil
+					}))
+
+				r := httptest.NewRequest(route.method, route.target, nil)
+				r = r.WithContext(withPrincipal(r.Context(), principal))
+
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, r)
+
+				if admit {
+					if w.Code != allow || !reached {
+						t.Errorf("status = %d (reached %v), want 200: the door refused a credential "+
+							"the table admits (body %s)", w.Code, reached, strings.TrimSpace(w.Body.String()))
+					}
+
+					return
+				}
+
+				if w.Code != denied {
+					t.Errorf("status = %d, want %d: a credential reached a level the table refuses "+
+						"(body %s)", w.Code, denied, strings.TrimSpace(w.Body.String()))
+				}
+
+				if reached {
+					t.Error("the handler ran for a credential the door refuses")
+				}
+			})
+		}
+	}
+}
+
+// declaredAuthMethods reads every `Method` constant out of internal/auth's
+// source, so the door tests cannot be driven by a hand-written list.
+//
+// It is the api-side twin of internal/auth's own declaredMethods, duplicated
+// rather than exported because a test helper is not part of a package's API --
+// and this seam is exactly where the duplication has to be paid. internal/auth
+// declares the Methods; internal/api decides which doors each may come through.
+// A gate on the second half that restates the first half's list fails in
+// precisely the case it exists to catch: declaring MethodDeployKey in
+// internal/auth must fail a test in THIS package with no edit here.
+//
+// The whole PACKAGE is scanned, not principal.go alone: credential code in
+// internal/auth is already spread over five files, so a Method declared beside
+// its own validator would otherwise be invisible.
+func declaredAuthMethods(t *testing.T) []auth.Method {
+	t.Helper()
+
+	dir := filepath.Join("..", "auth")
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+
+	fset := token.NewFileSet()
+
+	var out []auth.Method
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+
+		file, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+
+		for _, decl := range file.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.CONST {
+				continue
+			}
+
+			for _, spec := range gen.Specs {
+				value, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+
+				ident, ok := value.Type.(*ast.Ident)
+				if !ok || ident.Name != "Method" || len(value.Values) == 0 {
+					continue
+				}
+
+				lit, ok := value.Values[0].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					t.Fatalf("Method constant %v is not a string literal; the scan cannot read it",
+						value.Names)
+				}
+
+				unquoted, err := strconv.Unquote(lit.Value)
+				if err != nil {
+					t.Fatalf("unquote %s: %v", lit.Value, err)
+				}
+
+				out = append(out, auth.Method(unquoted))
+			}
+		}
+	}
+
+	if len(out) == 0 {
+		t.Fatal("found no auth.Method constants; the source scan has lost its inputs")
+	}
+
+	return out
+}
+
+// TestEveryMethodIsInTheControlPlaneDoor fails when a Method is declared without
+// a decision about which doors it may come through.
+//
+// methodMayReach's switch has no default arm and a trailing `return false`, so an
+// unclassified Method is refused everywhere -- fail-closed, which is right. This
+// makes it LOUD as well, so a new credential kind cannot silently ship with no
+// control-plane access at all when it was meant to have some.
+//
+// IT IS DRIVEN BY THE SOURCE, not by a literal. The previous shape declared its
+// own six-entry map and then ranged over it, so declaring a Method in
+// internal/auth changed nothing here -- the test its own doc-comment describes
+// did not exist. It also checks the ALLOWLIST TABLE in
+// TestControlPlaneDoorIsAnAllowlist above, which is the table that says what each
+// credential may actually reach; a Method missing from it has no per-level
+// assertion at all.
+func TestEveryMethodIsInTheControlPlaneDoor(t *testing.T) {
+	declared := declaredAuthMethods(t)
+
+	for _, m := range declared {
+		if !methodMayReach(m, AccessAuthenticated) {
+			t.Errorf("%s cannot reach /me; every credential must be able to verify itself.\n"+
+				"A newly declared Method is refused everywhere by methodMayReach's trailing "+
+				"`return false` -- fail-closed, and deliberately loud here: add an arm for it.", m)
+		}
+
+		if _, stated := controlPlaneDoorTable()[m]; !stated {
+			t.Errorf("%s has no row in the door table.\n"+
+				"Add one to controlPlaneDoorTable so TestControlPlaneDoorIsAnAllowlist "+
+				"asserts what this credential may reach at every Access level.", m)
+		}
+	}
+
+	// An unrecognised Method is refused at every level, including /me.
+	for access := AccessPublic; access <= AccessProjectAdmin; access++ {
+		if access == AccessPublic {
+			continue
+		}
+
+		if methodMayReach(auth.Method("brand_new_credential"), access) {
+			t.Errorf("an unclassified Method reached %s; the door is not an allowlist", access)
+		}
+	}
+}
+
+// TestRobotRejectedOnEveryAPIRouteExceptMe drives the REAL route table.
+//
+// The two tests above assert the door's table; this one asserts that the table is
+// what the shipped routes are actually behind. It walks every registered route,
+// presents a maximal robot principal, and requires a refusal everywhere but
+// GET /me -- at the ROUTER SEAM, before any handler runs, which is why the
+// assertion is on `reached` as much as on the status.
+//
+// It needs no per-route knowledge and no maintenance: a route added tomorrow is
+// covered the moment it is registered.
+func TestRobotRejectedOnEveryAPIRouteExceptMe(t *testing.T) {
+	acme := mustUUID(t, orgAcmeID)
+	firmware := mustUUID(t, projFirmwareID)
+
+	robot := &fakePrincipal{
+		userID: pgtype.UUID{}, email: "", displayName: "",
+		method: auth.MethodOrgToken, siteRole: auth.SiteRoleAdmin,
+		// Deliberately maximal in every field a robot cannot really have, so that a
+		// leak through any capability branch shows up as an allow.
+		orgs:     map[pgtype.UUID]auth.OrgRole{acme: auth.OrgRoleOwner},
+		projects: map[pgtype.UUID]auth.ProjectRole{firmware: auth.ProjectRoleAdmin},
+		key:      nil,
+		robot:    &auth.RobotGrant{RobotID: uuidOf("robot"), OrgID: acme, Scope: auth.ScopeWrite},
+		maxScope: auth.ScopeWrite,
+	}
+
+	store := fixtureStore(t)
+	a := testAPI(t, store, nil)
+	a.mount(http.NewServeMux())
+
+	// Path values the guard needs, substituted into each registered pattern.
+	values := strings.NewReplacer(
+		"{org}", "acme",
+		"{project}", "firmware",
+		"{user}", "anna@example.com",
+		"{key}", keyAnnaID,
+		"{token}", keyAnnaID,
+		"{robot}", keyAnnaID,
+		"{kind}", "sstate",
+		"{id}", "1",
+	)
+
+	for _, spec := range a.routes {
+		if spec.Access == AccessPublic {
+			continue // no credential is consulted at all
+		}
+
+		t.Run(spec.Pattern, func(t *testing.T) {
+			method, pattern, ok := strings.Cut(spec.Pattern, " ")
+			if !ok {
+				t.Fatalf("route %q has no method", spec.Pattern)
+			}
+
+			var reached bool
+
+			mux := http.NewServeMux()
+			mux.HandleFunc(spec.Pattern,
+				a.guard(spec.Access, func(w http.ResponseWriter, _ *http.Request) error {
+					reached = true
+					w.WriteHeader(http.StatusOK)
+
+					return nil
+				}))
+
+			r := httptest.NewRequest(method, values.Replace(pattern), nil)
+			r.Header.Set("Content-Type", "application/json")
+			r = r.WithContext(withPrincipal(r.Context(), robot))
+
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, r)
+
+			isMe := pattern == Prefix+"/me"
+
+			if isMe {
+				if w.Code != allow || !reached {
+					t.Errorf("GET /me = %d (reached %v), want 200: a robot must be able to verify "+
+						"its own token without performing a push", w.Code, reached)
+				}
+
+				return
+			}
+
+			if w.Code != denied || reached {
+				t.Errorf("status = %d (reached %v), want %d and no handler: a robot reached a "+
+					"control-plane route (body %s)",
+					w.Code, reached, denied, strings.TrimSpace(w.Body.String()))
+			}
+		})
+	}
+}
+
+// TestUserTokenCannotManageAPIKeys drives the REAL route table with a personal
+// access token and asserts the credential-management routes are shut at the door.
+//
+// The rule is stated twice in this wave -- usertokens.go's "a token that could
+// REVOKE them would hand it a denial of service" and api.go's `/user/tokens`
+// being AccessUser -- and the API keys under a project are the same class of
+// object as the tokens under a user. Before AccessProjectCredential existed the
+// three credential routes sat at AccessProjectRead, which the door deliberately
+// opens to a PAT: the two mints were refused one layer in by requireMintAuthority,
+// and the REVOKE was refused nowhere at all. `keys.go`'s owner check passes for a
+// PAT because a PAT's UserID() IS its owner's, so a leaked token could enumerate
+// its owner's key ids (GET .../keys, which stays open on purpose) and delete every
+// one of them -- no escalation, and every CI job in the org broken, attributed to
+// the owner.
+//
+// The assertion is on `reached` as much as on the status: this must be refused at
+// the router seam, before any handler or any inner check runs.
+func TestUserTokenCannotManageAPIKeys(t *testing.T) {
+	acme := mustUUID(t, orgAcmeID)
+	firmware := mustUUID(t, projFirmwareID)
+
+	// Maximal in every field, so a leak through any capability branch shows up as
+	// an allow rather than as a coincidence of this principal being weak.
+	pat := &fakePrincipal{
+		userID: mustUUID(t, userAnnaID), email: "anna@example.com", displayName: "Anna",
+		method: auth.MethodUserToken, siteRole: auth.SiteRoleAdmin,
+		orgs:     map[pgtype.UUID]auth.OrgRole{acme: auth.OrgRoleOwner},
+		projects: map[pgtype.UUID]auth.ProjectRole{firmware: auth.ProjectRoleAdmin},
+		key:      nil, robot: nil, maxScope: auth.ScopeWrite,
+	}
+
+	// The three routes that MINT or REVOKE a credential, and the one that merely
+	// lists metadata -- which stays reachable, because that is what `bakery key
+	// list` does with a PAT and it hands a leaked token nothing it did not have.
+	cases := map[string]bool{
+		"POST " + Prefix + "/orgs/{org}/projects/{project}/keys":         false,
+		"DELETE " + Prefix + "/orgs/{org}/projects/{project}/keys/{key}": false,
+		"POST " + Prefix + "/orgs/{org}/projects/{project}/snippet":      false,
+		"GET " + Prefix + "/orgs/{org}/projects/{project}/keys":          true,
+	}
+
+	store := fixtureStore(t)
+	a := testAPI(t, store, nil)
+	a.mount(http.NewServeMux())
+
+	values := strings.NewReplacer(
+		"{org}", "acme",
+		"{project}", "firmware",
+		"{key}", keyAnnaID,
+	)
+
+	// Every case must name a route that is actually registered: a test that
+	// silently stops covering a renamed route is worse than no test.
+	registered := map[string]Access{}
+	for _, spec := range a.routes {
+		registered[spec.Pattern] = spec.Access
+	}
+
+	for pattern, admit := range cases {
+		access, ok := registered[pattern]
+		if !ok {
+			t.Fatalf("%q is not a registered route; this test has drifted from the route table", pattern)
+		}
+
+		t.Run(pattern, func(t *testing.T) {
+			method, path, ok := strings.Cut(pattern, " ")
+			if !ok {
+				t.Fatalf("route %q has no method", pattern)
+			}
+
+			var reached bool
+
+			mux := http.NewServeMux()
+			mux.HandleFunc(pattern, a.guard(access, func(w http.ResponseWriter, _ *http.Request) error {
+				reached = true
+				w.WriteHeader(http.StatusOK)
+
+				return nil
+			}))
+
+			r := httptest.NewRequest(method, values.Replace(path), nil)
+			r.Header.Set("Content-Type", "application/json")
+			r = r.WithContext(withPrincipal(r.Context(), pat))
+
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, r)
+
+			if admit {
+				if w.Code != allow || !reached {
+					t.Errorf("status = %d (reached %v), want 200: reading your own key metadata "+
+						"with a personal access token is what `bakery key list` does (body %s)",
+						w.Code, reached, strings.TrimSpace(w.Body.String()))
+				}
+
+				return
+			}
+
+			if w.Code != denied || reached {
+				t.Errorf("status = %d (reached %v), want %d and no handler: a personal access "+
+					"token reached a credential-management route (body %s)",
+					w.Code, reached, denied, strings.TrimSpace(w.Body.String()))
+			}
+		})
+	}
+}
+
+// controlPlaneDoorTable is THE PRODUCT DECISION, in one place: which Access
+// levels each credential kind may come through at all.
+//
+// It is a function rather than a literal inside one test because TWO tests need
+// it: TestControlPlaneDoorIsAnAllowlist asserts each row against the real guard,
+// and TestEveryMethodIsInTheControlPlaneDoor asserts that every Method declared
+// in internal/auth HAS a row here. A table only one of them can see is a table
+// the other cannot police -- which is how the door test came to restate its own
+// six-entry list and stop noticing new credentials altogether.
+func controlPlaneDoorTable() map[auth.Method]map[Access]bool {
+	return map[auth.Method]map[Access]bool{
+		auth.MethodSession: {
+			AccessAuthenticated: true, AccessUserScoped: true, AccessUser: true,
+			AccessSiteAdmin: true, AccessOrgView: true, AccessOrgAdmin: true,
+			AccessOrgOwner: true, AccessProjectRead: true, AccessProjectCredential: true,
+			AccessProjectAdmin: true,
+		},
+		auth.MethodBearer: {
+			AccessAuthenticated: true, AccessUserScoped: true, AccessUser: true,
+			AccessSiteAdmin: true, AccessOrgView: true, AccessOrgAdmin: true,
+			AccessOrgOwner: true, AccessProjectRead: true, AccessProjectCredential: true,
+			AccessProjectAdmin: true,
+		},
+		auth.MethodDev: {
+			AccessAuthenticated: true, AccessUserScoped: true, AccessUser: true,
+			AccessSiteAdmin: true, AccessOrgView: true, AccessOrgAdmin: true,
+			AccessOrgOwner: true, AccessProjectRead: true, AccessProjectCredential: true,
+			AccessProjectAdmin: true,
+		},
+		auth.MethodUserToken: {
+			AccessAuthenticated: true, AccessUserScoped: true, AccessUser: false,
+			AccessSiteAdmin: false, AccessOrgView: true, AccessOrgAdmin: false,
+			AccessOrgOwner: false, AccessProjectRead: true, AccessProjectCredential: false,
+			AccessProjectAdmin: false,
+		},
+		auth.MethodAPIKey: {
+			AccessAuthenticated: true, AccessUserScoped: false, AccessUser: false,
+			AccessSiteAdmin: false, AccessOrgView: false, AccessOrgAdmin: false,
+			AccessOrgOwner: false, AccessProjectRead: false, AccessProjectCredential: false,
+			AccessProjectAdmin: false,
+		},
+		auth.MethodOrgToken: {
+			AccessAuthenticated: true, AccessUserScoped: false, AccessUser: false,
+			AccessSiteAdmin: false, AccessOrgView: false, AccessOrgAdmin: false,
+			AccessOrgOwner: false, AccessProjectRead: false, AccessProjectCredential: false,
+			AccessProjectAdmin: false,
+		},
 	}
 }

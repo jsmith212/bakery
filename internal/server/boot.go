@@ -114,7 +114,8 @@ func Boot(ctx context.Context, p BootParams) error {
 	// they are only coherent if exactly one process writes this database. A second
 	// instance is refused, loudly, unless the operator has explicitly asserted that
 	// they know what they are doing.
-	lock, err := db.AcquireBootLock(ctx, bootPool)
+	lock, err := acquireBootLockWithWait(ctx, cmd.BootLockWait, bootLockRetryInterval, log,
+		func(ctx context.Context) (*db.BootLock, error) { return db.AcquireBootLock(ctx, bootPool) })
 
 	switch {
 	case errors.Is(err, db.ErrLocked) && cmd.AllowMultiInstance:
@@ -160,20 +161,17 @@ func Boot(ctx context.Context, p BootParams) error {
 		return fmt.Errorf("register pool collector: %w", err)
 	}
 
-	// The byte store. Constructing it here is load-bearing even though no cache
-	// backend reads it yet in M1: NewLocal creates and probes --storage-dir, so a
-	// typo'd or unwritable path is a LOUD boot failure rather than an EACCES the
-	// first time M2 tries to write an object into a directory that was never
-	// there. The instrumented decorator both times every future storage call and
-	// makes bakery_storage_operations_total exist from boot.
-	localStore, err := storage.NewLocal(cmd.StorageDir)
+	// The byte store. Constructing it here is load-bearing: each driver's
+	// constructor PROBES its store -- NewLocal creates and probes --storage-dir,
+	// NewS3 resolves the credential chain and HeadBuckets the bucket -- so a
+	// typo'd path, an unwritable directory, a misspelled bucket or a credential
+	// chain with nowhere to go is a LOUD boot failure rather than a 500 on the
+	// first cache write, hours later. The instrumented decorator times every
+	// storage call and makes bakery_storage_operations_total exist from boot.
+	byteStore, err := buildStorage(ctx, cmd, m, log)
 	if err != nil {
-		return fmt.Errorf("prepare storage directory: %w", err)
+		return err
 	}
-
-	byteStore := storage.NewInstrumented(localStore, m, metrics.DriverLocal)
-
-	log.Info("storage ready", "driver", metrics.DriverLocal, "root", localStore.Root())
 
 	store := db.NewStore(pool)
 
@@ -506,6 +504,73 @@ func Boot(ctx context.Context, p BootParams) error {
 // It returns on ctx.Done() so an ordinary shutdown does not leave it behind, and it
 // is a no-op for a nil channel, which is what a --allow-multi-instance boot (no
 // lock, no watcher) hands it.
+// bootLockRetryInterval is how often a --boot-lock-wait poll retries.
+const bootLockRetryInterval = 2 * time.Second
+
+// acquireBootLockWithWait tries once, then -- only if it lost the race AND
+// the operator opted in with --boot-lock-wait -- polls every interval until
+// it wins, ctx is canceled, or the wait budget runs out. try is injected
+// (Boot passes db.AcquireBootLock closed over the bootstrap pool) so this is
+// unit-testable without a database.
+//
+// This is NOT a substitute for `strategy: Recreate`, and must never be
+// documented as one: it rescues the timing hazards where the LOCK HOLDER is
+// on its way out (a node drain/eviction outside the tidy SIGTERM sequence, a
+// slow-terminating old pod still inside its grace period) -- it cannot
+// rescue a k8s Deployment left on the default `RollingUpdate` strategy. At
+// replicas=1 the default maxSurge=1/maxUnavailable=0 makes k8s start the NEW
+// pod before killing the old one, so the new pod's wait contends with a
+// holder that is itself healthy and waiting on the new pod to become Ready
+// -- a circular wait no finite timeout resolves. The error text at budget
+// exhaustion names RollingUpdate as the likely cause; docs/deploy/k8s.md
+// spells out the trace.
+func acquireBootLockWithWait(
+	ctx context.Context,
+	wait, interval time.Duration,
+	log *slog.Logger,
+	try func(ctx context.Context) (*db.BootLock, error),
+) (*db.BootLock, error) {
+	lock, err := try(ctx)
+	if !errors.Is(err, db.ErrLocked) || wait <= 0 {
+		return lock, err
+	}
+
+	deadline := time.Now().Add(wait)
+	ticker := time.NewTicker(interval)
+
+	defer ticker.Stop()
+
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, fmt.Errorf(
+				"boot lock still held by another instance after waiting %s: if the "+
+					"deployment strategy is RollingUpdate, this will never resolve on its "+
+					"own -- the new pod is waiting on a holder that is itself healthy and "+
+					"waiting on the new pod to become Ready. Use `strategy: Recreate`. (%w)",
+				wait, db.ErrLocked)
+		}
+
+		log.Warn("boot lock still held by another instance; retrying",
+			"interval", interval, "remaining", remaining)
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+
+		lock, err = try(ctx)
+		if err == nil {
+			return lock, nil
+		}
+
+		if !errors.Is(err, db.ErrLocked) {
+			return nil, err
+		}
+	}
+}
+
 func watchBootLock(ctx context.Context, lost <-chan struct{}, stop context.CancelFunc, log *slog.Logger) {
 	if lost == nil {
 		return
@@ -644,6 +709,65 @@ func (ociUpstreamDisabled) Blob(
 	}
 
 	return nil, 0, oci.ErrUpstreamNotFound
+}
+
+// buildStorage selects the byte store from --storage-driver and probes it.
+//
+// The switch is exhaustive over the Kong enum (`local,s3`), and the default arm
+// is an ERROR rather than a fallback to Local: a deployment that asked for s3,
+// hit a typo Kong somehow admitted, and silently got a local directory would
+// serve a cold cache from an empty disk forever while looking perfectly healthy.
+//
+// Each arm logs the driver it built with the fields an operator needs to tell
+// "the wrong store" from "an empty store" in the first ten seconds of an
+// incident.
+func buildStorage(
+	ctx context.Context, cmd config.ServeCmd, m *metrics.Metrics, log *slog.Logger,
+) (*storage.Instrumented, error) {
+	switch cmd.StorageDriver {
+	case metrics.DriverS3:
+		s3Store, err := storage.NewS3(ctx, storage.S3Config{
+			Bucket:         cmd.S3Bucket,
+			Region:         cmd.S3Region,
+			Endpoint:       cmd.S3Endpoint,
+			ForcePathStyle: cmd.S3ForcePathStyle,
+			Prefix:         cmd.S3Prefix,
+			HTTPClient:     nil,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("prepare s3 storage: %w", err)
+		}
+
+		log.Info("storage ready",
+			"driver", metrics.DriverS3,
+			"bucket", s3Store.Bucket(),
+			"prefix", s3Store.Prefix(),
+			"endpoint", cmd.S3Endpoint,
+			"path_style", cmd.S3ForcePathStyle,
+		)
+
+		return storage.NewInstrumented(s3Store, m, metrics.DriverS3), nil
+
+	// "" is the ZERO VALUE, not an operator's choice: Kong stamps the
+	// `default:"local"` on every parsed ServeCmd and its enum refuses an empty
+	// --storage-driver outright, so an empty string can only reach here from a
+	// hand-built struct (the boot tests, an embedder). Folding it into local is
+	// what keeps TestBootRejectsAnUnusableStorageDir proving what it claims
+	// instead of passing on this function's error message.
+	case metrics.DriverLocal, "":
+		localStore, err := storage.NewLocal(cmd.StorageDir)
+		if err != nil {
+			return nil, fmt.Errorf("prepare storage directory: %w", err)
+		}
+
+		log.Info("storage ready", "driver", metrics.DriverLocal, "root", localStore.Root())
+
+		return storage.NewInstrumented(localStore, m, metrics.DriverLocal), nil
+
+	default:
+		return nil, fmt.Errorf("unknown storage driver %q: want %q or %q",
+			cmd.StorageDriver, metrics.DriverLocal, metrics.DriverS3)
+	}
 }
 
 // buildAuth assembles the auth service: the pgxpool-backed session store, the

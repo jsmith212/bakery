@@ -38,7 +38,7 @@ export const load: PageLoad = async (event) => {
 			orgs: orgs.items,
 			returnPath: takeReturnPath(),
 			lastOrg: lastOrg(),
-			lastProject: lastProject()
+			lastProject: lastProject(lastOrg())
 		})
 	);
 };

@@ -1,0 +1,4 @@
+{
+  "name": "ci-runner",
+  "description": "Bazel remote cache for the CI fleet"
+}

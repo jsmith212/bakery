@@ -270,6 +270,208 @@ func TestTokenStale(t *testing.T) {
 	}
 }
 
+// TestCredentialsFileBackcompat is the load-bearing test in this widening: an
+// EXISTING credentials.json, written by a version of this CLI that predates
+// user tokens and robot/project keys, must parse UNCHANGED. serverCreds embeds
+// Token anonymously precisely so this file's shape -- id_token/access_token/
+// refresh_token/expiry, nothing else -- decodes straight into the promoted
+// fields, with UserToken and Keys simply absent. No forced re-login on upgrade.
+func TestCredentialsFileBackcompat(t *testing.T) {
+	store, home := tempStore(t)
+
+	dir := filepath.Join(home, "bakery")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// The pre-widening shape, verbatim: one server, one OIDC session, no
+	// user_token or keys field at all -- because those did not exist yet.
+	old := `{
+		"servers": {
+			"https://bakery.example.com": {
+				"id_token": "old-id-token",
+				"access_token": "old-access-token",
+				"refresh_token": "old-refresh-token",
+				"expiry": "2030-01-01T00:00:00Z"
+			}
+		}
+	}`
+
+	if err := os.WriteFile(store.Path(), []byte(old), 0o600); err != nil {
+		t.Fatalf("write the old-shape file: %v", err)
+	}
+
+	tok, ok := store.Get("https://bakery.example.com")
+	if !ok {
+		t.Fatal("Get found no token in the old-shape file")
+	}
+
+	if tok.IDToken != "old-id-token" || tok.AccessToken != "old-access-token" ||
+		tok.RefreshToken != "old-refresh-token" {
+		t.Errorf("Token = %+v, want the three old fields verbatim", tok)
+	}
+
+	// Nothing new is invented out of an absent field.
+	if _, ok := store.GetUserToken("https://bakery.example.com"); ok {
+		t.Error("GetUserToken found a token in a file that never had a user_token field")
+	}
+
+	if _, ok := store.GetKey("https://bakery.example.com", "acme"); ok {
+		t.Error("GetKey found a key in a file that never had a keys field")
+	}
+
+	if _, ok := store.DefaultServer(); ok {
+		t.Error("DefaultServer found one in a file that never had a default_server field")
+	}
+
+	// And writing through the WIDENED type must not perturb the old bytes any
+	// more than JSON round-tripping is expected to (same keys, same values).
+	if err := store.PutUserToken("https://bakery.example.com", "bkru_new"); err != nil {
+		t.Fatalf("PutUserToken: %v", err)
+	}
+
+	tok, ok = store.Get("https://bakery.example.com")
+	if !ok || tok.IDToken != "old-id-token" {
+		t.Errorf("the OIDC session did not survive writing a user token alongside it: %+v (found=%v)", tok, ok)
+	}
+}
+
+// TestTokenStoreWidenedRoundTrip: Put (the OIDC session), PutUserToken and
+// PutKey each touch a DIFFERENT field of the same server entry, and none may
+// clobber another -- the whole reason serverCreds groups them instead of three
+// separate top-level maps keyed by server.
+func TestTokenStoreWidenedRoundTrip(t *testing.T) {
+	store, _ := tempStore(t)
+	const server = "https://bakery.example.com"
+
+	if err := store.Put(server, Token{IDToken: "id-1"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	if err := store.PutUserToken(server, "bkru_abc"); err != nil {
+		t.Fatalf("PutUserToken: %v", err)
+	}
+
+	if err := store.PutKey(server, "acme", "bkro_org"); err != nil {
+		t.Fatalf("PutKey(org): %v", err)
+	}
+
+	if err := store.PutKey(server, "acme/firmware", "bkry_proj"); err != nil {
+		t.Fatalf("PutKey(org/project): %v", err)
+	}
+
+	tok, ok := store.Get(server)
+	if !ok || tok.IDToken != "id-1" {
+		t.Errorf("Get = %+v (found=%v), want id-1 surviving every later write", tok, ok)
+	}
+
+	if got, ok := store.GetUserToken(server); !ok || got != "bkru_abc" {
+		t.Errorf("GetUserToken = %q (found=%v), want bkru_abc", got, ok)
+	}
+
+	if got, ok := store.GetKey(server, "acme"); !ok || got != "bkro_org" {
+		t.Errorf("GetKey(org) = %q (found=%v), want bkro_org", got, ok)
+	}
+
+	if got, ok := store.GetKey(server, "acme/firmware"); !ok || got != "bkry_proj" {
+		t.Errorf("GetKey(org/project) = %q (found=%v), want bkry_proj", got, ok)
+	}
+
+	// A later Put (an ordinary re-login) must not evict the keys or the user
+	// token minted in between -- see Put's doc.
+	if err := store.Put(server, Token{IDToken: "id-2"}); err != nil {
+		t.Fatalf("second Put: %v", err)
+	}
+
+	if got, ok := store.GetUserToken(server); !ok || got != "bkru_abc" {
+		t.Errorf("GetUserToken after a second Put = %q (found=%v), want it to survive", got, ok)
+	}
+
+	if got, ok := store.GetKey(server, "acme/firmware"); !ok || got != "bkry_proj" {
+		t.Errorf("GetKey(org/project) after a second Put = %q (found=%v), want it to survive", got, ok)
+	}
+}
+
+// TestTokenStoreDeletePreservesUserTokenAndKeys: `bakery logout` ends the
+// browser-derived session only. A cached user token or project/robot key is an
+// independently-lived credential a CI job may depend on, and must not
+// disappear as a side effect of a human logging out of their own session.
+func TestTokenStoreDeletePreservesUserTokenAndKeys(t *testing.T) {
+	store, _ := tempStore(t)
+	const server = "https://bakery.example.com"
+
+	if err := store.Put(server, Token{IDToken: "id-1"}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	if err := store.PutUserToken(server, "bkru_abc"); err != nil {
+		t.Fatalf("PutUserToken: %v", err)
+	}
+
+	if err := store.PutKey(server, "acme/firmware", "bkry_proj"); err != nil {
+		t.Fatalf("PutKey: %v", err)
+	}
+
+	had, err := store.Delete(server)
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	if !had {
+		t.Fatal("Delete reported no session, want one")
+	}
+
+	if _, ok := store.Get(server); ok {
+		t.Error("the OIDC session survived Delete")
+	}
+
+	if got, ok := store.GetUserToken(server); !ok || got != "bkru_abc" {
+		t.Errorf("GetUserToken after Delete = %q (found=%v), want it to survive logout", got, ok)
+	}
+
+	if got, ok := store.GetKey(server, "acme/firmware"); !ok || got != "bkry_proj" {
+		t.Errorf("GetKey after Delete = %q (found=%v), want it to survive logout", got, ok)
+	}
+
+	// The file itself must survive too -- deleting it would drop the surviving
+	// key and user token right along with it.
+	if _, err := os.Stat(store.Path()); err != nil {
+		t.Errorf("credentials.json was removed even though it still holds a key: %v", err)
+	}
+}
+
+// TestTokenStoreDefaultServerRoundTrip covers `bakery login --set-default`.
+func TestTokenStoreDefaultServerRoundTrip(t *testing.T) {
+	store, _ := tempStore(t)
+
+	if _, ok := store.DefaultServer(); ok {
+		t.Error("DefaultServer found one before any was set")
+	}
+
+	if err := store.SetDefaultServer("https://staging.example.com/"); err != nil {
+		t.Fatalf("SetDefaultServer: %v", err)
+	}
+
+	got, ok := store.DefaultServer()
+	if !ok {
+		t.Fatal("DefaultServer found none after SetDefaultServer")
+	}
+
+	// canonicalServer strips the trailing slash, same as the server-keyed map
+	// itself -- a default recorded with or without one must be the same value.
+	if got != "https://staging.example.com" {
+		t.Errorf("DefaultServer = %q, want the trailing slash stripped", got)
+	}
+
+	if err := store.SetDefaultServer("https://prod.example.com"); err != nil {
+		t.Fatalf("second SetDefaultServer: %v", err)
+	}
+
+	if got, _ := store.DefaultServer(); got != "https://prod.example.com" {
+		t.Errorf("DefaultServer after a second Set = %q, want the latest value", got)
+	}
+}
+
 func TestIDTokenExpiry(t *testing.T) {
 	want := time.Unix(1_800_000_000, 0)
 

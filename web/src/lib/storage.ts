@@ -150,12 +150,37 @@ export function setLastOrg(slug: string, port: StorageLike | null = local()): vo
 	port?.setItem(LAST_ORG_KEY, slug);
 }
 
-export function lastProject(port: StorageLike | null = local()): string | null {
-	return port?.getItem(LAST_PROJECT_KEY) ?? null;
+/**
+ * The stored value is namespaced `"{org}/{project}"`, not a bare slug --
+ * `lastProject` only ever returns a project for the SAME org it was recorded
+ * under. Without that, a flat key leaks project X's slug onto org Y's page
+ * the moment someone visits two orgs in one browser: the switcher would read
+ * "Y / X" and every sidebar link built from it would 404.
+ */
+export function lastProject(
+	org: string | null,
+	port: StorageLike | null = local()
+): string | null {
+	if (!org) return null;
+
+	const raw = port?.getItem(LAST_PROJECT_KEY) ?? null;
+	if (!raw) return null;
+
+	const sep = raw.indexOf('/');
+	if (sep === -1) return null;
+
+	const storedOrg = raw.slice(0, sep);
+	const storedProject = raw.slice(sep + 1);
+
+	return storedOrg === org && storedProject ? storedProject : null;
 }
 
-export function setLastProject(slug: string, port: StorageLike | null = local()): void {
-	port?.setItem(LAST_PROJECT_KEY, slug);
+export function setLastProject(
+	org: string,
+	slug: string,
+	port: StorageLike | null = local()
+): void {
+	port?.setItem(LAST_PROJECT_KEY, `${org}/${slug}`);
 }
 
 /** Forgets the remembered tenancy. Called on sign-out. */

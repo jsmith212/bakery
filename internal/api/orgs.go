@@ -148,6 +148,13 @@ func (a *API) handleCreateOrg(w http.ResponseWriter, r *http.Request) error {
 	var org repository.Organization
 
 	err := a.store.Tx(ctx, func(q *repository.Queries) error {
+		// Users first, before the org row and before the grant below: this
+		// transaction writes an org_memberships row, so it is subject to the same
+		// lock-ordering rule as every other membership writer (see lockUserFirst).
+		if err := lockUserFirst(ctx, q, p.UserID()); err != nil {
+			return err
+		}
+
 		created, err := q.CreateOrganization(ctx, repository.CreateOrganizationParams{
 			Slug: req.Slug, Name: req.Name,
 		})
@@ -275,13 +282,33 @@ func (a *API) handleUpdateOrg(w http.ResponseWriter, r *http.Request) error {
 //
 // This cascades: projects, memberships, API keys, backend configs, and every
 // cache object in the org. That is why it is owner-only and not admin.
+//
+// It is the WIDEST membership writer there is -- the cascade deletes an
+// org_memberships row per member and fires the epoch trigger once per row -- so it
+// is also the widest window for the ABBA lockUserFirst exists to close. It takes
+// every member's users row first, in id order, in the same transaction.
 func (a *API) handleDeleteOrg(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	s := scopeFrom(ctx)
 
-	n, err := a.store.DeleteOrganization(ctx, s.OrgID)
+	var n int64
+
+	err := a.store.Tx(ctx, func(q *repository.Queries) error {
+		if err := q.LockOrgMemberUsersForAuthzUpdate(ctx, s.OrgID); err != nil {
+			return fmt.Errorf("lock the org's members before deleting it: %w", err)
+		}
+
+		deleted, err := q.DeleteOrganization(ctx, s.OrgID)
+		if err != nil {
+			return fmt.Errorf("delete organization: %w", err)
+		}
+
+		n = deleted
+
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("delete organization: %w", err)
+		return err
 	}
 
 	if n == 0 {

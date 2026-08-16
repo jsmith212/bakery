@@ -1,0 +1,15 @@
+{
+  "user_id": "",
+  "email": "",
+  "display_name": "",
+  "method": "org_token",
+  "site_role": "user",
+  "is_site_admin": false,
+  "orgs": [],
+  "projects": [],
+  "robot": {
+    "robot_id": "b2c3d4e5-5f6a-4b7c-8d9e-0f1a2b3c4d5e",
+    "org_id": "1c9c9e2a-3e4f-4a5b-8c7d-6e5f4a3b2c1d",
+    "scope": "write"
+  }
+}

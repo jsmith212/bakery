@@ -97,7 +97,9 @@ export interface Me {
 	user_id: string;
 	email: string;
 	display_name: string;
-	/** session | bearer | api_key | dev */
+	/** The IdP `picture` claim, https-only. Absent when the IdP asserted none. */
+	avatar_url?: string;
+	/** session | bearer | api_key | user_token | org_token | dev */
 	method: string;
 	site_role: SiteRole;
 	is_site_admin: boolean;
@@ -105,6 +107,22 @@ export interface Me {
 	projects: MeProject[];
 	/** Present only when the request authenticated WITH a key. */
 	api_key?: MeKeyGrant;
+	/**
+	 * Present only when the request authenticated with a robot (`bkro_`) token.
+	 * When it is set, `user_id`, `email` and `display_name` are empty -- a robot
+	 * is owned by an org and has no user row behind it.
+	 */
+	robot?: MeRobotGrant;
+}
+
+/**
+ * What a `bkro_` request reports about itself. There is no project id: the grant
+ * is one ORG at one scope, covering every project in it, present and future.
+ */
+export interface MeRobotGrant {
+	robot_id: string;
+	org_id: string;
+	scope: KeyScope;
 }
 
 // ---------------------------------------------------------------------------
@@ -600,4 +618,96 @@ export interface InstanceInfo {
 	gc_interval: string;
 	gc_usage_interval: string;
 	gc_grace_period: string;
+}
+
+// ---------------------------------------------------------------------------
+// personal access tokens (`bkru_`) and robots (`bkro_`)
+// ---------------------------------------------------------------------------
+
+/**
+ * A personal access token, metadata only. The plaintext exists in exactly one
+ * response, ever -- `CreatedUserToken.token`.
+ */
+export interface UserToken {
+	id: string;
+	name: string;
+	/** `bkru_` plus 8 characters. Non-secret; the handle after the one-time reveal. */
+	token_prefix: string;
+	/**
+	 * The CEILING on what this token may be used for, not a grant. Its real
+	 * authority is its owner's live roles, narrowed by this.
+	 */
+	max_scope: KeyScope;
+	created_at: string;
+	expires_at: string | null;
+	last_used_at: string | null;
+	revoked_at: string | null;
+}
+
+export interface CreatedUserToken extends UserToken {
+	/** Shown exactly once. There is no query that can return it again. */
+	token: string;
+}
+
+/** An org-owned machine identity. Not a user: it has no console session. */
+export interface Robot {
+	id: string;
+	org_id: string;
+	name: string;
+	description: string;
+	created_by: string;
+	/**
+	 * Snapshotted at creation. `created_by` goes null when its referent is
+	 * deleted, and a robot deliberately outlives its creator -- so this is the
+	 * half of the audit trail that survives the human.
+	 */
+	created_by_email: string;
+	created_at: string;
+	tokens: OrgToken[];
+}
+
+/** A robot's credential, metadata only. */
+export interface OrgToken {
+	id: string;
+	robot_id: string;
+	org_id: string;
+	name: string;
+	/** `bkro_` plus 8 characters. */
+	token_prefix: string;
+	scope: KeyScope;
+	/**
+	 * NOT nullable, unlike every other expiry in the API. A robot survives its
+	 * creator, so expiry is the countervailing control and "never" is not
+	 * representable.
+	 */
+	expires_at: string;
+	created_by: string;
+	created_by_email: string;
+	created_at: string;
+	last_used_at: string | null;
+	revoked_at: string | null;
+}
+
+export interface CreatedOrgToken extends OrgToken {
+	/** Shown exactly once. */
+	token: string;
+}
+
+export interface CreateUserTokenRequest {
+	name: string;
+	scope: KeyScope;
+	/** Absent or null means never expires. Console default: 90 days. */
+	expires_at?: string | null;
+}
+
+export interface CreateRobotRequest {
+	name: string;
+	description: string;
+}
+
+export interface CreateOrgTokenRequest {
+	name: string;
+	scope: KeyScope;
+	/** REQUIRED, unlike every other expiry request in the API -- see OrgToken. */
+	expires_at: string;
 }

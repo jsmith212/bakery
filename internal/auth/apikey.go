@@ -63,18 +63,28 @@ type NewAPIKey struct {
 // GenerateAPIKey mints a key. crypto/rand, never math/rand: a math/rand key is
 // predictable from a handful of samples, and this is the credential that guards
 // every cache write.
-func GenerateAPIKey() (NewAPIKey, error) {
+func GenerateAPIKey() (NewAPIKey, error) { return GenerateToken(TokenPrefix) }
+
+// GenerateToken mints a credential of ANY kind in the Bakery token family: pass
+// TokenPrefix, UserTokenPrefix or OrgTokenPrefix.
+//
+// One generator for all three, deliberately. The entropy, the encoding, the
+// display length and the hashing are properties of the FAMILY, not of the table:
+// three copies of this function is three places for one of them to drift to 16
+// bytes, or to math/rand, or to a display length outside the 6..12 the
+// token_prefix CHECKs allow -- and only the last of those fails loudly.
+func GenerateToken(prefix string) (NewAPIKey, error) {
 	buf := make([]byte, tokenBytes)
 	if _, err := rand.Read(buf); err != nil {
 		return NewAPIKey{}, fmt.Errorf("read random bytes: %w", err)
 	}
 
 	body := base64.RawURLEncoding.EncodeToString(buf)
-	token := TokenPrefix + body
+	token := prefix + body
 
 	return NewAPIKey{
 		Token:  token,
-		Prefix: TokenPrefix + body[:displayLen],
+		Prefix: prefix + body[:displayLen],
 		Hash:   HashToken(token),
 	}, nil
 }
@@ -237,6 +247,12 @@ func (s *Service) authenticateKey(ctx context.Context, token string) (Principal,
 			ProjectID: row.projectID,
 			Scope:     row.scope,
 		},
+		robot: nil,
+		// Never consulted: maxScope is the ceiling on a LIVE role set, and an API key
+		// has none (actsAsUser is false for it, so CanWriteProject answers from the
+		// grant above and returns before it is read). Set to the key's own scope so
+		// that if it ever were read, it could not widen anything.
+		maxScope: row.scope,
 	}, nil
 }
 
@@ -247,36 +263,56 @@ func (s *Service) authenticateKey(ctx context.Context, token string) (Principal,
 // to Authenticate or AuthenticateCache at that point, and inventing one would be a
 // lie about where the credential came from.
 //
-// It is a thin wrapper over authenticateKey and MUST stay one: the same
-// constant-time, zero-join, index-only probe the Bearer and Basic arms run. A
-// second validation path here would be a second place for a key to be accepted
+// It is a thin wrapper over the SHARED token seam (authenticateBakeryToken) and
+// MUST stay one: the same prefix dispatch, and then the same constant-time,
+// zero-join, index-only probe that the Bearer and Basic arms run. A second
+// validation path here would be a second place for a credential to be accepted
 // that the other two would refuse -- and being the one path with no HTTP in front
 // of it, it would be the weakest.
 //
+// It routes on the prefix rather than assuming api_keys, and that is load-bearing
+// rather than tidy: this method is the ONLY entry point for hashserv's in-band
+// auth RPC and for the OCI backend's Authenticator. Hardcoding authenticateKey
+// here would mean every bkru_/bkro_ token reaching hashserv or a registry pull
+// was validated against the wrong table, missed, and came back ErrKeyInvalid --
+// on hashserv, silently degrading the build to unihash=taskhash rather than
+// failing loudly.
+//
 // Choosing WHICH field of the calling protocol holds the token is the caller's
 // job, not this method's: hashserv's auth RPC carries {"username","token"} and a
-// Bakery credential is one opaque bkry_ token, not an id:secret pair, so it may
-// arrive in either field. A token of the wrong shape never reaches the database --
-// looksLikeAPIKey turns it into ErrKeyInvalid inside authenticateKey.
+// Bakery credential is one opaque token, not an id:secret pair, so it may arrive
+// in either field. A token of the wrong shape never reaches the database -- the
+// family gate turns it into ErrKeyInvalid before any validator is called.
 func (s *Service) AuthenticateToken(ctx context.Context, token string) (Principal, error) {
-	p, err := s.authenticateKey(ctx, token)
-	s.observeErr(MethodAPIKey, err)
-
-	return p, err
+	return s.authenticateBakeryToken(ctx, token)
 }
 
 // keyToucher coalesces last_used_at updates off the request path.
 //
 // mark() is what the hot path calls: one mutex-guarded map insert, no I/O. The
 // flusher drains the set on a timer and issues ONE statement for the whole batch.
+//
+// It is generic over the WRITE, not over the table, because there are now three
+// credential tables with identical last_used_at semantics and exactly one reason
+// they exist -- the row-lock convoy described at touchKeysSQL is a property of
+// "one CI machine, one credential, thousands of parallel HEADs", which is equally
+// true of an api_keys row, a user_tokens row and an org_tokens row.
 type keyToucher struct {
 	mu      sync.Mutex
 	pending map[pgtype.UUID]struct{}
-	store   keyStore
+
+	// what names the table, for the log line on a failed flush. Without it three
+	// touchers produce three identical, unattributable error messages.
+	what  string
+	write func(ctx context.Context, ids []pgtype.UUID) error
+}
+
+func newToucher(what string, write func(ctx context.Context, ids []pgtype.UUID) error) *keyToucher {
+	return &keyToucher{pending: make(map[pgtype.UUID]struct{}), what: what, write: write}
 }
 
 func newKeyToucher(store keyStore) *keyToucher {
-	return &keyToucher{pending: make(map[pgtype.UUID]struct{}), store: store}
+	return newToucher("api key", store.touchKeys)
 }
 
 func (t *keyToucher) mark(id pgtype.UUID) {
@@ -303,24 +339,37 @@ func (t *keyToucher) drain() []pgtype.UUID {
 	return ids
 }
 
-// flush writes one batched UPDATE for every key seen since the last flush.
+// flush writes one batched UPDATE for every credential seen since the last flush.
 func (t *keyToucher) flush(ctx context.Context) error {
-	return t.store.touchKeys(ctx, t.drain())
+	return t.write(ctx, t.drain())
 }
 
-// StartKeyToucher runs the coalescing last_used_at flusher until ctx is
+// StartKeyToucher runs the coalescing last_used_at flushers until ctx is
 // cancelled. Wire it to the server's shutdown context.
+//
+// ALL THREE credential tables are flushed on the same tick, from the same
+// goroutine. Three goroutines would be three shutdown paths to get right for a
+// value nobody reads in real time.
 func (s *Service) StartKeyToucher(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
+	touchers := []*keyToucher{s.toucher, s.userTokenToucher, s.orgTokenToucher}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := s.toucher.flush(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				s.log.ErrorContext(ctx, "api key last_used_at flush failed", slog.Any("error", err))
+			for _, t := range touchers {
+				if t == nil {
+					continue
+				}
+
+				if err := t.flush(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					s.log.ErrorContext(ctx, "last_used_at flush failed",
+						slog.String("credential", t.what), slog.Any("error", err))
+				}
 			}
 		}
 	}

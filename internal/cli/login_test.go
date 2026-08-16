@@ -13,6 +13,7 @@ import (
 
 	"github.com/jsmith212/bakery/internal/api"
 	"github.com/jsmith212/bakery/internal/auth"
+	"github.com/jsmith212/bakery/internal/config"
 )
 
 // ---------------------------------------------------------------------------
@@ -224,7 +225,7 @@ func TestDeviceGrantBacksOff(t *testing.T) {
 
 	out := new(strings.Builder)
 
-	if err := Login(t.Context(), h.client, out); err != nil {
+	if err := Login(t.Context(), h.client, out, config.LoginCmd{}); err != nil {
 		t.Fatalf("Login: %v", err)
 	}
 
@@ -283,7 +284,7 @@ func TestLoginCachesTokensAt0600(t *testing.T) {
 			`","token_type":"Bearer","expires_in":3600}`,
 	}}, 1)
 
-	if err := Login(t.Context(), h.client, new(strings.Builder)); err != nil {
+	if err := Login(t.Context(), h.client, new(strings.Builder), config.LoginCmd{}); err != nil {
 		t.Fatalf("Login: %v", err)
 	}
 
@@ -359,7 +360,7 @@ func TestDeviceGrantOutcomes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newLoginHarness(t, tc.replies, 1)
 
-			err := Login(t.Context(), h.client, new(strings.Builder))
+			err := Login(t.Context(), h.client, new(strings.Builder), config.LoginCmd{})
 			if err == nil {
 				t.Fatal("Login succeeded, want an error")
 			}
@@ -406,7 +407,7 @@ func TestLoginRefusesAServerWithNoDeviceEndpoint(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	err = Login(t.Context(), c, new(strings.Builder))
+	err = Login(t.Context(), c, new(strings.Builder), config.LoginCmd{})
 	if err == nil {
 		t.Fatal("Login succeeded against a provider with no device endpoint")
 	}
@@ -505,6 +506,128 @@ func TestARevokedRefreshTokenSaysRunBakeryLogin(t *testing.T) {
 	_, err := h.client.ListOrgs(t.Context())
 	if !errors.Is(err, ErrNeedsLogin) {
 		t.Fatalf("err = %v, want ErrNeedsLogin", err)
+	}
+}
+
+// TestLoginWithTokenValidatesAndStores is the headless path (spec §5): no
+// device grant at all, no polling, no browser -- just GET /me with the token
+// presented directly, and a store on success.
+func TestLoginWithTokenValidatesAndStores(t *testing.T) {
+	h := newLoginHarness(t, nil, 1)
+
+	out := new(strings.Builder)
+	if err := Login(t.Context(), h.client, out, config.LoginCmd{Token: "bkru_abc123"}); err != nil {
+		t.Fatalf("Login --token: %v", err)
+	}
+
+	if !strings.Contains(out.String(), "dev@bakery.local") {
+		t.Errorf("did not print who signed in: %s", out.String())
+	}
+
+	// No device-grant traffic happened at all -- the headless path never
+	// touches the fake IdP.
+	if len(h.idp.forms()) != 0 {
+		t.Errorf("the device grant's token endpoint was called %d times, want 0", len(h.idp.forms()))
+	}
+
+	got, ok := h.store.GetUserToken(h.client.Server())
+	if !ok || got != "bkru_abc123" {
+		t.Errorf("GetUserToken = %q (found=%v), want bkru_abc123 stored", got, ok)
+	}
+}
+
+// TestLoginWithTokenHonoursSetDefault: the headless path is the one place
+// --set-default matters most (a CI job provisioning a build host has no other
+// way to make BAKERY_SERVER-less commands find the right server), and it is
+// the one place a prior bug silently dropped it -- the token branch returned
+// before the SetDefault block ever ran.
+func TestLoginWithTokenHonoursSetDefault(t *testing.T) {
+	h := newLoginHarness(t, nil, 1)
+
+	out := new(strings.Builder)
+	err := Login(t.Context(), h.client, out, config.LoginCmd{Token: "bkru_abc123", SetDefault: true})
+	if err != nil {
+		t.Fatalf("Login --token --set-default: %v", err)
+	}
+
+	got, ok := h.store.DefaultServer()
+	if !ok || got != h.client.Server() {
+		t.Errorf("DefaultServer = %q (found=%v), want %q recorded", got, ok, h.client.Server())
+	}
+
+	if !strings.Contains(out.String(), "is now the default server") {
+		t.Errorf("did not announce the new default: %s", out.String())
+	}
+}
+
+// TestLoginWithTokenFromStdin covers `--token -`: the token never touches
+// shell history or a process listing.
+func TestLoginWithTokenFromStdin(t *testing.T) {
+	h := newLoginHarness(t, nil, 1)
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+
+	orig := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() { os.Stdin = orig })
+
+	go func() {
+		_, _ = w.WriteString("  bkru_from_stdin  \n")
+		_ = w.Close()
+	}()
+
+	if err := Login(t.Context(), h.client, new(strings.Builder), config.LoginCmd{Token: "-"}); err != nil {
+		t.Fatalf("Login --token -: %v", err)
+	}
+
+	if got, ok := h.store.GetUserToken(h.client.Server()); !ok || got != "bkru_from_stdin" {
+		t.Errorf("GetUserToken = %q (found=%v), want the trimmed stdin value", got, ok)
+	}
+}
+
+// TestLoginWithTokenRejectsWrongShape: --token exists for bkru_ personal
+// access tokens. A bkry_ project key has no "signed in as" and belongs under
+// `bakery key create --store`, not this verb.
+func TestLoginWithTokenRejectsWrongShape(t *testing.T) {
+	h := newLoginHarness(t, nil, 1)
+
+	err := Login(t.Context(), h.client, new(strings.Builder), config.LoginCmd{Token: "bkry_project_key"})
+	if err == nil {
+		t.Fatal("Login --token accepted a bkry_ project key, want a rejection")
+	}
+
+	if _, ok := h.store.GetUserToken(h.client.Server()); ok {
+		t.Error("a rejected token was cached anyway")
+	}
+}
+
+// TestLoginWithTokenRejectedByServerIsNotCached: the token is validated
+// BEFORE it is written to disk, so a typo'd or already-revoked token is caught
+// loudly here instead of being cached and failing silently on the first real
+// push.
+func TestLoginWithTokenRejectedByServerIsNotCached(t *testing.T) {
+	h := newLoginHarness(t, nil, 1)
+
+	h.api.handler = func(w http.ResponseWriter, r *http.Request) bool {
+		if strings.TrimPrefix(r.URL.Path, api.Prefix) == "/me" {
+			writeErr(w, http.StatusUnauthorized, api.CodeUnauthorized, "invalid token")
+
+			return true
+		}
+
+		return false
+	}
+
+	err := Login(t.Context(), h.client, new(strings.Builder), config.LoginCmd{Token: "bkru_revoked"})
+	if err == nil {
+		t.Fatal("Login --token accepted a token the server rejected")
+	}
+
+	if _, ok := h.store.GetUserToken(h.client.Server()); ok {
+		t.Error("a token the server rejected via GET /me was cached anyway")
 	}
 }
 

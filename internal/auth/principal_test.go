@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -267,18 +268,35 @@ func TestPrincipalIsUnforgeable(t *testing.T) {
 	// Each of these is one attack the compiler must reject. If a future refactor
 	// (say, exporting the principal struct "just for the API layer") opens one of
 	// them, the corresponding line here stops erroring and the test fails.
+	// Each attack lists EVERY phrasing that counts as the refusal we intended, and a
+	// refusal is required -- but not one exact string. The compiler has two ways to
+	// say "you may not name auth.principal", and which one it uses depends on
+	// whether the unexported type happens to be present in the package's export
+	// data: "undefined: auth.principal" when it is absent, "name principal not
+	// exported by package auth" when it is there but unexported. Both are the same
+	// rejection; neither is reachable if a refactor ever EXPORTS the type, which is
+	// the change this line exists to catch.
 	forbidden := []struct {
 		attack string
-		want   string
+		want   []string
 	}{
-		{attack: "composite literal of the interface", want: "invalid composite literal type auth.Principal"},
-		{attack: "reference to the unexported implementation", want: "undefined: auth.principal"},
-		{attack: "implementing the interface in another package", want: "sealed"},
+		{
+			attack: "composite literal of the interface",
+			want:   []string{"invalid composite literal type auth.Principal"},
+		},
+		{
+			attack: "reference to the unexported implementation",
+			want: []string{
+				"undefined: auth.principal",
+				"name principal not exported by package auth",
+			},
+		},
+		{attack: "implementing the interface in another package", want: []string{"sealed"}},
 	}
 
 	for _, f := range forbidden {
-		if !strings.Contains(out, f.want) {
-			t.Errorf("the compiler did not reject the %s attack with %q.\nBuild output:\n%s",
+		if !slices.ContainsFunc(f.want, func(w string) bool { return strings.Contains(out, w) }) {
+			t.Errorf("the compiler did not reject the %s attack with any of %q.\nBuild output:\n%s",
 				f.attack, f.want, out)
 		}
 	}

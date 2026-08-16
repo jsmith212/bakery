@@ -77,7 +77,7 @@ func sstatePush(ctx context.Context, c *Client, r renderer, cmd config.SstatePus
 	return runPush(ctx, c, r, kindSstate, cmd.Org, cmd.Project, entries, pushOpts{
 		concurrency: cmd.Concurrency,
 		dryRun:      cmd.DryRun,
-		cred:        cacheCredential{Key: cmd.Key},
+		cred:        resolveCacheCredential(c.tokens, c.Server(), cmd.Org, cmd.Project, cmd.Key),
 	})
 }
 
@@ -90,7 +90,7 @@ func downloadsPush(ctx context.Context, c *Client, r renderer, cmd config.Downlo
 	return runPush(ctx, c, r, kindDownloads, cmd.Org, cmd.Project, entries, pushOpts{
 		concurrency: cmd.Concurrency,
 		dryRun:      cmd.DryRun,
-		cred:        cacheCredential{Key: cmd.Key},
+		cred:        resolveCacheCredential(c.tokens, c.Server(), cmd.Org, cmd.Project, cmd.Key),
 	})
 }
 

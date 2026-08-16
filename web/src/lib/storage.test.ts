@@ -106,16 +106,29 @@ describe('last-used tenancy', () => {
 		setStoragePorts({ local });
 
 		setLastOrg('acme');
-		setLastProject('firmware');
+		setLastProject('acme', 'firmware');
 		expect(lastOrg()).toBe('acme');
-		expect(lastProject()).toBe('firmware');
+		expect(lastProject('acme')).toBe('firmware');
 		expect(local.getItem(LAST_ORG_KEY)).toBe('acme');
-		expect(local.getItem(LAST_PROJECT_KEY)).toBe('firmware');
+		expect(local.getItem(LAST_PROJECT_KEY)).toBe('acme/firmware');
 
 		// Sign-out drops it: the next person on a shared machine must not land in
 		// a tenant they may not be able to see.
 		clearLastTenancy();
 		expect(lastOrg()).toBeNull();
-		expect(lastProject()).toBeNull();
+		expect(lastProject('acme')).toBeNull();
+	});
+
+	it('namespaces the remembered project to the org that recorded it', () => {
+		const local = memoryStorage();
+		setStoragePorts({ local });
+
+		setLastProject('org-a', 'firmware');
+
+		// The exact F9 defect: a flat key would leak org A's project onto
+		// org B's page. The namespaced key must not.
+		expect(lastProject('org-b')).toBeNull();
+		expect(lastProject('org-a')).toBe('firmware');
+		expect(lastProject(null)).toBeNull();
 	});
 });

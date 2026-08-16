@@ -3,6 +3,9 @@ name: Build
 on:
   push:
     branches: [main]
+    # A `vX.Y.Z` tag publishes a release-tagged image (see the `image` job) --
+    # this is the trigger that makes a tag push run CI at all.
+    tags: ['v*']
   pull_request:
 
 concurrency:
@@ -393,6 +396,41 @@ jobs:
           name: oci-conformance-log
           path: build/oci-conformance.log
 
+  # Feedback wave 1's gate for the S3 storage driver. The Store-interface-only suite in
+  # internal/storage/conformance_test.go runs twice: against Local, and against a REAL
+  # minio the harness starts with `docker run` on a daemon-assigned port (path-style
+  # addressing, the mechanism DESIGN.md prescribes for minio/Ceph/Garage/R2).
+  #
+  # A FAKE S3 WOULD PASS EVERY ONE OF THESE TESTS AND PROVE NOTHING -- what the driver has
+  # to get right IS S3's semantics, and a fake agrees with whatever the driver happens to
+  # do. So it runs through `just storage-conformance`, where a skip FAILS: a skipped S3
+  # half means not one assertion ran against real S3 semantics.
+  #
+  # A SEPARATE job, like the four conformance gates above. It needs NO postgres service:
+  # the storage package owns bytes and nothing else -- no metadata, no tenancy, no pool.
+  storage-conformance:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - uses: extractions/setup-just@v3
+
+      - name: Storage conformance (local + a real minio; a skip fails the job)
+        run: just storage-conformance
+
+      - name: Upload the storage conformance log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: storage-conformance-log
+          path: build/storage-conformance.log
+
   # The SPA-to-API wiring wave's gate: drive the REAL bakery binary and a real
   # Chromium through the console -- dev-login, create an org and a project,
   # configure sstate AND hashserv, mint a project API key, and preview the
@@ -482,7 +520,7 @@ jobs:
 
   image:
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
 
     # hashserv-conformance is in this list, and that is the point of having written it: a
     # gate that runs, goes red, and still lets the image push to ghcr.io gates nothing.
@@ -495,6 +533,7 @@ jobs:
         hashserv-conformance,
         bazel-conformance,
         oci-conformance,
+        storage-conformance,
         web-e2e,
       ]
 
@@ -515,6 +554,33 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # A manifest pinned to `:latest` cannot be rolled back by tag, and with
+      # imagePullPolicy: Always (the :latest default) a Recreate handover can
+      # silently pull a DIFFERENT image than the one that was just running --
+      # entangling the boot-lock handover with an unplanned version change.
+      # `sha-<full sha>` is what docs/deploy/k8s/deployment.yaml pins to, on
+      # EVERY build; `:latest` is kept for local/dev convenience on main only;
+      # a `vX.Y.Z` tag push additionally publishes that exact tag, for a
+      # human-readable release pin.
+      - name: Compute image tags
+        id: tags
+        run: |
+          tags="ghcr.io/jsmith212/bakery:sha-${{ github.sha }}"
+
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            tags="${tags}"$'\n'"ghcr.io/jsmith212/bakery:latest"
+          fi
+
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            tags="${tags}"$'\n'"ghcr.io/jsmith212/bakery:${GITHUB_REF_NAME}"
+          fi
+
+          {
+            echo "tags<<EOF"
+            echo "${tags}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       # No artifact download: unlike kbi, whose Dockerfile was FROM scratch over
       # a binary CI had already built, this Dockerfile is self-contained -- it
       # builds the frontend and compiles the binary from source itself.
@@ -525,7 +591,7 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ghcr.io/jsmith212/bakery:latest
+          tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

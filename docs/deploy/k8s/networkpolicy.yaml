@@ -1,0 +1,88 @@
+# THE control -- service-metrics.yaml and ingress.example.yaml are discovery
+# and routing, not access control. A Kubernetes Service is a name and a
+# load-balancing rule: once the container listens on 0.0.0.0:9090 (metrics)
+# and 0.0.0.0:9092 (gRPC) -- required so their Services can reach the pod at
+# all -- ANY pod in the cluster that can resolve the Service, or the pod IP
+# directly, can reach those ports with no Service or Ingress in the way.
+# /metrics exposes every org and project slug and how many bytes each
+# stores; that is the customer list. This NetworkPolicy is what actually
+# keeps it off-limits to everything but Prometheus.
+#
+# Default-deny ingress, then three narrow allows. Adjust the namespaceSelector
+# label values below to match your cluster's actual ingress-controller and
+# monitoring namespace labels (these follow the common
+# `kubernetes.io/metadata.name` convention that k8s auto-labels every
+# namespace with, but your cluster may use something else).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bakery
+  labels:
+    app.kubernetes.io/name: bakery
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: bakery
+  policyTypes:
+    - Ingress
+  ingress:
+    # The public listener: only from the ingress controller's namespace, not
+    # from every pod in the cluster.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - port: http
+          protocol: TCP
+    # Metrics: ONLY from the monitoring namespace. This is the line that
+    # actually enforces "exposing /metrics has to be an explicit act" once
+    # METRICS_ADDR is bound to 0.0.0.0 for the Service to work at all.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: metrics
+          protocol: TCP
+    # KUBELET HEALTH PROBES. READ THIS BEFORE APPLYING THIS FILE.
+    #
+    # startupProbe, readinessProbe and livenessProbe are all httpGet on `http`
+    # (8080) -- the same port the first rule above restricts to the ingress
+    # controller's namespace. Probes do NOT come from a namespace: they come
+    # from the KUBELET on the node, with the node's own IP, and on any CNI that
+    # enforces host-to-pod traffic (Calico with its default felix config, Weave
+    # Net, Antrea, kube-router) a default-deny ingress policy drops them.
+    #
+    # The symptom is the worst possible one: every probe fails, the startupProbe
+    # burns its 60 x 5s budget, the container is killed and restarts forever --
+    # a CrashLoopBackOff with a healthy process and no application error in the
+    # log, which is indistinguishable from the boot-lock wedge k8s.md spends a
+    # page explaining. (Cilium and the AWS VPC CNI do not enforce host->pod by
+    # default, so this rule is a no-op there; it is not harmful on any of them.)
+    #
+    # SET THE CIDR. There is no selector for "the kubelet", so this has to be an
+    # ipBlock and it has to be YOUR node CIDR -- the placeholder below is the
+    # RFC1918 /8 that most clusters' nodes fall inside, which is broad enough to
+    # work and too broad to leave unexamined. Narrow it to your node subnet
+    # (`kubectl get nodes -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'`),
+    # and if your CNI does not enforce host->pod traffic you may delete the rule
+    # outright.
+    - from:
+        - ipBlock:
+            cidr: 10.0.0.0/8 # set this to your node CIDR
+      ports:
+        - port: http
+          protocol: TCP
+    # gRPC (Bazel REAPI): only if remote Bazel/moon clients exist outside
+    # this namespace. Delete this block (and GRPC_ADDR/the grpc Service port)
+    # entirely if nothing needs it -- an unused open port is an unused open
+    # port. Scoped here to the ingress-controller namespace as a placeholder;
+    # narrow it to your actual Bazel/moon client namespace(s).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - port: grpc
+          protocol: TCP

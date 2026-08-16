@@ -26,13 +26,19 @@
 -- half holds each admin up.
 --
 -- name: UpsertUser :one
-INSERT INTO users (issuer, subject, email, display_name,
+-- avatar_url is claim-sourced and machine-owned, exactly like email and
+-- display_name: it joins the keep-set here, unconditionally, on every login.
+-- sqlc.narg because the claim is commonly absent (no picture claim, dev
+-- login, or a non-https value already filtered out by verify()) -- narg
+-- writes NULL rather than requiring the caller to invent a sentinel.
+INSERT INTO users (issuer, subject, email, display_name, avatar_url,
                    site_role_oidc, site_oidc_group, last_login_at)
-VALUES ($1, $2, $3, $4,
+VALUES ($1, $2, $3, $4, sqlc.narg(avatar_url),
         NULLIF(sqlc.arg(site_role)::site_role, 'user'), sqlc.narg(site_group), now())
 ON CONFLICT (issuer, subject) DO UPDATE
    SET email           = EXCLUDED.email,
        display_name    = EXCLUDED.display_name,
+       avatar_url      = EXCLUDED.avatar_url,
        site_role_oidc  = EXCLUDED.site_role_oidc,
        site_oidc_group = EXCLUDED.site_oidc_group,
        last_login_at   = now()
@@ -40,6 +46,50 @@ RETURNING *;
 
 -- name: GetUser :one
 SELECT * FROM users WHERE id = $1;
+
+-- LOCK ORDERING. THIS IS THE FIRST STATEMENT OF EVERY MEMBERSHIP-MUTATING
+-- TRANSACTION, AND IT IS NOT OPTIONAL.
+--
+-- 000015's epoch triggers make every writer of org_memberships or
+-- project_memberships take a SECOND lock, on `users`, after the membership row:
+-- the trigger body is `UPDATE users SET authz_epoch = authz_epoch + 1`. The login
+-- reconciler takes the same two locks in the OPPOSITE order -- UpsertUser first,
+-- then the membership upsert -- so a console login and an admin's `PUT
+-- /orgs/{org}/members/{user}` for the same human are a textbook ABBA deadlock.
+-- Postgres aborts one of them: the login redirects to /login?denied=auth_failed
+-- and the PUT 500s, intermittently, with nothing in either code path expecting it.
+--
+-- The fix is agreement rather than retry: EVERY authority-mutating transaction
+-- takes the users row FIRST, so there is no cycle to detect. FOR NO KEY UPDATE
+-- rather than FOR UPDATE because that is exactly the strength the trigger's own
+-- UPDATE takes (it writes no key column), it conflicts with itself, and it does
+-- not block the foreign-key checks that read users concurrently.
+--
+-- name: LockUserForAuthzUpdate :exec
+SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE;
+
+-- The same lock, for the two CASCADING deletes that touch MANY users' memberships
+-- in one statement: DELETE FROM organizations (cascades org_memberships ->
+-- project_memberships -> api_keys, across the whole roster) and DELETE FROM
+-- projects (cascades project_memberships).
+--
+-- ORDER BY u.id is the second half of the ordering rule: two concurrent org
+-- deletes with overlapping rosters must take their user locks in the same
+-- sequence, or they deadlock against each other rather than against a login.
+--
+-- name: LockOrgMemberUsersForAuthzUpdate :exec
+SELECT u.id
+  FROM users u
+ WHERE u.id IN (SELECT om.user_id FROM org_memberships om WHERE om.org_id = $1)
+ ORDER BY u.id
+   FOR NO KEY UPDATE;
+
+-- name: LockProjectMemberUsersForAuthzUpdate :exec
+SELECT u.id
+  FROM users u
+ WHERE u.id IN (SELECT pm.user_id FROM project_memberships pm WHERE pm.project_id = $1)
+ ORDER BY u.id
+   FOR NO KEY UPDATE;
 
 -- LOCAL SITE-ADMIN GRANTS -- the API's half of the site role, and ONLY its half.
 --
@@ -174,12 +224,23 @@ UPDATE org_memberships
 -- authorization: when a membership outlives an LDAP change an admin needs to know
 -- which half is holding it up.
 --
+-- THE `WHERE` ON THE `DO UPDATE` IS A VALUE-CHANGED GUARD, and it is here because
+-- this statement runs once per mapped org on EVERY login. Postgres fires row
+-- triggers on an UPDATE regardless of value equality, so without it an ordinary
+-- login -- which changes nothing on this row 99.9% of the time -- bumps
+-- users.authz_epoch once per membership and evicts that user's entire
+-- principal-cache generation for no reason. It is the same guard
+-- users_site_role_bumps_authz_epoch carries, applied at the statement instead of
+-- at the trigger, and for the same stated reason.
+--
 -- name: ReconcileOrgMembershipUpsert :exec
 INSERT INTO org_memberships (user_id, org_id, oidc_role, oidc_group)
 VALUES ($1, $2, $3, $4)
 ON CONFLICT (user_id, org_id) DO UPDATE
    SET oidc_role  = EXCLUDED.oidc_role,
-       oidc_group = EXCLUDED.oidc_group;
+       oidc_group = EXCLUDED.oidc_group
+ WHERE org_memberships.oidc_role  IS DISTINCT FROM EXCLUDED.oidc_role
+    OR org_memberships.oidc_group IS DISTINCT FROM EXCLUDED.oidc_group;
 
 -- name: ListOrgMembershipsForUser :many
 SELECT om.org_id, om.role, o.slug, o.name

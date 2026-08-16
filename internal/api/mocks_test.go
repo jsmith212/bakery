@@ -74,6 +74,15 @@ type fakePrincipal struct {
 	projects map[pgtype.UUID]auth.ProjectRole
 
 	key *auth.KeyGrant
+
+	// robot is set for a MethodOrgToken double. Like key, it is the WHOLE of that
+	// credential's authority -- one org, one scope, no project named.
+	robot *auth.RobotGrant
+
+	// maxScope is the ceiling a personal access token carries. The zero value is
+	// read-only, which is safe here because only a MethodUserToken double consults
+	// it (mirroring auth's own placement -- see principal.CanWriteProject).
+	maxScope auth.Scope
 }
 
 var _ Principal = (*fakePrincipal)(nil)
@@ -84,8 +93,11 @@ func (p *fakePrincipal) DisplayName() string     { return p.displayName }
 func (p *fakePrincipal) Method() auth.Method     { return p.method }
 func (p *fakePrincipal) SiteRole() auth.SiteRole { return p.siteRole }
 
+// IsSiteAdmin mirrors auth's own allowlist, not a denylist on MethodAPIKey. A
+// test double that is MORE permissive than production is how a guard regression
+// passes review: every non-interactive method must be refused here too.
 func (p *fakePrincipal) IsSiteAdmin() bool {
-	return p.method != auth.MethodAPIKey && p.siteRole == auth.SiteRoleAdmin
+	return interactiveMethod(p.method) && p.siteRole == auth.SiteRoleAdmin
 }
 
 func (p *fakePrincipal) OrgRole(orgID pgtype.UUID) (auth.OrgRole, bool) {
@@ -108,8 +120,27 @@ func (p *fakePrincipal) APIKey() (auth.KeyGrant, bool) {
 	return *p.key, true
 }
 
+func (p *fakePrincipal) Robot() (auth.RobotGrant, bool) {
+	if p.robot == nil {
+		return auth.RobotGrant{}, false
+	}
+
+	return *p.robot, true
+}
+
+// grants mirrors auth's own: a credential that does not act as a user is answered
+// by whichever grant it carries, and one carrying neither is refused.
+func (p *fakePrincipal) grants(orgID, projectID pgtype.UUID, want auth.Scope) bool {
+	if p.robot != nil {
+		return p.robot.OrgID == orgID && (want == auth.ScopeRead || p.robot.Scope == auth.ScopeWrite)
+	}
+
+	return p.key != nil && p.key.ProjectID == projectID &&
+		(want == auth.ScopeRead || p.key.Scope == auth.ScopeWrite)
+}
+
 func (p *fakePrincipal) CanViewOrg(orgID pgtype.UUID) bool {
-	if p.method == auth.MethodAPIKey {
+	if !actsAsUserMethod(p.method) {
 		return false
 	}
 
@@ -123,7 +154,7 @@ func (p *fakePrincipal) CanViewOrg(orgID pgtype.UUID) bool {
 }
 
 func (p *fakePrincipal) CanAdminOrg(orgID pgtype.UUID) bool {
-	if p.method == auth.MethodAPIKey {
+	if !interactiveMethod(p.method) {
 		return false
 	}
 
@@ -137,7 +168,7 @@ func (p *fakePrincipal) CanAdminOrg(orgID pgtype.UUID) bool {
 }
 
 func (p *fakePrincipal) CanOwnOrg(orgID pgtype.UUID) bool {
-	if p.method == auth.MethodAPIKey {
+	if !interactiveMethod(p.method) {
 		return false
 	}
 
@@ -151,8 +182,8 @@ func (p *fakePrincipal) CanOwnOrg(orgID pgtype.UUID) bool {
 }
 
 func (p *fakePrincipal) CanReadProject(orgID, projectID pgtype.UUID) bool {
-	if p.method == auth.MethodAPIKey {
-		return p.key != nil && p.key.ProjectID == projectID
+	if !actsAsUserMethod(p.method) {
+		return p.grants(orgID, projectID, auth.ScopeRead)
 	}
 
 	if p.IsSiteAdmin() {
@@ -169,12 +200,16 @@ func (p *fakePrincipal) CanReadProject(orgID, projectID pgtype.UUID) bool {
 }
 
 func (p *fakePrincipal) CanWriteProject(orgID, projectID pgtype.UUID) bool {
-	if p.method == auth.MethodAPIKey {
-		return p.key != nil && p.key.ProjectID == projectID && p.key.Scope == auth.ScopeWrite
+	if !actsAsUserMethod(p.method) {
+		return p.grants(orgID, projectID, auth.ScopeWrite)
 	}
 
-	if p.CanAdminOrg(orgID) {
-		return true
+	if interactiveMethod(p.method) {
+		if p.CanAdminOrg(orgID) {
+			return true
+		}
+	} else if p.maxScope != auth.ScopeWrite {
+		return false
 	}
 
 	r, ok := p.projects[projectID]
@@ -183,7 +218,7 @@ func (p *fakePrincipal) CanWriteProject(orgID, projectID pgtype.UUID) bool {
 }
 
 func (p *fakePrincipal) CanAdminProject(orgID, projectID pgtype.UUID) bool {
-	if p.method == auth.MethodAPIKey {
+	if !interactiveMethod(p.method) {
 		return false
 	}
 
@@ -210,6 +245,11 @@ type fakeStore struct {
 	backends []repository.CacheBackend
 	users    []repository.User
 	keys     []repository.ListAPIKeysForProjectRow
+
+	// Stage 3's credential tables.
+	userTokens []repository.ListUserTokensForUserRow
+	robots     []repository.Robot
+	orgTokens  []repository.ListOrgTokensForOrgRow
 
 	orgMembers     map[pgtype.UUID][]repository.ListOrgMembersRow
 	projectMembers map[pgtype.UUID][]repository.ListProjectMembersRow
@@ -930,7 +970,9 @@ type fakeMinter struct {
 	token string
 	err   error
 
-	got auth.CreateKeyInput
+	got          auth.CreateKeyInput
+	gotUserToken auth.CreateUserTokenInput
+	gotOrgToken  auth.CreateOrgTokenInput
 }
 
 var _ keyMinter = (*fakeMinter)(nil)
@@ -949,4 +991,199 @@ func (m *fakeMinter) CreateAPIKey(
 			ID: uuidOf(in.Name), UserID: p.UserID(), ProjectID: in.ProjectID,
 			Name: in.Name, TokenPrefix: "bkry_abcd1234", Scope: in.Scope,
 		}, nil
+}
+
+// The two credential mints stage 3 added. Same shape as CreateAPIKey above: the
+// fake records the input and hands back a plaintext, because the show-once
+// semantics are what these tests assert -- auth.Service's own tests own the
+// mint-authority guard and the schema round trip.
+func (m *fakeMinter) CreateUserToken(
+	_ context.Context, p Principal, in auth.CreateUserTokenInput,
+) (auth.NewAPIKey, repository.CreateUserTokenRow, error) {
+	m.gotUserToken = in
+
+	if m.err != nil {
+		return auth.NewAPIKey{}, repository.CreateUserTokenRow{}, m.err
+	}
+
+	return auth.NewAPIKey{Token: m.token, Prefix: "bkru_abcd1234", Hash: nil},
+		repository.CreateUserTokenRow{
+			ID: uuidOf(in.Name), UserID: p.UserID(), Name: in.Name,
+			TokenPrefix: "bkru_abcd1234", MaxScope: in.MaxScope,
+		}, nil
+}
+
+func (m *fakeMinter) CreateOrgToken(
+	_ context.Context, _ Principal, in auth.CreateOrgTokenInput,
+) (auth.NewAPIKey, repository.CreateOrgTokenRow, error) {
+	m.gotOrgToken = in
+
+	if m.err != nil {
+		return auth.NewAPIKey{}, repository.CreateOrgTokenRow{}, m.err
+	}
+
+	return auth.NewAPIKey{Token: m.token, Prefix: "bkro_abcd1234", Hash: nil},
+		repository.CreateOrgTokenRow{
+			ID: uuidOf(in.Name), RobotID: in.RobotID, OrgID: in.OrgID, Name: in.Name,
+			TokenPrefix: "bkro_abcd1234", Scope: in.Scope,
+			ExpiresAt:      pgtype.Timestamptz{Time: in.ExpiresAt, InfinityModifier: pgtype.Finite, Valid: true},
+			CreatedByEmail: "granter@example.com",
+		}, nil
+}
+
+// ---------------------------------------------------------------------------
+// fakeStore: user tokens, robots and org tokens.
+//
+// In-memory and deliberately thin. The interesting behaviour of these tables --
+// the owner-scoped revoke predicate, the org-scoped robot lookup, the CASCADE --
+// is the DATABASE's, and internal/auth's dbtest suite asserts it there. What this
+// package's tests need is that a DENIED request reaches none of them, which is
+// what `calls` records.
+// ---------------------------------------------------------------------------
+
+func (s *fakeStore) ListUserTokensForUser(
+	_ context.Context, userID pgtype.UUID,
+) ([]repository.ListUserTokensForUserRow, error) {
+	if s.desiredErr != nil {
+		return nil, s.desiredErr
+	}
+
+	out := []repository.ListUserTokensForUserRow{}
+
+	for _, row := range s.userTokens {
+		if row.UserID == userID {
+			out = append(out, row)
+		}
+	}
+
+	return out, nil
+}
+
+func (s *fakeStore) RevokeUserToken(
+	_ context.Context, arg repository.RevokeUserTokenParams,
+) (int64, error) {
+	s.note("RevokeUserToken:" + uuidString(arg.ID))
+
+	if s.desiredErr != nil {
+		return 0, s.desiredErr
+	}
+
+	for _, row := range s.userTokens {
+		// The owner predicate is part of the STATEMENT in production; the fake mirrors
+		// it so a test cannot pass here and fail against Postgres.
+		if row.ID == arg.ID && row.UserID == arg.UserID {
+			return 1, nil
+		}
+	}
+
+	return 0, nil
+}
+
+func (s *fakeStore) ListRobotsForOrg(
+	_ context.Context, orgID pgtype.UUID,
+) ([]repository.Robot, error) {
+	if s.desiredErr != nil {
+		return nil, s.desiredErr
+	}
+
+	out := []repository.Robot{}
+
+	for _, row := range s.robots {
+		if row.OrgID == orgID {
+			out = append(out, row)
+		}
+	}
+
+	return out, nil
+}
+
+func (s *fakeStore) CreateRobot(
+	_ context.Context, arg repository.CreateRobotParams,
+) (repository.Robot, error) {
+	s.note("CreateRobot:" + arg.Name)
+
+	if s.desiredErr != nil {
+		return repository.Robot{}, s.desiredErr
+	}
+
+	robot := repository.Robot{
+		ID: uuidOf("robot:" + arg.Name), OrgID: arg.OrgID, Name: arg.Name,
+		Description: arg.Description, CreatedBy: arg.CreatedBy,
+		CreatedByEmail: arg.CreatedByEmail,
+	}
+	s.robots = append(s.robots, robot)
+
+	return robot, nil
+}
+
+func (s *fakeStore) GetRobotForOrg(
+	_ context.Context, arg repository.GetRobotForOrgParams,
+) (repository.Robot, error) {
+	if s.desiredErr != nil {
+		return repository.Robot{}, s.desiredErr
+	}
+
+	for _, row := range s.robots {
+		if row.ID == arg.ID && row.OrgID == arg.OrgID {
+			return row, nil
+		}
+	}
+
+	return repository.Robot{}, pgx.ErrNoRows
+}
+
+func (s *fakeStore) DeleteRobotForOrg(
+	_ context.Context, arg repository.DeleteRobotForOrgParams,
+) (int64, error) {
+	s.note("DeleteRobotForOrg:" + uuidString(arg.ID))
+
+	if s.desiredErr != nil {
+		return 0, s.desiredErr
+	}
+
+	for i, row := range s.robots {
+		if row.ID == arg.ID && row.OrgID == arg.OrgID {
+			s.robots = append(s.robots[:i], s.robots[i+1:]...)
+
+			return 1, nil
+		}
+	}
+
+	return 0, nil
+}
+
+func (s *fakeStore) ListOrgTokensForOrg(
+	_ context.Context, orgID pgtype.UUID,
+) ([]repository.ListOrgTokensForOrgRow, error) {
+	if s.desiredErr != nil {
+		return nil, s.desiredErr
+	}
+
+	out := []repository.ListOrgTokensForOrgRow{}
+
+	for _, row := range s.orgTokens {
+		if row.OrgID == orgID {
+			out = append(out, row)
+		}
+	}
+
+	return out, nil
+}
+
+func (s *fakeStore) RevokeOrgToken(
+	_ context.Context, arg repository.RevokeOrgTokenParams,
+) (int64, error) {
+	s.note("RevokeOrgToken:" + uuidString(arg.ID))
+
+	if s.desiredErr != nil {
+		return 0, s.desiredErr
+	}
+
+	for _, row := range s.orgTokens {
+		if row.ID == arg.ID && row.RobotID == arg.RobotID && row.OrgID == arg.OrgID {
+			return 1, nil
+		}
+	}
+
+	return 0, nil
 }

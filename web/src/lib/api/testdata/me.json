@@ -2,6 +2,7 @@
   "user_id": "8f2b1d40-1f7a-4c9d-9a7a-0d2c3b4e5f60",
   "email": "anna@acme.dev",
   "display_name": "Anna Roux",
+  "avatar_url": "https://lh3.googleusercontent.com/a/anna-roux",
   "method": "session",
   "site_role": "user",
   "is_site_admin": false,

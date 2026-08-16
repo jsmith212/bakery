@@ -9,7 +9,7 @@ import {
 	memoryStorage,
 	setStoragePorts
 } from './storage';
-import { orgPath, projectPath, resolveLanding, resolveTenancy } from './tenancy';
+import { orgPath, projectPath, resolveLanding, resolveNavScope, resolveTenancy } from './tenancy';
 
 function me(over: Partial<Me> = {}): Me {
 	return {
@@ -133,7 +133,7 @@ describe('resolveLanding', () => {
 describe('legacy flat routes', () => {
 	beforeEach(() => {
 		setStoragePorts({
-			local: memoryStorage({ [LAST_ORG_KEY]: 'acme', [LAST_PROJECT_KEY]: 'firmware' }),
+			local: memoryStorage({ [LAST_ORG_KEY]: 'acme', [LAST_PROJECT_KEY]: 'acme/firmware' }),
 			session: memoryStorage()
 		});
 	});
@@ -183,5 +183,85 @@ describe('legacy flat routes', () => {
 		});
 
 		expect(legacyTarget(ctx, { org: 'settings' })).toBe('/o/acme/settings');
+	});
+});
+
+// The sticky-nav switcher's fallback (F9 / spec wave-1 §6): a global page
+// (`/user`, `/gc`, ...) has no `[org]`/`[project]` path segment, so it must
+// fall back to the last-remembered scope -- without leaking one org's
+// remembered project onto another org's page.
+describe('resolveNavScope', () => {
+	const rememberedProject = (recordedUnder: string, project: string) => (org: string) =>
+		org === recordedUnder ? project : null;
+
+	it('/user remembers acme/fw', () => {
+		expect(
+			resolveNavScope({
+				paramsOrg: null,
+				paramsProject: null,
+				visibleOrgs: ['acme'],
+				rememberedOrg: 'acme',
+				rememberedProject: rememberedProject('acme', 'fw')
+			})
+		).toEqual({ org: 'acme', project: 'fw' });
+	});
+
+	it('/o/acme/members renders project none', () => {
+		// The org param is present, so the project fallback never fires -- an
+		// org-scoped route with no project segment is a legitimate "none", not
+		// a spot to guess into.
+		expect(
+			resolveNavScope({
+				paramsOrg: 'acme',
+				paramsProject: null,
+				visibleOrgs: ['acme'],
+				rememberedOrg: 'acme',
+				rememberedProject: rememberedProject('acme', 'fw')
+			})
+		).toEqual({ org: 'acme', project: null });
+	});
+
+	it('a stale remembered org (no longer visible) renders none', () => {
+		expect(
+			resolveNavScope({
+				paramsOrg: null,
+				paramsProject: null,
+				visibleOrgs: ['acme'],
+				rememberedOrg: 'ghost',
+				rememberedProject: rememberedProject('ghost', 'fw')
+			})
+		).toEqual({ org: null, project: null });
+	});
+
+	it('a remembered org with no remembered project renders project none, not a guess', () => {
+		// The state ConsoleNav's project switcher must render as "nothing to
+		// show" rather than an enabled-but-empty menu: a global page, an org
+		// remembered and still visible, and no project ever remembered under
+		// it (a fresh org, or one only ever visited via /members or /settings).
+		expect(
+			resolveNavScope({
+				paramsOrg: null,
+				paramsProject: null,
+				visibleOrgs: ['acme'],
+				rememberedOrg: 'acme',
+				rememberedProject: () => null
+			})
+		).toEqual({ org: 'acme', project: null });
+	});
+
+	it('a project remembered under org A never renders under org B', () => {
+		// Namespacing lives in `storage.ts#lastProject`, but this proves the
+		// caller (the console layout) resolves the org BEFORE asking for the
+		// remembered project, so a same-named `rememberedProject` lookup keyed
+		// on a different org can never leak through.
+		expect(
+			resolveNavScope({
+				paramsOrg: null,
+				paramsProject: null,
+				visibleOrgs: ['org-b'],
+				rememberedOrg: 'org-b',
+				rememberedProject: rememberedProject('org-a', 'firmware')
+			})
+		).toEqual({ org: 'org-b', project: null });
 	});
 });

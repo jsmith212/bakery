@@ -1,0 +1,145 @@
+# Bakery is a SINGLETON by design: the boot advisory lock, the in-process
+# route cache, the blob LRU and the GC's pending-read set are only coherent
+# with exactly one writer. `replicas: 1` and `strategy: Recreate` are both
+# MANDATORY, not tuning knobs -- see docs/deploy/k8s.md for the full trace of
+# why the default RollingUpdate strategy permanently wedges at replicas=1
+# (the new pod waits on the boot lock, which the OLD pod will not release
+# until it is Ready -- a circular wait BOOT_LOCK_WAIT cannot resolve).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bakery
+  labels:
+    app.kubernetes.io/name: bakery
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bakery
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bakery
+    spec:
+      # Worst-case graceful shutdown is shutdownTimeout (10s, public+gRPC+
+      # metrics listeners) + backgroundDrainTimeout (30s, GC sweep + the
+      # api_keys.last_used_at toucher) + the boot lock release, roughly 40s --
+      # already past k8s's own 30s default. A SIGKILL before that truncates
+      # the GC/toucher flush and turns a clean pg_advisory_unlock into
+      # Postgres having to notice a dead socket instead.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bakery
+          # SHA-pinned, never :latest. The `image` CI job publishes
+          # ghcr.io/jsmith212/bakery:sha-<full commit sha> on every push to
+          # main (and ghcr.io/jsmith212/bakery:<tag> on a vX.Y.Z release tag)
+          # specifically so a manifest can pin to an exact, reproducible
+          # build -- imagePullPolicy: Always against :latest would let a
+          # Recreate handover silently pull a DIFFERENT image than the one
+          # that was just running, entangling the boot-lock handover with an
+          # unplanned version change. Replace the sha below with the tag of
+          # the build you are actually deploying.
+          image: ghcr.io/jsmith212/bakery:sha-0000000000000000000000000000000000000000
+          args: ["serve"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+            - name: grpc
+              containerPort: 9092
+          env:
+            - name: DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: bakery-db
+                  key: DB_URL
+            # Loopback by default (see internal/config/config.go) -- rebinding
+            # to 0.0.0.0 here is required for the separate bakery-metrics
+            # Service to reach it at all. This is NOT a violation of "served
+            # on --metrics-addr and nowhere else": that invariant is about
+            # listener SEPARATION (its own port, its own Service, never
+            # merged onto the public Service or an Ingress -- see
+            # networkpolicy.yaml and ingress.example.yaml), not bind
+            # interface.
+            - name: METRICS_ADDR
+              value: "0.0.0.0:9090"
+            # Same story as METRICS_ADDR. Omit this (and the grpc port/
+            # Service) entirely if no remote Bazel/moon client needs the
+            # REAPI listener.
+            - name: GRPC_ADDR
+              value: "0.0.0.0:9092"
+            # The default (./data) resolves under / in the distroless image
+            # (no WORKDIR is set in the final stage) -- unwritable under
+            # readOnlyRootFilesystem: true. This must match the PVC mount
+            # path below.
+            - name: STORAGE_DIR
+              value: "/data"
+            # Poll for the boot lock this long before giving up if another
+            # instance holds it. Helps ONLY node-drain/eviction and a
+            # slow-terminating old pod still inside its grace period -- it
+            # is not a substitute for strategy: Recreate above, and cannot
+            # rescue a deployment that was left on RollingUpdate. See
+            # docs/deploy/k8s.md for how this interacts with startupProbe
+            # sizing below.
+            - name: BOOT_LOCK_WAIT
+              value: "45s"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            # readOnlyRootFilesystem needs a writable /tmp for anything that
+            # shells out to it; Bakery itself does not today, but this is
+            # cheap insurance against a future dependency that does.
+            - name: tmp
+              mountPath: /tmp
+          # startupProbe budgets the WHOLE boot sequence -- connect+ping,
+          # advisory lock (+ up to BOOT_LOCK_WAIT), migrations, OIDC
+          # discovery (bounded at 30s), storage, auth, cache backend wiring
+          # -- not just "the process started". The public listener does not
+          # bind until every one of those has finished, so the first
+          # successful /healthz IS the proof they did.
+          # failureThreshold * periodSeconds must exceed BOOT_LOCK_WAIT plus
+          # a normal boot; 60 * 5s = 300s gives BOOT_LOCK_WAIT=45s a wide
+          # margin.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          # Really pings the pool under a 2s server-side bound. Pulls the pod
+          # from Service endpoints on a DB blip without killing it.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Deliberately /healthz, NEVER /readyz: a livenessProbe on /readyz
+          # would restart a perfectly healthy binary because Postgres
+          # blinked, which is the wrong-direction conflation CLAUDE.md's
+          # readyz/healthz invariant exists to prevent.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: bakery-data
+        - name: tmp
+          emptyDir: {}

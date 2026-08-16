@@ -64,7 +64,7 @@
 					orgs: orgs?.items ?? null,
 					returnPath: takeReturnPath(),
 					lastOrg: lastOrg(),
-					lastProject: lastProject()
+					lastProject: lastProject(lastOrg())
 				}),
 				{ replaceState: true }
 			);

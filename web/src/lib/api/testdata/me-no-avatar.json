@@ -1,0 +1,24 @@
+{
+  "user_id": "8f2b1d40-1f7a-4c9d-9a7a-0d2c3b4e5f60",
+  "email": "anna@acme.dev",
+  "display_name": "Anna Roux",
+  "method": "session",
+  "site_role": "user",
+  "is_site_admin": false,
+  "orgs": [
+    {
+      "id": "1c9c9e2a-3e4f-4a5b-8c7d-6e5f4a3b2c1d",
+      "slug": "acme",
+      "name": "Acme",
+      "role": "admin"
+    }
+  ],
+  "projects": [
+    {
+      "id": "2d8d8f3b-4f5a-4b6c-9d8e-7f6a5b4c3d2e",
+      "slug": "firmware",
+      "org_slug": "acme",
+      "role": "admin"
+    }
+  ]
+}

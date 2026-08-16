@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
@@ -11,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/jsmith212/bakery/internal/config"
+	"github.com/jsmith212/bakery/internal/db"
 	"github.com/jsmith212/bakery/internal/db/repository"
 )
 
@@ -103,7 +105,16 @@ func (s *Service) Reconcile(ctx context.Context, id Identity) (pgtype.UUID, erro
 
 	var userID pgtype.UUID
 
-	err = s.store.Tx(ctx, func(q *repository.Queries) error {
+	// UpsertUser IS THE LOCK-ORDERING STATEMENT, and it is first for a second
+	// reason on top of the one below.
+	//
+	// 000015's epoch triggers make every writer of org_memberships take a `users`
+	// lock AFTER the membership row. This transaction takes them the other way
+	// round -- and it has no choice, because it needs a user id before it can name
+	// a membership. So the login path is the FIXED order and every membership
+	// writer in internal/api agrees with it (api.lockUserFirst), rather than the
+	// other way round. Do not move this call.
+	err = reconcileTx(ctx, s.store, func(q *repository.Queries) error {
 		// site_role_OIDC and site_oidc_group, never site_role_local: the local half of
 		// a site role is granted in-app (or by the CLI break-glass) and MUST survive a
 		// login, so this reconciler does not name the column that holds it. The group
@@ -115,8 +126,13 @@ func (s *Service) Reconcile(ctx context.Context, id Identity) (pgtype.UUID, erro
 			Subject:     id.Subject,
 			Email:       id.Email,
 			DisplayName: id.DisplayName,
-			SiteRole:    siteRole(res.SiteRole),
-			SiteGroup:   pgtype.Text{String: res.SiteGroup, Valid: res.SiteGroup != ""},
+			// AvatarURL is claim-sourced and machine-owned, exactly like Email and
+			// DisplayName above it -- id.AvatarURL is already https-filtered (see
+			// oidc.go's verify()), so an empty string here means the IdP asserted
+			// none, and threads through as NULL, never as a user-editable field.
+			AvatarURL: pgtype.Text{String: id.AvatarURL, Valid: id.AvatarURL != ""},
+			SiteRole:  siteRole(res.SiteRole),
+			SiteGroup: pgtype.Text{String: res.SiteGroup, Valid: res.SiteGroup != ""},
 		})
 		if err != nil {
 			return fmt.Errorf("upsert user: %w", err)
@@ -197,6 +213,55 @@ func (s *Service) Reconcile(ctx context.Context, id Identity) (pgtype.UUID, erro
 	return userID, nil
 }
 
+// reconcileAttempts bounds the 40P01 retry around the reconciliation transaction.
+//
+// IT IS BELT, NOT BRACES. The ordering rule (users row first, everywhere -- see
+// UpsertUser's comment above and api.lockUserFirst) is what makes a deadlock
+// unreachable through the code we ship. This is what keeps a login from failing
+// closed if some future writer, or a psql session, or a cascade nobody modelled,
+// takes the two locks the other way round: the transaction was aborted whole, it
+// holds nothing by the time we see the error, and a login is idempotent, so a
+// retry is exactly right. An unbounded one is not -- the same reasoning, and the
+// same shape, as blob.deleteBatchTx.
+const reconcileAttempts = 3
+
+// reconcileBackoff is the first retry's pause; it doubles per attempt.
+const reconcileBackoff = 10 * time.Millisecond
+
+// reconcileTx runs fn in a transaction, retrying a Postgres deadlock (40P01) a
+// bounded number of times. Every other error is returned as-is on the first
+// attempt: a retry is only ever correct for the one error that means "your
+// transaction was aborted whole and nothing you did survived".
+func reconcileTx(ctx context.Context, store *db.Store, fn func(*repository.Queries) error) error {
+	var lastErr error
+
+	for attempt := range reconcileAttempts {
+		err := store.Tx(ctx, fn)
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != pgerrcode.DeadlockDetected {
+			return err
+		}
+
+		timer := time.NewTimer(reconcileBackoff << attempt)
+
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+
+			return fmt.Errorf("reconcile: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
+
+	return fmt.Errorf("reconcile: %d attempts deadlocked: %w", reconcileAttempts, lastErr)
+}
+
 // EnsureOrgs creates every organization the group mapping names. Call it at boot.
 //
 // Without it the system deadlocks on day one: the mapping file names an org, no
@@ -269,6 +334,38 @@ func (s *Service) ensureOrg(ctx context.Context, slug string) (pgtype.UUID, erro
 // at all. This is a cold path -- the console, not the cache -- and it can afford
 // three queries. (API keys make the opposite trade and must: see apikey.go.)
 func (s *Service) loadPrincipal(ctx context.Context, userID pgtype.UUID, method Method) (Principal, error) {
+	authz, err := s.loadUserAuthz(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// An interactive principal has no ceiling of its own: it is bounded by its
+	// roles, and nothing else. ScopeWrite is "no ceiling" -- see principal.maxScope.
+	return authz.principal(method, ScopeWrite, nil), nil
+}
+
+// userAuthz is every authorization fact about one human, detached from the
+// credential that presented them.
+//
+// It exists because two very different callers need the same three reads.
+// loadPrincipal (the console: once per request, cold) and authenticateUserToken
+// (the cache plane: once per CACHE MISS, because the result is cached by
+// (user_id, authz_epoch)) must agree exactly on what a user's authority is --
+// a second, slightly different reader is how "your token can do more than you
+// can" ships.
+type userAuthz struct {
+	userID      pgtype.UUID
+	issuer      string
+	subject     string
+	email       string
+	displayName string
+	siteRole    SiteRole
+	orgs        map[pgtype.UUID]OrgRole
+	projects    map[pgtype.UUID]ProjectRole
+}
+
+// loadUserAuthz reads the three tables. Cold path only -- see the type doc.
+func (s *Service) loadUserAuthz(ctx context.Context, userID pgtype.UUID) (*userAuthz, error) {
 	user, err := s.store.GetUser(ctx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("load user: %w", err)
@@ -294,18 +391,40 @@ func (s *Service) loadPrincipal(ctx context.Context, userID pgtype.UUID, method 
 		projects[row.ProjectID] = row.Role
 	}
 
-	return &principal{
+	return &userAuthz{
 		userID:      user.ID,
 		issuer:      user.Issuer,
 		subject:     user.Subject,
 		email:       user.Email,
 		displayName: user.DisplayName,
-		method:      method,
 		siteRole:    user.SiteRole,
 		orgs:        orgs,
 		projects:    projects,
-		key:         nil,
 	}, nil
+}
+
+// principal stamps a credential onto a role set.
+//
+// The maps are SHARED with the cached userAuthz rather than copied, and that is
+// safe for exactly one reason: nothing ever writes to them after loadUserAuthz
+// builds them. Every capability method reads. If a future change needs to mutate
+// a principal's roles in place, it must copy here first -- otherwise one request
+// would be editing every other request's authority.
+func (u *userAuthz) principal(method Method, maxScope Scope, key *KeyGrant) *principal {
+	return &principal{
+		userID:      u.userID,
+		issuer:      u.issuer,
+		subject:     u.subject,
+		email:       u.email,
+		displayName: u.displayName,
+		method:      method,
+		siteRole:    u.siteRole,
+		orgs:        u.orgs,
+		projects:    u.projects,
+		key:         key,
+		robot:       nil,
+		maxScope:    maxScope,
+	}
 }
 
 func slugsOf(orgs map[string]config.OrgRole) []string {

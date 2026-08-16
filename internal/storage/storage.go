@@ -23,9 +23,12 @@
 //     with a refcount = 0 recheck -- that nothing does. blob.Service.ReapDigest is
 //     that proof, and it is the only caller.
 //
-// S3 IS DEFERRED. The interface is deliberately free of any filesystem concept
-// (no paths, no modes, no directories) so an S3 implementation is a new type, not a
-// new interface.
+// TWO DRIVERS: Local (local.go) and S3 (s3.go). The interface is deliberately
+// free of any filesystem concept (no paths, no modes, no directories), which is
+// why S3 landed as a new TYPE and not as a new interface. Everything either
+// driver owes a caller is proven once, against both, by the shared suite in
+// conformance_test.go -- a driver-specific test file may add its own stronger
+// guarantees but may never weaken those.
 package storage
 
 import (
@@ -118,8 +121,8 @@ type Info struct {
 // buffers an object in memory is a bug, not a tuning choice.
 type Store interface {
 	// Create stages a new object. Write the bytes to the returned Writer, then
-	// Commit (durable) or Abort (discarded). Nothing is observable at the object's
-	// key until Commit returns.
+	// Commit (durable) or Abort (discarded). Nothing PARTIAL is ever observable
+	// at the object's key -- see Writer for exactly when a driver publishes.
 	Create(ctx context.Context) (Writer, error)
 
 	// Get streams an object's bytes. The caller MUST Close the reader.
@@ -149,6 +152,23 @@ type Store interface {
 // The Key is not a parameter, it is a RESULT: you get it from Digest (after
 // writing) or from Commit. That is what makes "bytes before metadata" structural
 // rather than aspirational.
+//
+// THE PUBLICATION CONTRACT, and it is DRIVER-AWARE -- the load-bearing property
+// is not "Commit publishes", it is:
+//
+//	Bytes are durable at their content address STRICTLY BEFORE any metadata row
+//	names them. Local publishes at Commit; S3 publishes at Sync and RE-ASSERTS at
+//	Commit under the caller's digest advisory lock. Neither ever publishes a torn
+//	or partial object, and no reader reaches storage except through a live
+//	metadata row.
+//
+// The re-assertion is not ceremony. A driver that publishes before the lock is
+// taken can have its object reaped by a concurrent ReapDigest in the window
+// between publication and the lock; the PUT would then write a live metadata row
+// naming bytes that are gone, which is dangling metadata and a permanent 500 --
+// the forbidden side of the ordering invariant. Any such driver MUST re-check
+// (and if necessary re-publish) inside Commit, using CONSTANT-TIME calls on the
+// common path.
 type Writer interface {
 	io.Writer
 
@@ -161,28 +181,36 @@ type Writer interface {
 	// them and dedup onto the copy that is already there.
 	Digest() (Key, int64)
 
-	// Sync makes the staged bytes durable WITHOUT naming them: it fsyncs the staged
-	// object but does not rename it into place, so nothing is observable at the
-	// object's content address yet.
+	// Sync makes the staged bytes DURABLE. Local fsyncs the staged object without
+	// renaming it into place, so nothing is observable at the content address yet;
+	// S3 finishes the upload and server-side-copies to the content address, so
+	// there the object IS observable from here on. Both satisfy the publication
+	// contract above.
 	//
-	// This is the EXPENSIVE step -- an fsync of a possibly multi-GB object -- and it
-	// is a separate call so blob.Service can pay it BEFORE it opens the metadata
-	// transaction and takes the digest advisory lock, rather than holding a pool
-	// connection and the lock across a multi-second fsync while every other Postgres
-	// user starves. Commit then only renames and fsyncs the directory, which is
-	// milliseconds.
+	// This is the EXPENSIVE step -- an fsync, or a server-side copy, of a possibly
+	// multi-GB object -- and it is a separate call so blob.Service can pay it
+	// BEFORE it opens the metadata transaction and takes the digest advisory lock,
+	// rather than holding a pool connection and the lock across it while every
+	// other Postgres user starves. Commit is then constant-time on the common
+	// path.
 	//
 	// Bytes-first is preserved: the data is durable after Sync, before any metadata
-	// row. Sync is OPTIONAL -- Commit fsyncs the data itself if Sync was not called,
-	// so a caller that skips it still gets a durable object. Idempotent, and a no-op
-	// after Commit.
+	// row. Sync is OPTIONAL -- Commit does the whole job itself if Sync was not
+	// called, so a caller that skips it still gets a durable object. Idempotent,
+	// and a no-op after Commit.
 	Sync() error
 
 	// Commit makes the staged bytes durable at their content address and returns
-	// their Info. On return the bytes are fsynced and the rename is fsynced: a
-	// reader can never observe a torn or partial object, and a crash cannot
-	// resurrect one. When Sync was already called, the data fsync is elided and only
-	// the rename and directory fsync remain.
+	// their Info. On return, a reader can never observe a torn or partial object,
+	// and a crash cannot resurrect one.
+	//
+	// IT RUNS INSIDE THE CALLER'S TRANSACTION, HOLDING THE DIGEST ADVISORY LOCK.
+	// That is its whole cost budget: on the common path an implementation may make
+	// only CONSTANT-TIME calls here (Local: a rename plus a directory fsync; S3: a
+	// HeadObject plus a staging DELETE). Size-proportional work belongs in Sync.
+	// It is also the only window in which the driver and a concurrent physical
+	// delete are mutually excluded, which is why a driver that published in Sync
+	// must re-assert presence here -- see the publication contract above.
 	//
 	// Committing content that is already present is a no-op that succeeds -- the
 	// bytes are identical by construction.
@@ -190,7 +218,9 @@ type Writer interface {
 	// A second Commit returns ErrCommitted.
 	Commit(ctx context.Context) (Info, error)
 
-	// Abort discards the staged bytes. Idempotent, and a no-op after a successful
-	// Commit, so `defer w.Abort()` is always correct.
+	// Abort discards the staged bytes -- the STAGED ones only, NEVER the object at
+	// the content address, which on the dedup path is live, referenced and
+	// somebody else's. Idempotent, and a no-op after a successful Commit, so
+	// `defer w.Abort()` is always correct.
 	Abort() error
 }

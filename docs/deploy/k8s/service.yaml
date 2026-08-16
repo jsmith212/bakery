@@ -1,0 +1,22 @@
+# The PUBLIC listener only: HTTP (console + /api/v1 + /cache + /v2) and the
+# Bazel REAPI gRPC port. Never merge /metrics onto this Service -- it exposes
+# every org and project slug and their stored byte counts, which on a
+# publicly-routable Service is the customer list. See service-metrics.yaml.
+apiVersion: v1
+kind: Service
+metadata:
+  name: bakery
+  labels:
+    app.kubernetes.io/name: bakery
+spec:
+  selector:
+    app.kubernetes.io/name: bakery
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    # Omit this port entirely (and GRPC_ADDR in deployment.yaml) if no
+    # remote Bazel/moon client needs the REAPI listener.
+    - name: grpc
+      port: 9092
+      targetPort: grpc
