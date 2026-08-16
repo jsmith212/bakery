@@ -275,6 +275,11 @@ test.describe('console: dev-login through config snippets', () => {
 
 test.describe('console: personal access tokens and robots (wave 1)', () => {
 	test('/user: mint a personal access token, one-time reveal, bkru_ prefix', async ({ page }) => {
+		// Declared at test scope: used across two steps. unique() because
+		// user_tokens_active_name_key is UNIQUE (user_id, name) WHERE revoked_at
+		// IS NULL and the dev user persists across local runs -- a literal name
+		// makes the second run fail opaquely at the reveal assert.
+		const tokenName = unique('e2e-token');
 		await test.step('dev-login', async () => {
 			await signInWithoutAuth(page);
 		});
@@ -284,10 +289,6 @@ test.describe('console: personal access tokens and robots (wave 1)', () => {
 			await page.getByRole('button', { name: 'Create token' }).click();
 
 			const createDialog = page.getByRole('dialog');
-			// unique(): user_tokens_active_name_key is UNIQUE (user_id, name) WHERE
-			// revoked_at IS NULL, and the dev user persists across local runs -- a
-			// literal name makes the second run fail opaquely at the reveal assert.
-			const tokenName = unique('e2e-token');
 			await createDialog.locator('input[placeholder="build-host-1"]').fill(tokenName);
 			// Scope and expiry keep their defaults (write, 90 days).
 			await createDialog.getByRole('button', { name: 'Create token' }).click();

@@ -7,9 +7,9 @@ repos:
       # The OCI testdata is captured wire bytes whose sha256 is asserted verbatim
       # (see testIndexDigest); a "fixed" trailing newline changes the digest.
       - id: trailing-whitespace
-        exclude: ^(internal/cache/oci|test/oci)/testdata/
+        exclude: ^((internal/cache/oci|test/oci)/testdata/|docs/deploy/schemas/)
       - id: end-of-file-fixer
-        exclude: ^(internal/cache/oci|test/oci)/testdata/
+        exclude: ^((internal/cache/oci|test/oci)/testdata/|docs/deploy/schemas/)
       - id: check-added-large-files
       - id: detect-private-key
 
