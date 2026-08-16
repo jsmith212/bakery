@@ -108,12 +108,13 @@ export interface NavScopeInput {
  *  - `paramsOrg` absent -> fall back to `rememberedOrg`, but ONLY if it is
  *    still in `visibleOrgs` (an org the caller lost access to must read
  *    "none", not dangle a stale switcher entry forever).
- *  - `paramsProject` absent -> fall back to the remembered project, but
- *    ONLY when the org ALSO fell back. On `/o/acme/members` the missing
- *    project param is legitimate (there is no project in that route) and
- *    must read "none", not whatever project was last visited under a
- *    DIFFERENT org -- `rememberedProject` is namespaced per org precisely
- *    so this cannot happen even if this guard were removed.
+ *  - `paramsProject` absent -> fall back to the remembered project FOR THE
+ *    RESOLVED ORG, whether the org came from the path or from memory. On
+ *    `/o/acme/members` the missing project param only means the ROUTE has
+ *    no project segment, not that the user deselected one -- clearing the
+ *    switcher there forced a reselect on every trip through the org pages.
+ *    `rememberedProject` is namespaced per org, so a project last visited
+ *    under a DIFFERENT org can never surface here.
  */
 export function resolveNavScope(input: NavScopeInput): Tenancy {
 	const org =
@@ -122,8 +123,7 @@ export function resolveNavScope(input: NavScopeInput): Tenancy {
 			? input.rememberedOrg
 			: null);
 
-	const project =
-		input.paramsProject ?? (input.paramsOrg ? null : org ? input.rememberedProject(org) : null);
+	const project = input.paramsProject ?? (org ? input.rememberedProject(org) : null);
 
 	return { org, project };
 }

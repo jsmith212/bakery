@@ -206,10 +206,11 @@ describe('resolveNavScope', () => {
 		).toEqual({ org: 'acme', project: 'fw' });
 	});
 
-	it('/o/acme/members renders project none', () => {
-		// The org param is present, so the project fallback never fires -- an
-		// org-scoped route with no project segment is a legitimate "none", not
-		// a spot to guess into.
+	it('/o/acme/members keeps the remembered project sticky', () => {
+		// An org-scoped route has no project SEGMENT, but that is the route's
+		// shape, not a deselection: clearing the switcher here forced a
+		// reselect on every trip through the org pages (owner-reported). The
+		// org-namespaced remembered project is safe to keep showing.
 		expect(
 			resolveNavScope({
 				paramsOrg: 'acme',
@@ -218,7 +219,19 @@ describe('resolveNavScope', () => {
 				rememberedOrg: 'acme',
 				rememberedProject: rememberedProject('acme', 'fw')
 			})
-		).toEqual({ org: 'acme', project: null });
+		).toEqual({ org: 'acme', project: 'fw' });
+	});
+
+	it('an org page for org B never shows a project remembered under org A', () => {
+		expect(
+			resolveNavScope({
+				paramsOrg: 'beta',
+				paramsProject: null,
+				visibleOrgs: ['acme', 'beta'],
+				rememberedOrg: 'acme',
+				rememberedProject: rememberedProject('acme', 'fw')
+			})
+		).toEqual({ org: 'beta', project: null });
 	});
 
 	it('a stale remembered org (no longer visible) renders none', () => {
