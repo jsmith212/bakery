@@ -150,7 +150,10 @@
 	class="flex min-h-screen w-[var(--sidenav-w)] shrink-0 flex-col gap-px border-r border-border-0 bg-bg-1 p-2 font-sans"
 	aria-label="Console"
 >
-	<div class="px-2 pb-1 pt-1.5 text-md font-semibold text-text-1">Bakery</div>
+	<div class="flex items-center gap-2 px-2 pb-1 pt-1.5">
+		<img src="/logo-96.png" alt="" class="h-5 w-5 shrink-0" />
+		<span class="text-md font-semibold text-text-1">Bakery</span>
+	</div>
 
 	<div class="flex flex-col gap-0.5 pb-2 pt-1">
 		<div class="relative">

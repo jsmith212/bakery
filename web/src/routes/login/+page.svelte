@@ -81,8 +81,9 @@
 <div class="grid min-h-screen place-items-center bg-bg-0 p-6">
 	<div class="flex w-[340px] flex-col gap-[14px]">
 		<div class="pb-1 text-center">
+			<img src="/logo-192.png" alt="" class="mx-auto mb-2 h-16 w-16" />
 			<div class="text-xl font-semibold tracking-[-0.01em] text-text-1">Bakery</div>
-			<div class="mt-1 font-mono text-sm text-text-3">build cache</div>
+			<div class="mt-1 font-mono text-sm text-text-3">bake once. cache everything.</div>
 		</div>
 
 		{#if denial}

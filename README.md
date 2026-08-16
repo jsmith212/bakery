@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/brand/logo-full-768.png" alt="Bakery — bake once, cache everything" width="640" />
+</p>
+
 # Bakery
 
 A multi-tenant build cache server: Yocto (sstate + hash equivalence + source premirror),
