@@ -286,6 +286,20 @@ coverage: web generate web-test
   go tool cover -func=build/coverage.out
   go tool cover -html=build/coverage.out -o build/coverage.html
 
+# Build and run the WHOLE thing locally with one command: Postgres (started if
+# absent), migrations at boot, dev-login enabled, console at http://127.0.0.1:8080.
+#
+# Dev-login seeds dev@bakery.local as a site admin with dev-org/playground, so the
+# first click on "Sign in without auth" lands in a working console. This reuses the
+# bakery-testdb container, so state persists across restarts (just db-down resets).
+# NEVER a production shape: DEV_LOGIN_ENABLED also drops Secure off the session
+# cookie, which is exactly what makes plain-http localhost work.
+demo: build
+  @docker inspect bakery-testdb > /dev/null 2>&1 || just db-up
+  @until docker exec bakery-testdb pg_isready -U postgres -q; do sleep 0.3; done
+  DB_URL='postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable' \
+    DEV_LOGIN_ENABLED=1 ./build/bakery serve
+
 # Start a shared Postgres for the local test loop (faster than a container per package)
 db-up:
   docker run -d --name bakery-testdb -p 127.0.0.1:5432:5432 \
