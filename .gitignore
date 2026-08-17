@@ -1,6 +1,11 @@
 build/
 tmp/
 
+# goreleaser output (`just release-snapshot`). Must stay ignored: goreleaser
+# refuses to run a real release from a dirty tree, and its dirty check is
+# `git status --porcelain`, which lists untracked-but-not-ignored files.
+dist/
+
 # Env files, including the SvelteKit/Vite-documented local-secret names
 # (.env.local, .env.production, .env.*.local). A bare `*.env` misses every
 # name that does not end in `.env`, so the `.env` / `.env.*` rules are load

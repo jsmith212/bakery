@@ -1,0 +1,141 @@
+# The release poke. Dispatch it (Actions -> Release -> Run workflow) and it
+# computes the next version from the conventional commits since the last tag,
+# pushes an annotated vX.Y.Z tag, and re-invokes Build on that tag. Build's
+# tag run does everything else: the full conformance-gated pipeline, the ghcr
+# images, and the GitHub Release with binaries + notes (the `release` job in
+# build.yml).
+#
+# Releases are TAG-ONLY -- this workflow never commits to main. Version math is
+# commitizen's (`cz bump --yes --get-next`), the same tool pre-commit uses to
+# lint every commit message, so the format enforcer and the format interpreter
+# cannot drift apart. A plain `cz bump` is NOT usable here: with
+# version_provider=scm and no version files it fails after computing the
+# version, without creating the tag (empirically verified; see .cz.toml).
+#
+# If a tag exists but its Build run failed, do NOT re-poke this workflow (it
+# would mint a fresh version for the same commits). Fix main, or re-run:
+#   gh workflow run build.yml --ref vX.Y.Z
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump (auto derives it from the conventional commits since the last tag)"
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
+      dry_run:
+        description: "Only report the version and notes this would release; tag nothing"
+        type: boolean
+        default: false
+
+# One release at a time; a queued second poke must see the first one's tag.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push the tag
+  actions: write # gh workflow run build.yml
+  checks: read # wait-on-check-action reads check runs
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    # The dispatch UI offers any branch; a release cut from anything but main
+    # would tag commits the main-branch gates never saw in their merged state.
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      # Fail (or wait, if CI is still running) unless HEAD is green. Build's
+      # tag run re-verifies everything anyway; this check exists because its
+      # failure mode without it is a DANGLING TAG -- a vX.Y.Z pointing at a
+      # commit that can never release, burning the version number (see the
+      # re-run note in the header).
+      - name: Require green CI on HEAD
+        if: ${{ !inputs.dry_run }}
+        uses: lewagon/wait-on-check-action@v1.9.1
+        with:
+          ref: ${{ github.sha }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          running-workflow-name: tag # this job's own check run
+          wait-interval: 30
+          allowed-conclusions: success,skipped
+
+      # Full history: commitizen walks tags AND commits to compute the bump.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Pin matches the pre-commit hook rev -- one commitizen version decides
+      # both what a valid commit is and what it bumps.
+      - name: Install commitizen
+        run: pip install commitizen==4.8.3
+
+      - name: Compute the next version
+        id: next
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "$BUMP" != "auto" ]; then
+            args+=(--increment "$(echo "$BUMP" | tr '[:lower:]' '[:upper:]')")
+          fi
+          # Exit 21 is commitizen's NO_COMMITS_TO_BUMP: nothing releasable
+          # since the last tag. Let it fail the step -- that IS the answer.
+          next="$(cz bump --yes --get-next "${args[@]}")"
+          echo "version=v${next}" >> "$GITHUB_OUTPUT"
+          echo "next version: v${next}"
+
+      - name: Dry run report
+        if: ${{ inputs.dry_run }}
+        env:
+          VERSION: ${{ steps.next.outputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Dry run: would release ${VERSION}"
+            echo
+            # --unreleased-version prints the WHOLE changelog with the pending
+            # commits as the top section; keep only that first section.
+            cz changelog --unreleased-version "$VERSION" --dry-run \
+              | awk '/^## /{n++} n>1{exit} {print}'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tag and push
+        if: ${{ !inputs.dry_run }}
+        env:
+          VERSION: ${{ steps.next.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "$VERSION"
+          git push origin "refs/tags/$VERSION"
+
+      # A tag pushed with GITHUB_TOKEN does not fire build.yml's tags trigger
+      # (GitHub's recursion guard), so invoke it explicitly. Same run either
+      # way: github.ref is refs/tags/vX.Y.Z, the image job publishes the
+      # version tag, and the release job publishes the GitHub Release.
+      - name: Run Build on the tag
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.next.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh workflow run build.yml --repo "$GITHUB_REPOSITORY" --ref "$VERSION"
+          {
+            echo "## Released ${VERSION}"
+            echo
+            echo "Tag pushed; Build dispatched on it. The GitHub Release appears"
+            echo "when the gates pass:"
+            echo
+            echo "https://github.com/${GITHUB_REPOSITORY}/actions/workflows/build.yml"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -34,7 +34,11 @@ COPY --from=web /src/web/dist ./web/dist
 # in the build context. Without this the build fails on a missing package.
 RUN go tool sqlc -f internal/db/sqlc.yaml generate
 
-RUN CGO_ENABLED=0 go build -o /bakery .
+# The stamp is the ONLY way the image can know its version: .dockerignore
+# excludes .git/, so buildVersion()'s VCS fallback reads nothing here. CI passes
+# the tag name (or sha-<sha> on main); a bare local `docker build` reports "dev".
+ARG VERSION=""
+RUN CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /bakery .
 
 
 FROM gcr.io/distroless/static-debian12:nonroot

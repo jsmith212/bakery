@@ -7,6 +7,12 @@ on:
     # this is the trigger that makes a tag push run CI at all.
     tags: ['v*']
   pull_request:
+  # Exists solely for release.yml: a tag pushed with GITHUB_TOKEN does not fire
+  # the `tags` trigger above (GitHub's recursion guard), so the release poke
+  # dispatches this workflow on the tag ref explicitly. Such a run is
+  # indistinguishable from a natural tag push -- github.ref is the tag either
+  # way, which is what the `image` and `release` job conditions key on.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -541,6 +547,11 @@ jobs:
       contents: read
       packages: write
 
+    # The digest ends up in the release notes: the tag `vX.Y.Z` is mutable in
+    # principle, the digest is what a paranoid deploy pins.
+    outputs:
+      digest: ${{ steps.build-and-push.outputs.digest }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -592,8 +603,86 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: ${{ steps.tags.outputs.tags }}
+          # The binary's self-reported version (`-X main.version`): the release
+          # tag when there is one, the sha-image tag otherwise. Without this the
+          # image has NO version at all -- .dockerignore excludes .git/, so the
+          # VCS-revision fallback reads nothing inside this build.
+          build-args: |
+            VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('sha-{0}', github.sha) }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Image digest
         run: echo ${{ steps.build-and-push.outputs.digest }}
+
+  # The GitHub Release: five-platform binary archives + SHA256SUMS + notes.
+  # Runs only on a vX.Y.Z tag ref (release.yml is what creates those), and
+  # `needs: [image]` chains it behind every conformance gate transitively -- a
+  # release cannot exist for a commit that failed a gate, and it always names an
+  # image that actually got published.
+  #
+  # Division of labor: commitizen writes the notes (same tool that lints every
+  # commit -- one conventional-commits parser), goreleaser builds and uploads
+  # the artifacts (.goreleaser.yaml; its changelog is disabled).
+  release:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [image]
+
+    permissions:
+      contents: write # create the GitHub Release
+
+    steps:
+      # Full history: `cz changelog` walks the tag graph to bound the section.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "25"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - uses: extractions/setup-just@v3
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Pin matches the pre-commit hook rev, like release.yml.
+      - name: Install commitizen
+        run: pip install commitizen==4.8.3
+
+      # `cz changelog <tag> --dry-run` emits exactly that version's section
+      # (verified empirically). The image reference is appended here because
+      # goreleaser never learns about the image at all -- the gated buildx job
+      # above owns it.
+      - name: Generate release notes
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          cz changelog "$GITHUB_REF_NAME" --dry-run > build/release-notes.md
+          {
+            echo
+            echo "### Container image"
+            echo
+            echo '```'
+            echo "ghcr.io/jsmith212/bakery:${GITHUB_REF_NAME}"
+            echo "ghcr.io/jsmith212/bakery@${{ needs.image.outputs.digest }}"
+            echo '```'
+          } >> build/release-notes.md
+
+      - name: Build and publish the release
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser # OSS, not pro
+          version: "~> v2"
+          args: release --clean --release-notes=build/release-notes.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

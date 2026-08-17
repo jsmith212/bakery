@@ -1,0 +1,62 @@
+# Release artifacts only. goreleaser builds the binary matrix, packages it, and
+# uploads the GitHub Release; it does NOT own version selection (commitizen, in
+# .github/workflows/release.yml), release notes (commitizen again -- passed in
+# via --release-notes, see `changelog.disable` below), or container images (the
+# gated `image` job in build.yml publishes ghcr; goreleaser's docker support is
+# deliberately unused so an image can never exist for a commit that failed the
+# conformance gates).
+#
+# Everything in this file is core OSS goreleaser -- no Pro-only keys.
+version: 2
+
+project_name: bakery
+
+# The binary embeds web/dist and compiles against the generated sqlc repository,
+# neither of which is in git. Running the just recipes as hooks means a release
+# build CANNOT silently ship a stale frontend or fail on a fresh checkout --
+# locally and in CI alike, and the justfile stays the single source of truth for
+# how those are produced.
+before:
+  hooks:
+    - just web
+    - just generate
+
+builds:
+  - id: bakery
+    main: .
+    binary: bakery
+    env:
+      - CGO_ENABLED=0
+    # {{ .Tag }} keeps the v prefix, matching what buildVersion() reports and
+    # what the ghcr image tag looks like.
+    ldflags:
+      - -s -w -X main.version={{ .Tag }}
+    # The one do-everything binary: server (`bakery serve`), API client, and
+    # break-glass admin. Servers are linux; the CLI half is why darwin and
+    # windows are on the list.
+    targets:
+      - linux_amd64
+      - linux_arm64
+      - darwin_amd64
+      - darwin_arm64
+      - windows_amd64
+
+archives:
+  - id: bakery
+    name_template: "bakery_{{ .Tag }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: "SHA256SUMS"
+
+# Notes come from commitizen (`cz changelog <tag> --dry-run`), the same tool that
+# lints every commit -- one conventional-commits parser, not two disagreeing
+# ones. The release job passes them with --release-notes.
+changelog:
+  disable: true
+
+release:
+  name_template: "{{ .Tag }}"

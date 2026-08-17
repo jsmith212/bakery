@@ -57,6 +57,13 @@ add-migration migration:
 build: web generate
   CGO_ENABLED=0 go build -o ./build/bakery .
 
+# Build the whole release artifact matrix into dist/ exactly as the release job
+# does -- five platforms, archives, SHA256SUMS -- publishing nothing. Needs
+# goreleaser on PATH (https://goreleaser.com/install/; OSS, not Pro). Version
+# selection, notes, and publishing live in .github/workflows/release.yml.
+release-snapshot:
+  goreleaser release --snapshot --clean
+
 # Run the server (needs Postgres: `just db-up` then export DB_URL -- see the README)
 run: web generate
   # `serve` is not optional: the binary is also the API client, so `go run .` with
