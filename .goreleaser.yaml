@@ -54,9 +54,14 @@ checksum:
 
 # Notes come from commitizen (`cz changelog <tag> --dry-run`), the same tool that
 # lints every commit -- one conventional-commits parser, not two disagreeing
-# ones. The release job passes them with --release-notes.
+# ones. The release job passes them with --release-notes, WHICH REQUIRES THE
+# CHANGELOG STAGE TO STAY ENABLED: `disable: true` also discards the
+# --release-notes file (goreleaser's documented behavior), and that shipped
+# v0.1.0 with an empty release body. With the stage enabled, a provided notes
+# file wins over this generated changelog; the git-log changelog below is only
+# ever used by local `just release-snapshot` runs, which publish nothing.
 changelog:
-  disable: true
+  use: git
 
 release:
   name_template: "{{ .Tag }}"
