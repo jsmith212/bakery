@@ -2,6 +2,14 @@
   <img src="docs/brand/logo-full-768.png" alt="Bakery — bake once, cache everything" width="640" />
 </p>
 
+<p align="center">
+  <a href="https://github.com/jsmith212/bakery/actions/workflows/build.yml"><img src="https://github.com/jsmith212/bakery/actions/workflows/build.yml/badge.svg" alt="Build" /></a>
+  <a href="https://github.com/jsmith212/bakery/releases/latest"><img src="https://img.shields.io/github/v/release/jsmith212/bakery" alt="Latest release" /></a>
+  <img src="https://img.shields.io/github/go-mod/go-version/jsmith212/bakery" alt="Go version" />
+  <a href="https://github.com/jsmith212/bakery/pkgs/container/bakery"><img src="https://img.shields.io/badge/ghcr.io-jsmith212%2Fbakery-2496ed" alt="Container image" /></a>
+  <a href="https://www.conventionalcommits.org"><img src="https://img.shields.io/badge/commits-conventional-fe5196" alt="Conventional commits" /></a>
+</p>
+
 # Bakery
 
 A multi-tenant build cache server: Yocto (sstate + hash equivalence + source premirror),
