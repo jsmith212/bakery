@@ -343,7 +343,10 @@ test.describe('console: personal access tokens and robots (wave 1)', () => {
 			await createDialog.getByRole('button', { name: 'Create robot' }).click();
 			await expect(createDialog).toBeHidden();
 
-			await expect(page.getByText('e2e-robot')).toBeVisible();
+			// exact: the success toast ("Created robot e2e-robot") is still on
+			// screen here and substring-matches the bare name -- a strict-mode
+			// violation whenever the assertion beats the toast's dismissal.
+			await expect(page.getByText('e2e-robot', { exact: true })).toBeVisible();
 		});
 
 		await test.step('mint the robot a token', async () => {
