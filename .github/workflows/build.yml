@@ -623,7 +623,9 @@ jobs:
   #
   # Division of labor: commitizen writes the notes (same tool that lints every
   # commit -- one conventional-commits parser), goreleaser builds and uploads
-  # the artifacts (.goreleaser.yaml; its changelog is disabled).
+  # the artifacts (.goreleaser.yaml; its changelog stage stays ENABLED there,
+  # because --release-notes is silently discarded when it is disabled -- the
+  # provided file wins over the generated changelog, which never runs).
   release:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
@@ -668,6 +670,13 @@ jobs:
           set -euo pipefail
           mkdir -p build
           cz changelog "$GITHUB_REF_NAME" --dry-run > build/release-notes.md
+          # The --release-notes flag below is the only thing standing between
+          # these notes and goreleaser's raw ungrouped git-log dump; assert cz
+          # actually produced a version section so a silently-empty cz run
+          # fails HERE, not on the published release. (The image block appended
+          # next makes the file non-empty unconditionally, so a bare `test -s`
+          # would prove nothing.)
+          grep -q '^## v' build/release-notes.md
           {
             echo
             echo "### Container image"

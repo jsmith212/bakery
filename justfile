@@ -60,7 +60,8 @@ build: web generate
 # Build the whole release artifact matrix into dist/ exactly as the release job
 # does -- five platforms, archives, SHA256SUMS -- publishing nothing. Needs
 # goreleaser on PATH (https://goreleaser.com/install/; OSS, not Pro). Version
-# selection, notes, and publishing live in .github/workflows/release.yml.
+# selection lives in .github/workflows/release.yml; notes generation and
+# publishing live in build.yml's `release` job.
 release-snapshot:
   goreleaser release --snapshot --clean
 

@@ -1,7 +1,8 @@
 # Release artifacts only. goreleaser builds the binary matrix, packages it, and
 # uploads the GitHub Release; it does NOT own version selection (commitizen, in
 # .github/workflows/release.yml), release notes (commitizen again -- passed in
-# via --release-notes, see `changelog.disable` below), or container images (the
+# via --release-notes; the `changelog:` block below explains why that stage
+# must stay enabled for the flag to work), or container images (the
 # gated `image` job in build.yml publishes ghcr; goreleaser's docker support is
 # deliberately unused so an image can never exist for a commit that failed the
 # conformance gates).
@@ -55,13 +56,16 @@ checksum:
 # Notes come from commitizen (`cz changelog <tag> --dry-run`), the same tool that
 # lints every commit -- one conventional-commits parser, not two disagreeing
 # ones. The release job passes them with --release-notes, WHICH REQUIRES THE
-# CHANGELOG STAGE TO STAY ENABLED: `disable: true` also discards the
-# --release-notes file (goreleaser's documented behavior), and that shipped
-# v0.1.0 with an empty release body. With the stage enabled, a provided notes
-# file wins over this generated changelog; the git-log changelog below is only
-# ever used by local `just release-snapshot` runs, which publish nothing.
-changelog:
-  use: git
+# CHANGELOG STAGE TO STAY ENABLED: with `disable: true` goreleaser's changelog
+# pipe never runs, and loading the --release-notes file happens INSIDE that
+# pipe, so the flag is silently discarded -- that shipped v0.1.0 with an empty
+# release body. Being enabled is this block's ENTIRE job; goreleaser's own
+# changelog generator never actually runs here. Snapshot builds skip the pipe
+# wholesale, and a real release short-circuits generation by providing the
+# notes file. The one path that would ever emit goreleaser's raw git-log dump
+# is a real tag release that LOST the --release-notes flag, which the release
+# job guards against by asserting the notes file carries a cz version heading.
+changelog: {}
 
 release:
   name_template: "{{ .Tag }}"
