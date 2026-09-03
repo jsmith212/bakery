@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/state';
+	import { projectPath } from '$lib/tenancy';
 
 	import { previewSnippet, generateSnippet } from '$lib/api/snippets';
 	import { isApiError } from '$lib/api/errors';
@@ -142,6 +143,23 @@
 	}
 
 	const gotcha = $derived(gotchas[selected]);
+	const selectedTile = $derived(tiles.find((t) => t.id === selected) ?? tiles[0]);
+	// The server guarantees an array, but `.length` on a missing field is how this
+	// screen blanked in v0.1.0 (nil slice -> `null`), so read it defensively --
+	// same as `files` and `env` below.
+	const pushCommands = $derived(response?.push_commands ?? []);
+	// One truth for "did this preview produce anything". The mint bar is gated
+	// on it too, so a key can never be minted into a snippet with no blocks --
+	// the one-time secret would have nothing to be baked into, and the empty
+	// state below would immediately invite a regenerate that wipes it.
+	const hasContent = $derived(
+		!!response &&
+			(!!response.local_conf ||
+				!!response.netrc ||
+				pushCommands.length > 0 ||
+				(response.files ?? []).length > 0 ||
+				(response.env ?? []).length > 0)
+	);
 </script>
 
 {#snippet block(title: string, content: string)}
@@ -207,7 +225,7 @@
 					</div>
 				{/if}
 
-				{#if response.preview}
+				{#if response.preview && hasContent}
 					<div
 						class="flex items-center gap-2.5 rounded-2 border border-border-0 bg-bg-2 px-3 py-2.5 text-sm text-text-2"
 					>
@@ -252,8 +270,8 @@
 				{#if response.netrc}
 					{@render block('~/.netrc', response.netrc)}
 				{/if}
-				{#if response.push_commands.length > 0}
-					{@render block('after a build — push to the cache', response.push_commands.join('\n'))}
+				{#if pushCommands.length > 0}
+					{@render block('after a build — push to the cache', pushCommands.join('\n'))}
 				{/if}
 				{#each response.files ?? [] as f (f.path)}
 					<div class="flex flex-col gap-1">
@@ -267,12 +285,21 @@
 						response.env.map((e) => `export ${e.name}="${e.value}"`).join('\n')
 					)}
 				{/if}
-				{#if !response.local_conf && !response.netrc && response.push_commands.length === 0 && (!response.files || response.files.length === 0) && (!response.env || response.env.length === 0)}
+				{#if !hasContent}
 					<EmptyState
 						glyph="∅"
-						title="Nothing to show"
-						desc="This project has no backend configured that {selected} can target. See the warning above."
-					/>
+						title="Nothing to generate for {selectedTile.name}"
+						desc="{selectedTile.name} needs the {selectedTile.backend} backend on this project. The warnings above say exactly what's missing or disabled — add it (or re-enable it on its backend page), then pick this tile again."
+					>
+						{#snippet action()}
+							<Button
+								variant="secondary"
+								size="md"
+								href="{projectPath(org.slug, project.slug)}/backends/new"
+								>Configure backends</Button
+							>
+						{/snippet}
+					</EmptyState>
 				{/if}
 			{/if}
 		</div>

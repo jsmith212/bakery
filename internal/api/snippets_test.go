@@ -1185,6 +1185,48 @@ func TestSnippetOCIToolsHaveNoPushCommands(t *testing.T) {
 	}
 }
 
+// TestSnippetPushCommandsIsAnArrayOnTheWire pins the JSON shape, not the Go one:
+// `len(nil) == 0` passes every len-based assertion in this file while the wire
+// carries `"push_commands":null`, and the console does `.length` on it -- which
+// is how selecting ANY non-yocto tile blanked the snippets screen in v0.1.0. The
+// three cases are the three ways the slice is left nil: a tool that never has a
+// push, an OCI tool (pull-through only), and yocto on a project with no sstate or
+// downloads. Both the minted and the preview branch go through snippetResponse.
+func TestSnippetPushCommandsIsAnArrayOnTheWire(t *testing.T) {
+	const wantKey = `"push_commands":[]`
+
+	cases := []struct {
+		name  string
+		store Store
+		body  string
+		want  int
+	}{
+		{"bazel minted", snippetStore(t, allSnippetBackends...), `{"tool":"bazel","scope":"read"}`, http.StatusCreated},
+		{"bazel preview", snippetStore(t, allSnippetBackends...), `{"tool":"bazel","preview":true}`, http.StatusOK},
+		{"docker preview", snippetStore(t, allSnippetBackends...), `{"tool":"docker","preview":true}`, http.StatusOK},
+		{"yocto with no backends", snippetStore(t), `{"tool":"yocto","preview":true}`, http.StatusOK},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := snippetAPI(t, tc.store, &fakeMinter{token: snippetToken})
+			w := snippetPost(t, a, principals(t)["proj_write"], tc.body, nil)
+
+			if w.Code != tc.want {
+				t.Fatalf("status = %d, want %d: %s", w.Code, tc.want, w.Body.String())
+			}
+
+			if !strings.Contains(w.Body.String(), wantKey) {
+				t.Errorf("wire body must carry %s, got:\n%s", wantKey, w.Body.String())
+			}
+
+			if strings.Contains(w.Body.String(), `"push_commands":null`) {
+				t.Errorf("push_commands must never be null on the wire")
+			}
+		})
+	}
+}
+
 // TestSnippetNeverEmitsAnIDSecretPair: a Bakery cache credential is ONE opaque
 // bkry_ token. `key_id:key_secret` is a credential that cannot exist, and it was the
 // single most repeated drift in the hand-authored console copy this generator
