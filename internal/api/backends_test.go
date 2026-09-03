@@ -284,6 +284,33 @@ func TestQuotaIsRefusedOnHashservAndOCI(t *testing.T) {
 	}
 }
 
+// TestQuotaIsAllowedOnRegistry is the OTHER OCI-shaped kind's opposite ruling
+// (buildkit-cache-export spec §5): unlike oci, registry has no upstream to fall
+// back to on eviction, `mode=max` exports run multi-GB by design, and a byte
+// quota is the operator's only ceiling -- so backendQuotaPatch must NOT refuse it
+// the way it refuses oci.
+func TestQuotaIsAllowedOnRegistry(t *testing.T) {
+	admin := principals(t)["proj_admin"]
+	store := fixtureStore(t)
+	a := testAPI(t, store, nil)
+
+	w := do(t, a, admin, http.MethodPost, Prefix+"/orgs/acme/projects/firmware/backends",
+		`{"kind":"registry","quota_bytes":1024}`)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body %s)", w.Code, w.Body.String())
+	}
+
+	var got Backend
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if got.QuotaBytes == nil || *got.QuotaBytes != 1024 {
+		t.Errorf("quota_bytes = %v, want 1024", got.QuotaBytes)
+	}
+}
+
 // CREATE ACCEPTS AN OVERRIDE AND KEEPS THE SEED OTHERWISE (D: R6#3).
 //
 // CreateBackend computes the opinionated window in SQL (spec §1.1/§4), so a create

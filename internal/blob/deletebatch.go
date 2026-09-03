@@ -69,7 +69,7 @@ func (s *Service) DeleteBatch(ctx context.Context, runID int64, refs []DeleteRef
 	}
 
 	if s.tx == nil {
-		return 0, errors.New("blob: service is read-only (no Txer configured)")
+		return 0, ErrReadOnly
 	}
 
 	backendID := refs[0].BackendID

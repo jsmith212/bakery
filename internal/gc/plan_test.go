@@ -125,9 +125,10 @@ func TestDerivedNamespaceWindows(t *testing.T) {
 	plans := buildPlans([]repository.ListBackendsForGCRow{
 		backendRow(1, repository.BackendKindBazel, project, day(30), true),
 		backendRow(2, repository.BackendKindOci, project, day(30), true),
+		backendRow(3, repository.BackendKindRegistry, project, day(30), true),
 	})
 
-	bazel, oci := plans[0], plans[1]
+	bazel, oci, registry := plans[0], plans[1], plans[2]
 
 	for _, ns := range []string{nsAC, nsACGRPC, nsSccache} {
 		if got := stageWindow(t, bazel, ns); got != day(30) {
@@ -166,6 +167,29 @@ func TestDerivedNamespaceWindows(t *testing.T) {
 	for i, st := range oci.stages {
 		if st.namespace != wantOrder[i] {
 			t.Fatalf("oci stage %d is %q, want %q", i, st.namespace, wantOrder[i])
+		}
+	}
+
+	// registry rides the OCI ladder VERBATIM (buildkit-cache-export spec §5): same
+	// three namespaces, same W/2W split, same order -- it differs from oci only in
+	// whether a quota may sit on top (backendQuotaPatch), which stagesFor never sees.
+	if got := stageWindow(t, registry, nsTags); got != day(30) {
+		t.Errorf("registry W_tags = %v, want 30d", got)
+	}
+
+	for _, ns := range []string{nsManifests, nsBlobs} {
+		if got := stageWindow(t, registry, ns); got != day(60) {
+			t.Errorf("registry W_%s = %v, want 60d (2 x W_tags)", ns, got)
+		}
+	}
+
+	if len(registry.stages) != 3 {
+		t.Fatalf("registry has %d stages, want 3 (tags, manifests, blobs)", len(registry.stages))
+	}
+
+	for i, st := range registry.stages {
+		if st.namespace != wantOrder[i] {
+			t.Fatalf("registry stage %d is %q, want %q", i, st.namespace, wantOrder[i])
 		}
 	}
 }

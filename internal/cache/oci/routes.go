@@ -23,8 +23,12 @@ const (
 var errBadRef = errors.New("oci: not a manifests or blobs reference")
 
 // errPushPath is the tail that names the PUSH API (<name>/blobs/uploads/...). It is
-// separated from errBadRef only so the handler can answer with UNSUPPORTED rather than
-// pretend the repository does not exist.
+// separated from errBadRef only so the MIRROR's handler can answer with UNSUPPORTED
+// rather than pretend the repository does not exist.
+//
+// The writable buildcache namespace does not consult it: its push verbs parse the tail
+// with splitUpload (registry.go) BEFORE ever reaching splitRef, so this error means the
+// same thing on both backends -- "that is a push URL, and this is not a push".
 var errPushPath = errors.New("oci: push is not implemented")
 
 // splitRef parses a registry path tail into (repository name, kind, reference).

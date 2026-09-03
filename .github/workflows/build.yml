@@ -402,6 +402,82 @@ jobs:
           name: oci-conformance-log
           path: build/oci-conformance.log
 
+  # The buildkit-cache-export gate: the WRITABLE buildcache namespace, driven by a real
+  # docker buildx container driver. It is the only conformance job here that runs a
+  # daemon -- buildkitd, in a container, on the runner's host network, pushing to and
+  # pulling from a Bakery bound on that same loopback.
+  #
+  # It exists because a cache export failure is INVISIBLE: the snippet carries
+  # ignore-error=true (without it a Bakery outage hard-fails every consumer build), so a
+  # completely broken buildcache still produces green builds and a permanently cold
+  # cache. The assertions are therefore against the server's recorded traffic, not the
+  # build's exit status -- and against both manifest shapes, because the two documents
+  # BuildKit exports are exactly the two that validating registries reject.
+  #
+  # A SEPARATE job, like the four gates above. ubuntu-latest already ships docker with
+  # the buildx plugin; skopeo comes from apt for the byte-identity half. It runs through
+  # `just registry-conformance`, where a skip FAILS.
+  registry-conformance:
+    runs-on: ubuntu-latest
+
+    # Same postgres service as the other jobs: dbtest uses TEST_DB_URL and never touches
+    # Docker, so the ephemeral database the backends boot against is this service. The
+    # DAEMON this job needs is the runner's own, for buildkitd -- not for the database.
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --health-start-period 10s
+
+    env:
+      TEST_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - uses: extractions/setup-just@v3
+
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+          skopeo --version
+
+      # Deliberately NOT docker/setup-buildx-action: that action creates a builder of its
+      # own, and this gate creates the builder it tests -- with network=host and its own
+      # buildkitd.toml, neither of which the action would apply. This step only proves the
+      # plugin the runner already ships is usable, so a missing plugin fails here with a
+      # clear message rather than as a skip three minutes later.
+      - name: Show the docker and buildx versions
+        run: |
+          docker version
+          docker buildx version
+
+      - name: Registry conformance (real docker buildx cache export/import + skopeo; a skip fails the job)
+        run: just registry-conformance
+
+      - name: Upload the registry conformance log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: registry-conformance-log
+          path: build/registry-conformance.log
+
   # Feedback wave 1's gate for the S3 storage driver. The Store-interface-only suite in
   # internal/storage/conformance_test.go runs twice: against Local, and against a REAL
   # minio the harness starts with `docker run` on a daemon-assigned port (path-style
@@ -539,6 +615,7 @@ jobs:
         hashserv-conformance,
         bazel-conformance,
         oci-conformance,
+        registry-conformance,
         storage-conformance,
         web-e2e,
       ]

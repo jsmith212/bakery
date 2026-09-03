@@ -436,7 +436,18 @@ func newFixture(t *testing.T) *fixture {
 func (f *fixture) seed(t *testing.T, namespace, key string, body []byte, ct string) storage.Key {
 	t.Helper()
 
-	w, err := f.store.Create(t.Context())
+	return seedObject(t, f.store, f.reader, namespace, key, body, ct, f.clock)
+}
+
+// seedObject is the shared body of every fixture's seed: bytes into the real local
+// store at their content address, then the matching fake metadata row.
+func seedObject(
+	t *testing.T, store storage.Store, reader *fakeReader,
+	namespace, key string, body []byte, ct string, at time.Time,
+) storage.Key {
+	t.Helper()
+
+	w, err := store.Create(t.Context())
 	if err != nil {
 		t.Fatalf("store.Create: %v", err)
 	}
@@ -450,7 +461,7 @@ func (f *fixture) seed(t *testing.T, namespace, key string, body []byte, ct stri
 		t.Fatalf("commit staged bytes: %v", err)
 	}
 
-	f.reader.add(namespace, key, info.Key, info.Size, ct, f.clock)
+	reader.add(namespace, key, info.Key, info.Size, ct, at)
 
 	return info.Key
 }

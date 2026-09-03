@@ -59,7 +59,7 @@ export type OrgRole = 'member' | 'admin' | 'owner';
 export type ProjectRole = 'reader' | 'writer' | 'admin';
 export type SiteRole = 'user' | 'admin';
 export type KeyScope = 'read' | 'write';
-export type BackendKind = 'sstate' | 'downloads' | 'hashserv' | 'bazel' | 'oci';
+export type BackendKind = 'sstate' | 'downloads' | 'hashserv' | 'bazel' | 'oci' | 'registry';
 
 export interface MeOrg {
 	id: string;
@@ -393,7 +393,8 @@ export type SnippetTool =
 	| 'containerd'
 	| 'buildkit'
 	| 'podman'
-	| 'docker';
+	| 'docker'
+	| 'buildcache';
 
 export const SNIPPET_TOOLS: readonly SnippetTool[] = [
 	'yocto',
@@ -404,7 +405,8 @@ export const SNIPPET_TOOLS: readonly SnippetTool[] = [
 	'containerd',
 	'buildkit',
 	'podman',
-	'docker'
+	'docker',
+	'buildcache'
 ] as const;
 
 /**

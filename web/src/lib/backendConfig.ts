@@ -49,6 +49,11 @@ export function backendEndpoints(kind: BackendKind, org: string, project: string
 				{ label: 'Endpoint (containerd/Docker)', value: `${base}/docker/v2/{rest}?ns=` },
 				{ label: 'Endpoint (BuildKit/podman)', value: `/v2/${org}/${project}/{rest}?ns=` }
 			];
+		case 'registry':
+			return [
+				{ label: 'Endpoint (containerd/Docker)', value: `${base}/docker/v2/buildcache/{rest}` },
+				{ label: 'Endpoint (BuildKit/podman)', value: `/v2/${org}/${project}/buildcache/{rest}` }
+			];
 	}
 }
 

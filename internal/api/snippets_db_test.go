@@ -58,7 +58,7 @@ func TestSnippetPreviewMintsNothing(t *testing.T) {
 
 	// A real, fully-configured project, so the previews below are full configs
 	// rather than warnings -- the point is that a COMPLETE snippet costs nothing.
-	for _, kind := range []string{"sstate", "downloads", "hashserv", "bazel", "oci"} {
+	for _, kind := range []string{"sstate", "downloads", "hashserv", "bazel", "oci", "registry"} {
 		h.createBackend(kind)
 	}
 

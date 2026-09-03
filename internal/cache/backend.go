@@ -102,6 +102,8 @@ func backendLabel(k repository.BackendKind) metrics.Backend {
 		return metrics.BackendBazel
 	case repository.BackendKindOci:
 		return metrics.BackendOCI
+	case repository.BackendKindRegistry:
+		return metrics.BackendRegistry
 	default:
 		// Unreachable: BackendKind is a Postgres enum and the column is NOT NULL.
 		// Returning a constant rather than string(k) keeps the label space closed

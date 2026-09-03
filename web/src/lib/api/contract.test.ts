@@ -40,6 +40,7 @@ import projectUsageFixture from './testdata/project-usage.json';
 import projectsFixture from './testdata/projects.json';
 import robotsFixture from './testdata/robots.json';
 import siteAdminsFixture from './testdata/site-admins.json';
+import snippetBuildcacheFixture from './testdata/snippet-buildcache.json';
 import snippetMintedFixture from './testdata/snippet-minted.json';
 import snippetPreviewFixture from './testdata/snippet-preview.json';
 import userTokensFixture from './testdata/user-tokens.json';
@@ -564,6 +565,19 @@ describe('response fixtures', () => {
 		expect(decoded.warnings?.[0]).toContain('one opaque bkry_ token');
 		// And never an id:secret pair, which is a credential shape that cannot exist.
 		expect(JSON.stringify(decoded)).not.toMatch(/bks_/);
+	});
+
+	it('a buildcache snippet carries a Files entry -- its push rides a flag, not push_commands', async () => {
+		const { decoded } = await serve(snippetBuildcacheFixture, (fetch) =>
+			snippetsApi.generateSnippet('acme', 'firmware', { tool: 'buildcache' }, { fetch })
+		);
+
+		expect(decoded.push_commands).toEqual([]);
+		expect(decoded.files).toHaveLength(1);
+		const script = decoded.files?.[0].content ?? '';
+		expect(script).toContain('docker buildx create --driver docker-container');
+		expect(script).toContain('--cache-to type=registry,ref=');
+		expect(script).toContain('ignore-error=true');
 	});
 });
 

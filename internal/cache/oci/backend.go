@@ -1,6 +1,12 @@
-// Package oci is the Docker/OCI pull-through proxy: a read-only registry mirror that
-// serves manifests, tags and blobs from Bakery's own blob store and fetches what it
-// does not have from an allowlisted upstream registry.
+// Package oci speaks the Docker/OCI registry protocol, as TWO backends over one set of
+// response helpers:
+//
+//   - Backend (kind `oci`) is the pull-through MIRROR: it serves manifests, tags and
+//     blobs from Bakery's own blob store and fetches what it does not have from an
+//     allowlisted upstream registry. Read-only to clients.
+//   - BuildCache (kind `registry`, registry.go) is the WRITABLE `buildcache` namespace:
+//     BuildKit's `--cache-to type=registry` target. It is the same core with NO Fetcher
+//     at all, so it can never contact an upstream and a miss is a clean 404.
 //
 // # The four things this package must never get wrong
 //
@@ -9,21 +15,27 @@
 // changes the digest and breaks Docker-Content-Digest for every client at once. It
 // reproduces only on multi-arch index manifests, i.e. not in your test and yes in
 // production. It is prevented STRUCTURALLY here: manifest bytes go from the upstream
-// response into blob.Service.Put with a VerifyDigest computed over those same bytes,
-// and are served back byte-for-byte. Nothing in this package parses a manifest.
+// response (or, on the writable namespace, from the client's PUT body) into
+// blob.Service.Put with a VerifyDigest computed over those same bytes, and are served
+// back byte-for-byte. Nothing in this package parses a manifest -- which is also why
+// both BuildKit cache shapes work: the index-of-blob-descriptors default and the
+// vnd.buildkit.cacheconfig.v0 image manifest each trip a different class of validating
+// registry, and Bakery has no opinion about either.
 //
 // THE STORED DIGEST IS OURS. The key a manifest is stored under is the sha256 WE
 // computed over the bytes WE received -- never the upstream's Docker-Content-Digest
-// header. go-containerregistry does not verify that header for tag fetches (its own
-// source says so: too many registries get it wrong), so trusting it would let one
-// broken upstream response store bytes under a digest they do not hash to, and every
-// client's content-store verification would then hard-fail on every pull of that
-// image, permanently.
+// header, and never the digest a pusher named. go-containerregistry does not verify
+// that header for tag fetches (its own source says so: too many registries get it
+// wrong), so trusting it would let one broken upstream response store bytes under a
+// digest they do not hash to, and every client's content-store verification would then
+// hard-fail on every pull of that image, permanently.
 //
 // AN UPSTREAM FETCH REQUIRES A VERIFIED PRINCIPAL. Every Fetcher method takes an
 // auth.Principal and rejects nil at entry. Without that, an anonymous request that
 // misses is a fetch made on the operator's credentials and rate limit -- an open relay
-// serving Docker Hub to the internet, indistinguishable from a busy cache.
+// serving Docker Hub to the internet, indistinguishable from a busy cache. On the
+// writable namespace the same property holds one level stronger: there is no Fetcher
+// field to be nil-guarded, so the relay is not merely refused, it is unrepresentable.
 //
 // EVERY FAILURE IS SILENT AT THE CLIENT. containerd, BuildKit, podman and Docker Engine
 // all fall back to the real registry on ANY mirror failure -- a 404, a 500, a bad
@@ -70,6 +82,26 @@ type RouteResolver interface {
 	Resolve(ctx context.Context, org, project string, kind repository.BackendKind) (cache.Route, bool)
 }
 
+// core is the state the two backends in this package share: the M1 seams, the server
+// config, and the response helpers that are identical whether or not an upstream
+// exists (challenge/token realm, manifest and blob serving, the read gate).
+//
+// IT DELIBERATELY HAS NO Fetcher. The writable buildcache backend (registry.go) is
+// exactly this core and nothing more, so "that namespace never contacts an upstream"
+// is expressed by the type having no field for one -- not by a flag some future edit
+// can forget to check.
+type core struct {
+	deps   cache.Deps
+	routes RouteResolver
+	authn  Authenticator
+	cfg    Config
+
+	// warnRealmOnce rate-limits the EXTERNAL_URL-unset warning to one line per process:
+	// the fallback fires on every token dance, and a warning per pull is noise nobody
+	// reads while a single line at first use is a config nudge somebody might.
+	warnRealmOnce sync.Once
+}
+
 // Backend implements cache.Backend: the OCI pull-through proxy.
 //
 // There is ONE Backend VALUE for the whole server -- exactly like the bazel backend --
@@ -78,11 +110,9 @@ type RouteResolver interface {
 // ping that podman requires, and `GET|POST /v2/token`), and registering a global
 // pattern twice panics the mux at startup.
 type Backend struct {
-	deps   cache.Deps
-	routes RouteResolver
-	authn  Authenticator
-	up     Fetcher
-	cfg    Config
+	core
+
+	up Fetcher
 
 	// sf collapses concurrent upstream work. A hundred nodes starting the same
 	// deployment pull the same layer at the same instant; without this that is a
@@ -94,11 +124,6 @@ type Backend struct {
 
 	// now is injectable so a test can advance past a tag TTL without sleeping.
 	now func() time.Time
-
-	// warnRealmOnce rate-limits the EXTERNAL_URL-unset warning to one line per process:
-	// the fallback fires on every token dance, and a warning per pull is noise nobody
-	// reads while a single line at first use is a config nudge somebody might.
-	warnRealmOnce sync.Once
 
 	// refreshHook, when non-nil, is called with the result of every completed
 	// background tag refresh. Production leaves it nil; tests use it to join the
@@ -119,7 +144,10 @@ var _ cache.Backend = (*Backend)(nil)
 // database.
 func New(deps cache.Deps, routes RouteResolver, authn Authenticator, up Fetcher, cfg Config) *Backend {
 	return &Backend{
-		deps: deps, routes: routes, authn: authn, up: up, cfg: cfg,
+		core: core{
+			deps: deps, routes: routes, authn: authn, cfg: cfg, warnRealmOnce: sync.Once{},
+		},
+		up: up,
 		sf: singleflight.Group{}, now: time.Now, refreshHook: nil, registered: false,
 	}
 }
@@ -265,7 +293,19 @@ func (q request) upstreamRef() UpstreamRef {
 //  4. Authenticate. May be anonymous on an open backend.
 //  5. Dispatch.
 func (b *Backend) serve(w http.ResponseWriter, r *http.Request) {
-	if r.PathValue("rest") == "" {
+	b.serveTail(w, r, r.PathValue("rest"))
+}
+
+// serveTail is serve with the repository tail made explicit instead of read from the
+// route pattern. The one caller besides serve is BuildCache's routing-shadow fallback:
+// the literal buildcache patterns statically shadow the mirror's {rest...} on every
+// project, so on a project with NO registry backend the fallback re-enters the mirror
+// here with the literal segment restored onto the tail -- handing back exactly the
+// request the mirror would have parsed had the buildcache patterns not been
+// registered. org/project still come from the request's own path wildcards, which
+// both pattern families bind identically.
+func (b *Backend) serveTail(w http.ResponseWriter, r *http.Request, tail string) {
+	if tail == "" {
 		b.serveTenantPing(w, r)
 
 		return
@@ -282,14 +322,14 @@ func (b *Backend) serve(w http.ResponseWriter, r *http.Request) {
 	// ordering argument lives on splitTagsList. It flows through the SAME policy,
 	// upstream and auth steps below -- the upstream matters even though the listing
 	// never dials one, because the upstream host is part of every tag's cache key.
-	name, isList := splitTagsList(r.PathValue("rest"))
+	name, isList := splitTagsList(tail)
 
 	var kind, ref string
 
 	if !isList {
 		var err error
 
-		name, kind, ref, err = splitRef(r.PathValue("rest"))
+		name, kind, ref, err = splitRef(tail)
 		if err != nil {
 			if errors.Is(err, errPushPath) {
 				// Honest rather than confusing: there is no push API, and a client that

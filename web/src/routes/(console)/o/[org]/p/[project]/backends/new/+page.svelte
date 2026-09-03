@@ -26,9 +26,10 @@
 		downloads: { hint: 'Yocto premirror', section: 'downloads — source premirror' },
 		hashserv: { hint: 'hash equivalence', section: 'hashserv — taskhash → unihash' },
 		bazel: { hint: 'REAPI + /ac /cas', section: 'bazel — action cache + CAS' },
-		oci: { hint: 'pull-through proxy', section: 'oci — pull-through proxy' }
+		oci: { hint: 'pull-through proxy', section: 'oci — pull-through proxy' },
+		registry: { hint: 'BuildKit cache export', section: 'registry — writable buildcache' }
 	};
-	const KIND_ORDER: BackendKind[] = ['sstate', 'downloads', 'hashserv', 'bazel', 'oci'];
+	const KIND_ORDER: BackendKind[] = ['sstate', 'downloads', 'hashserv', 'bazel', 'oci', 'registry'];
 
 	// Default to the first kind this project has not already configured, so
 	// the common "add the next backend" path lands on a useful choice rather
@@ -154,7 +155,7 @@
 
 	<div class="flex flex-col gap-1">
 		<Label>Type</Label>
-		<div class="grid grid-cols-5 gap-1.5">
+		<div class="grid grid-cols-6 gap-1.5">
 			{#each KIND_ORDER as id (id)}
 				<button
 					type="button"

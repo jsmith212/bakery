@@ -766,8 +766,10 @@ func backendKindOf(s string) (repository.BackendKind, error) {
 		return repository.BackendKindBazel, nil
 	case repository.BackendKindOci:
 		return repository.BackendKindOci, nil
+	case repository.BackendKindRegistry:
+		return repository.BackendKindRegistry, nil
 	default:
 		return "", errValidation("kind",
-			`kind must be one of "sstate", "downloads", "hashserv", "bazel", "oci"`)
+			`kind must be one of "sstate", "downloads", "hashserv", "bazel", "oci", "registry"`)
 	}
 }

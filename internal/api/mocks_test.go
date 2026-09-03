@@ -731,6 +731,7 @@ func seededRetention(kind repository.BackendKind) pgtype.Interval {
 		repository.BackendKindHashserv: 90,
 		repository.BackendKindBazel:    30,
 		repository.BackendKindOci:      30,
+		repository.BackendKindRegistry: 30,
 	}
 
 	d, ok := days[kind]

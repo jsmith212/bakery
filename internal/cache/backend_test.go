@@ -93,6 +93,7 @@ func TestRouteRefLabels(t *testing.T) {
 		{kind: repository.BackendKindHashserv, want: metrics.BackendHashserv},
 		{kind: repository.BackendKindBazel, want: metrics.BackendBazel},
 		{kind: repository.BackendKindOci, want: metrics.BackendOCI},
+		{kind: repository.BackendKindRegistry, want: metrics.BackendRegistry},
 	}
 
 	for _, tt := range tests {

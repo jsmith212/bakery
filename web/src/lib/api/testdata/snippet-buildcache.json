@@ -1,0 +1,31 @@
+{
+  "tool": "buildcache",
+  "host": "bakery.corp",
+  "base_url": "https://bakery.corp/cache/acme/firmware",
+  "local_conf": "",
+  "netrc": "",
+  "push_commands": [],
+  "files": [
+    {
+      "path": "build-with-cache.sh",
+      "language": "shell",
+      "content": "# Replace <repo>:<tag> with your own image name and cache tag below.\ndocker buildx create --driver docker-container --use\n\ndocker login bakery.corp -u bkry_9c8d7e6f5a4b3c2d1e0f1a2b3c4d5e6f7081920a1b2c3d4e -p bkry_9c8d7e6f5a4b3c2d1e0f1a2b3c4d5e6f7081920a1b2c3d4e\n\ndocker buildx build \\\n  --cache-to type=registry,ref=bakery.corp/acme/firmware/buildcache/<repo>:<tag>,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true \\\n  --cache-from type=registry,ref=bakery.corp/acme/firmware/buildcache/<repo>:<tag> \\\n  .\n"
+    }
+  ],
+  "api_key": {
+    "id": "e3f4a5b6-2c3d-4e5f-8a9b-6c7d8e9f0a12",
+    "name": "buildcache snippet 4f2a91",
+    "project_id": "2d8d8f3b-4f5a-4b6c-9d8e-7f6a5b4c3d2e",
+    "token_prefix": "bkry_9c8d7e6f",
+    "scope": "write",
+    "owner_id": "8f2b1d40-1f7a-4c9d-9a7a-0d2c3b4e5f60",
+    "owner_email": "anna@acme.dev",
+    "owner_name": "Anna Roux",
+    "created_at": "2026-09-03T10:11:12.000Z",
+    "expires_at": null,
+    "last_used_at": null,
+    "revoked_at": null,
+    "token": "bkry_9c8d7e6f5a4b3c2d1e0f1a2b3c4d5e6f7081920a1b2c3d4e"
+  },
+  "preview": false
+}

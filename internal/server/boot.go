@@ -380,6 +380,8 @@ func Boot(ctx context.Context, p BootParams) error {
 		grpc.MaxSendMsgSize(grpcMaxMsgSize),
 	)
 
+	ociMirror := oci.New(cacheDeps, routes, ociAuth{svc: authSvc}, ociUp, ociCfg)
+
 	cacheBackends := []cache.Backend{
 		httpblob.NewSstate(cacheDeps, routes, authn),
 		httpblob.NewDownloads(cacheDeps, routes, authn),
@@ -393,7 +395,17 @@ func Boot(ctx context.Context, p BootParams) error {
 		// under /cache/{org}/{project}/ -- see oci.Backend.Register. No new listener:
 		// it is plain HTTP on the public mux, headless included, exactly like sstate
 		// and downloads.
-		oci.New(cacheDeps, routes, ociAuth{svc: authSvc}, ociUp, ociCfg),
+		ociMirror,
+
+		// The WRITABLE buildcache namespace: BuildKit's `--cache-to type=registry`
+		// target, on the `registry` backend kind. It is constructed WITHOUT an upstream
+		// -- NewBuildCache has no Fetcher parameter at all -- so the anonymous-open-relay
+		// class of bug the mirror gates against cannot recur here: a miss is a 404 and
+		// there is nothing to relay to. It mounts the literal `buildcache` segment inside
+		// both families above, which ServeMux prefers over the mirror's {rest...}; the
+		// mirror is handed over as the read fallback so that shadow only bites on
+		// projects that actually HAVE a registry backend (spec §2).
+		oci.NewBuildCache(cacheDeps, routes, ociAuth{svc: authSvc}, ociCfg, ociMirror),
 	}
 
 	// Any backend that speaks gRPC registers its services here. Today only bazel does; the

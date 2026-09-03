@@ -246,6 +246,24 @@ func stagesFor(p backendPlan) []stage {
 			},
 		}
 
+	case repository.BackendKindRegistry:
+		// The OCI ladder VERBATIM (buildkit-cache-export spec §5): same storage trio
+		// under this kind's own backend_id, same reason tags outlive manifests outlive
+		// blobs (a live tag still names a manifest via FindMissingBlobs-style dedup).
+		// registry differs from oci only in whether a QUOTA may sit on TOP of this same
+		// stage order (backendQuotaPatch) -- the sweep itself does not know or care.
+		return []stage{
+			{namespace: nsTags, window: p.window, reason: metrics.GCReasonRetention, kindLabel: "tag"},
+			{
+				namespace: nsManifests, window: p.window * casWindowFactor,
+				reason: metrics.GCReasonRetention, kindLabel: "manifest",
+			},
+			{
+				namespace: nsBlobs, window: p.window * casWindowFactor,
+				reason: metrics.GCReasonRetention, kindLabel: "blob",
+			},
+		}
+
 	case repository.BackendKindHashserv:
 		return nil
 

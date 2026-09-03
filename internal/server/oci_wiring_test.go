@@ -106,6 +106,94 @@ func TestOCIMountsInBothModes(t *testing.T) {
 	}
 }
 
+// TestBuildCacheMountsInBothModes proves the buildcache boot wiring: the WRITABLE
+// registry backend registers its two literal-segment families -- three verbs each --
+// beside the read-only mirror's `{rest...}` patterns, the SPA, /api/v1 and every other
+// backend, in both modes, with no ServeMux panic.
+//
+// THE PRECEDENCE HALF IS THE POINT. `buildcache` is a literal segment inside the same
+// prefix the mirror claims with a wildcard, so ServeMux must prefer it; if it did not,
+// every export would land on the read-only mirror, which answers 404 UNSUPPORTED and
+// fails the build. The routes are UNCONFIGURED here (ok=false), so every case is a 404
+// -- but it must be the BuildCache handler's 404, never the SPA shell and never a 405
+// from a verb that was never registered.
+func TestBuildCacheMountsInBothModes(t *testing.T) {
+	deps := cache.Deps{Metrics: metrics.New()}
+	routes := stubRoutes{ok: false}
+
+	const (
+		buildkitTail = "/v2/acme/widget/buildcache/impulse"
+		tenantTail   = "/cache/acme/widget/docker/v2/buildcache/impulse"
+	)
+
+	targets := []struct {
+		name   string
+		method string
+		target string
+	}{
+		{"buildkit import, by tag", http.MethodGet, buildkitTail + "/manifests/main"},
+		{"buildkit push probe, HEAD by tag", http.MethodHead, buildkitTail + "/manifests/main"},
+		{"buildkit upload start", http.MethodPost, buildkitTail + "/blobs/uploads/"},
+		{"buildkit upload completion", http.MethodPut,
+			buildkitTail + "/blobs/uploads/u?digest=sha256:" + strings.Repeat("a", 64)},
+		{"buildkit manifest push", http.MethodPut, buildkitTail + "/manifests/main"},
+		{"containerd import, by tag", http.MethodGet, tenantTail + "/manifests/main"},
+		{"containerd upload start", http.MethodPost, tenantTail + "/blobs/uploads/"},
+		{"containerd manifest push", http.MethodPut, tenantTail + "/manifests/main"},
+	}
+
+	var bcBackend cache.Backend
+
+	for _, headless := range []bool{false, true} {
+		// A fresh oci.Backend per iteration for the same reason as above: it guards its
+		// GLOBAL routes against a double Register. BuildCache has no global routes and so
+		// needs no such guard, but it is rebuilt alongside for symmetry.
+		bc := oci.NewBuildCache(deps, routes, nil, oci.Config{ExternalURL: "https://bakery.example.com"}, nil)
+		bcBackend = bc
+
+		backends := []cache.Backend{
+			bazel.New(deps, routes, nil, nil),
+			httpblob.NewSccache(deps, routes, nil),
+			oci.New(deps, routes, nil, nil, oci.Config{ExternalURL: "https://bakery.example.com"}),
+			bc,
+		}
+
+		handler := NewHandler(Config{
+			Dist:          testDist(),
+			Headless:      headless,
+			API:           http.NotFoundHandler(),
+			CacheBackends: backends,
+		})
+
+		for _, tc := range targets {
+			t.Run(fmt.Sprintf("headless=%v/%s", headless, tc.name), func(t *testing.T) {
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.target, nil))
+
+				if rec.Code != http.StatusNotFound {
+					t.Errorf("%s %s = %d, want 404 from the unconfigured buildcache backend "+
+						"(405 means the verb was never registered)", tc.method, tc.target, rec.Code)
+				}
+
+				if body := rec.Body.String(); strings.Contains(body, "<title>bakery</title>") {
+					t.Errorf("%s %s returned the console shell -- the SPA catch-all swallowed the route",
+						tc.method, tc.target)
+				}
+
+				if ct := rec.Header().Get("Content-Type"); strings.HasPrefix(ct, "text/html") {
+					t.Errorf("%s %s served Content-Type %q -- a registry client would ingest HTML",
+						tc.method, tc.target, ct)
+				}
+			})
+		}
+	}
+
+	// Like the mirror, the writable namespace is HTTP-only: REAPI is bazel's alone.
+	if _, ok := bcBackend.(cache.GRPCBackend); ok {
+		t.Error("the buildcache backend implements cache.GRPCBackend -- it must not")
+	}
+}
+
 // TestOCIPingCarriesChallengeThroughBoot proves the highest-stakes M5 assertion
 // (see oci.Backend.challenge's doc) survives the REAL boot wiring, not just oci's own
 // package tests: podman/skopeo/CRI-O harvest auth challenges from the /v2/ ping

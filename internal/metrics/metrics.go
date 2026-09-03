@@ -96,6 +96,7 @@ const (
 	BackendHashserv  Backend = "hashserv"
 	BackendBazel     Backend = "bazel"
 	BackendOCI       Backend = "oci"
+	BackendRegistry  Backend = "registry"
 )
 
 // Storage driver labels. A CLOSED set: --storage-driver is a Kong enum over

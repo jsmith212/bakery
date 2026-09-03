@@ -1,0 +1,13 @@
+-- Reverse of 000017. A NO-OP: PostgreSQL has no `ALTER TYPE ... DROP VALUE`, and
+-- there is no supported way to remove one value from an enum in place (the
+-- documented workaround is rename-the-type-and-rebuild, which is a table
+-- rewrite on cache_backends for zero benefit here -- nothing downstream treats
+-- an unused enum member as a hazard the way it would treat a dangling column).
+--
+-- This is not a rollback gap in practice: `bakery migrate down` (and
+-- TestGCRetentionQuotasMigrationRoundTrips) roll every migration back to zero,
+-- and 000001's down drops `backend_kind` outright -- so a FULL down/up round
+-- trip still ends up clean, recreating the type from 000001's original five
+-- values and re-adding 'registry' here exactly once. What this file cannot do
+-- is take a database sitting at exactly 000017 back to exactly 000016 with
+-- 'registry' gone; nothing in Postgres can, short of that full rebuild.

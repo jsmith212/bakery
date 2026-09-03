@@ -5,9 +5,12 @@ import (
 	"net/http"
 )
 
-// The OCI distribution spec's error codes. Only the ones a PULL-THROUGH, READ-ONLY
-// proxy can produce are here: there is no push API, so BLOB_UPLOAD_*, MANIFEST_INVALID
-// and friends are unreachable by construction.
+// The OCI distribution spec's error codes this package can produce.
+//
+// The read-only mirror emits only the first block. The WRITABLE buildcache namespace
+// (registry.go) adds the second: containerd parses the envelope when the body carries
+// one, so a push failure that answers a bare status is a client-side "unknown error"
+// where it could have been a diagnosis.
 const (
 	// codeNameUnknown: the repository -- or, for us, the org/project/backend the
 	// repository would live under -- does not exist here.
@@ -19,8 +22,24 @@ const (
 	// codeUnauthorized: a credential is required and was absent or rejected. Paired
 	// with the Bearer challenge, never sent bare.
 	codeUnauthorized = "UNAUTHORIZED"
-	// codeUnsupported: an operation this proxy does not implement (every write verb).
+	// codeUnsupported: an operation this proxy does not implement (on the MIRROR, every
+	// write verb).
 	codeUnsupported = "UNSUPPORTED"
+
+	// codeDenied: authenticated, but the key is not write-scoped for this project. The
+	// 403 half of the write gate; see core.authorizeWrite.
+	codeDenied = "DENIED"
+	// codeDigestInvalid: the ?digest= on a blob PUT is missing, is not sha256, or does
+	// not match the bytes that arrived.
+	codeDigestInvalid = "DIGEST_INVALID"
+	// codeManifestInvalid: an empty or unreadable manifest body. It is NOT a
+	// content judgement -- nothing here parses a manifest.
+	codeManifestInvalid = "MANIFEST_INVALID"
+	// codeUnknown: an internal fault on a PUSH. The read path never 5xxes (a 5xx makes
+	// some clients retry rather than fall back); a push has nothing to fall back to, so
+	// hiding a storage fault behind a 404 would tell BuildKit "cache not found" and
+	// turn an outage into a silent cold build.
+	codeUnknown = "UNKNOWN"
 )
 
 // errorBody is the spec's error envelope: {"errors":[{"code":..,"message":..}]}.

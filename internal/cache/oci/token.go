@@ -119,7 +119,7 @@ func formToken(r *http.Request) (string, bool) {
 //
 // The realm MUST be an absolute URL -- see Config.ExternalURL for why deriving it from
 // the request is production-only-wrong.
-func (b *Backend) challenge(w http.ResponseWriter, r *http.Request, route cache.Route) {
+func (b *core) challenge(w http.ResponseWriter, r *http.Request, route cache.Route) {
 	w.Header().Set("WWW-Authenticate",
 		`Bearer realm="`+b.tokenURL(r, route)+`",service="bakery"`)
 }
@@ -131,7 +131,7 @@ func (b *Backend) challenge(w http.ResponseWriter, r *http.Request, route cache.
 // so the distinction is cosmetic -- but a client that harvested a challenge from the
 // tenant ping and later has to re-auth against a tenant path stays inside one path
 // prefix, which is what an operator reading an access log expects.
-func (b *Backend) tokenURL(r *http.Request, route cache.Route) string {
+func (b *core) tokenURL(r *http.Request, route cache.Route) string {
 	base := strings.TrimSuffix(b.cfg.ExternalURL, "/")
 	if base == "" {
 		// Direct-connection fallback -- and it FAILS CLOSED. Behind a TLS-terminating

@@ -37,7 +37,13 @@
 		{ id: 'containerd', name: 'containerd / k8s', backend: 'oci', hint: 'certs.d hosts.toml per upstream' },
 		{ id: 'buildkit', name: 'BuildKit', backend: 'oci', hint: 'registry mirror in buildkitd.toml' },
 		{ id: 'podman', name: 'Podman / skopeo / CRI-O', backend: 'oci', hint: 'registries.conf, no ?ns= ever sent' },
-		{ id: 'docker', name: 'Docker Engine', backend: 'oci', hint: 'daemon.json — forwards your real Hub login' }
+		{ id: 'docker', name: 'Docker Engine', backend: 'oci', hint: 'daemon.json — forwards your real Hub login' },
+		{
+			id: 'buildcache',
+			name: 'BuildKit cache',
+			backend: 'registry',
+			hint: '--cache-to/--cache-from type=registry'
+		}
 	];
 
 	const gotchas: Record<SnippetTool, string> = {
@@ -57,7 +63,9 @@
 		podman:
 			'containers/image never sends ?ns=, so this project needs default_upstream configured server-side. It also strips credentials on a cross-domain mirror — a docker.io login never reaches Bakery.',
 		docker:
-			'Docker Engine forwards your real Docker Hub login to this mirror, unscoped, on every pull. Only works against a backend with authenticated reads turned off.'
+			'Docker Engine forwards your real Docker Hub login to this mirror, unscoped, on every pull. Only works against a backend with authenticated reads turned off.',
+		buildcache:
+			'ignore-error=true is load-bearing: without it a failed export hard-fails the whole build, so a Bakery outage takes every consumer build down with it. Over plain HTTP, BuildKit also needs http = true set for this host in buildkitd.toml or it refuses the connection.'
 	};
 
 	// Same idiom as `$lib/api/errors`' `isApiErrorCode`: a checked narrowing into

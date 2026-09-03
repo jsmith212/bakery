@@ -50,8 +50,11 @@
 
 	// yocto composes sstate/downloads/hashserv into one snippet; bazel-family
 	// tools (moon/ccache/sccache/bazel) share the bazel backend; the OCI tools
-	// share one backend too -- containerd is the representative tile.
-	const snippetTool = $derived(kind === 'bazel' ? 'bazel' : kind === 'oci' ? 'containerd' : 'yocto');
+	// share one backend too -- containerd is the representative tile; registry
+	// (the writable buildcache namespace) has exactly one tool, buildcache.
+	const snippetTool = $derived(
+		kind === 'bazel' ? 'bazel' : kind === 'oci' ? 'containerd' : kind === 'registry' ? 'buildcache' : 'yocto'
+	);
 
 	// A backend cannot have a quota if it structurally can never be reached
 	// (hashserv stores no cache objects) or is bounded a different way (oci by
@@ -76,6 +79,10 @@
 		oci: [
 			{ label: 'Manifests', value: 'stored and served byte-exact' },
 			{ label: 'Upstream credentials', value: 'set by the operator, never per-project' }
+		],
+		registry: [
+			{ label: 'Upstream', value: 'none — writable only, a miss is a clean 404' },
+			{ label: 'Manifest digest', value: 'self-computed, never trusted from the client' }
 		]
 	};
 
@@ -136,7 +143,8 @@
 		downloads: [''],
 		hashserv: [],
 		bazel: ['ac', 'ac-grpc', 'cas', 'sccache'],
-		oci: ['tags', 'manifests', 'blobs']
+		oci: ['tags', 'manifests', 'blobs'],
+		registry: ['tags', 'manifests', 'blobs']
 	};
 
 	function nsLabel(ns: string): string {

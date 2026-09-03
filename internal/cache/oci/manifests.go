@@ -17,10 +17,12 @@ import (
 )
 
 // defaultManifestType is what we serve when a stored manifest has no recorded media
-// type -- only possible for a row written before content_type existed. It is the
-// docker manifest list type rather than an OCI one because that is what the
-// overwhelming majority of untyped legacy content is, and because a wrong guess here
-// is a client dispatch failure rather than corruption.
+// type: a row written before content_type existed, or a push that omitted the
+// Content-Type header (the OCI spec requires it and no real client omits it, but a
+// lenient store is better than a 400 for an unknown one). It is the docker manifest
+// list type rather than an OCI one because that is what the overwhelming majority of
+// untyped legacy content is, and because a wrong guess here is a client dispatch
+// failure rather than corruption.
 const defaultManifestType = "application/vnd.docker.distribution.manifest.v2+json"
 
 // serveManifest splits the two completely different kinds of manifest request.
@@ -168,7 +170,7 @@ func (b *Backend) storeManifest(ctx context.Context, req request, m Manifest) (b
 // The ETag is the digest, which makes If-None-Match a free 304 -- http.ServeContent
 // evaluates the precondition for us, so a client re-checking a manifest it already has
 // transfers no body.
-func (b *Backend) writeManifest(
+func (b *core) writeManifest(
 	w http.ResponseWriter, r *http.Request, ref blob.Ref, meta blob.Meta,
 ) {
 	mediaType := meta.ContentType
@@ -191,6 +193,11 @@ func (b *Backend) writeManifest(
 	w.Header().Set("Docker-Content-Digest", digest)
 	w.Header().Set("Content-Type", mediaType)
 	w.Header().Set("ETag", `"`+digest+`"`)
+	// The stored media type is a closed set on the buildcache write path
+	// (manifestMediaTypeAllowed) and upstream-chosen on the mirror; either way a
+	// browser must never be invited to sniff better than it. Defense in depth for
+	// the stored-XSS class, not the primary gate.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 
 	if r.Method == http.MethodHead {
 		w.Header().Set("Content-Length", strconv.FormatInt(meta.Size, 10))
@@ -308,7 +315,7 @@ func (b *Backend) ingest(
 // It is the ONLY witness: every registry client silently falls back to the real
 // registry on any mirror failure, so a bug here produces green builds, no complaints,
 // and a hit rate of zero. Logging loudly is not optional.
-func (b *Backend) internal(ctx context.Context, op string, err error) {
+func (b *core) internal(ctx context.Context, op string, err error) {
 	b.deps.Logger.ErrorContext(ctx, "oci: "+op, slog.Any("error", err))
 }
 

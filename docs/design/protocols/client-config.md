@@ -242,6 +242,64 @@ docker login bakery.corp -u {key} -p {key}
 
 ---
 
+## BuildKit cache export — `docker buildx build --cache-to`/`--cache-from`
+
+A different surface from the pull-through mirror above: `--cache-to type=registry` is a
+genuine registry *push*, so it targets a SEPARATE, writable namespace
+(`.../buildcache/<repo>:<tag>`) that only exists on a project with its own `registry`
+backend configured — it does not touch the `oci` backend or its config at all. Full wire
+contract: [BuildKit cache export spec](../specs/2026-09-03-buildkit-cache-export.md).
+
+The `docker-container` driver is required — the default `docker` driver cannot export
+cache at all:
+
+```bash
+docker buildx create --driver docker-container --use
+
+docker login bakery.corp -u {key} -p {key}
+
+docker buildx build \
+  --cache-to type=registry,ref=bakery.corp/{org}/{proj}/buildcache/{repo}:{tag},mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true \
+  --cache-from type=registry,ref=bakery.corp/{org}/{proj}/buildcache/{repo}:{tag} \
+  .
+```
+
+`{repo}:{tag}` are yours to pick — a `--cache-to` ref names one image's cache, and Bakery
+only knows the org/project, never which image(s) a project builds or what tag to cache it
+under.
+
+**⚠️ `ignore-error=true` is LOAD-BEARING, not a nicety — the snippet generator always
+emits it.** Without it, a failed export hard-fails the whole `docker buildx build`
+(`solver/llbsolver/export.go`), so a Bakery outage would take down every consumer build
+that exports cache, not merely degrade it. Cache import failure is unconditionally soft
+already (a discarded error and a cold build on a miss); only export needs the flag.
+
+**⚠️ Over plain HTTP, BuildKit also needs an explicit `http = true`** — there is no
+localhost-implies-http rule here (unlike go-containerregistry, which is why the
+pull-through mirror above needs no such stanza). Because the cache ref names
+`bakery.corp` directly rather than substituting it for a mirrored upstream, the entry is
+keyed on **Bakery's own host**, not on `docker.io` — a different stanza from the
+pull-through section above:
+
+```toml
+[registry."bakery.corp"]
+  http = true
+```
+
+`mode=max` writes every intermediate layer, not just the final one — this is what makes
+an unrelated later build stage come back `CACHED`. `image-manifest=true` +
+`oci-mediatypes=true` select the config-blob manifest shape
+(`application/vnd.buildkit.cacheconfig.v0`) over the default index-of-descriptors shape;
+Bakery stores and serves BOTH shapes verbatim (it parses neither), so either works, but
+the config-blob shape is also the one that round-trips through registries that validate
+or allowlist manifest config types, which is why the snippet emits it.
+
+**What this endpoint refuses:** everything but blob upload, blob PUT and manifest
+PUT/GET — there is no listing, no deletion, no repo browser, and pushing anything other
+than a BuildKit cache export is unsupported even though the wire wouldn't stop it.
+
+---
+
 ## Docker Engine (`dockerd`) — `/etc/docker/daemon.json`
 
 ```json
@@ -267,6 +325,6 @@ Support-and-warn was a deliberate product decision, not an oversight: leaving th
 |---|---|
 | **Yocto < Scarthgap 5.0** | No WebSocket transport, no hashserv auth, no GC. |
 | **Binary package feeds (ipk/deb/rpm)** | Out of scope — that's a repository server with a mutable index, not a cache. |
-| **Registry push, `/v2/_catalog`, tags list, delete, referrers** | Bakery's OCI backend is pull-through only. A client that tries one of these gets an honest 404/405 and falls back to the real registry, exactly like a mirror miss. |
+| **Registry push, `/v2/_catalog`, tags list, delete, referrers** | Bakery's OCI (mirror) backend is pull-through only. A client that tries one of these gets an honest 404/405 and falls back to the real registry, exactly like a mirror miss. (The separate `registry` backend's `buildcache` namespace above DOES accept a push — but only BuildKit cache export is documented, gated and supported there; catalog, tag listing and delete are unsupported on it too.) |
 | **Docker Schema1 manifests** | Rejected by containerd ≥ 2.0 already; no fallback rewrite exists on Bakery's side either. |
 | **Non-sha256 digests (e.g. `sha512:...`)** | go-containerregistry — the library Bakery's upstream client is built on — cannot fetch them either. A clean 404 sends the client to a registry that can. |

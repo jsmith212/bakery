@@ -666,6 +666,7 @@ func TestGCRetentionQuotasMigrationRoundTrips(t *testing.T) {
 	for _, kind := range []repository.BackendKind{
 		repository.BackendKindSstate, repository.BackendKindDownloads,
 		repository.BackendKindHashserv, repository.BackendKindBazel, repository.BackendKindOci,
+		repository.BackendKindRegistry,
 	} {
 		seedBackendKind(t, preRoundTrip, kind)
 	}
@@ -708,11 +709,13 @@ func TestGCRetentionQuotasMigrationRoundTrips(t *testing.T) {
 		repository.BackendKindHashserv: 90,
 		repository.BackendKindBazel:    30,
 		repository.BackendKindOci:      30,
+		repository.BackendKindRegistry: 30,
 	}
 
 	for _, kind := range []repository.BackendKind{
 		repository.BackendKindSstate, repository.BackendKindHashserv,
-		repository.BackendKindBazel, repository.BackendKindOci, repository.BackendKindDownloads,
+		repository.BackendKindBazel, repository.BackendKindOci, repository.BackendKindRegistry,
+		repository.BackendKindDownloads,
 	} {
 		id := seedBackendKind(t, serving, kind)
 

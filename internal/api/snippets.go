@@ -99,6 +99,12 @@ const snippetTokenPlaceholder = "«create an API key»"
 // so PushCommands stays empty for these too. All four target the SAME per-project OCI
 // backend through one of two route families (see cache/oci.Backend.Register); the
 // client picks the family, the snippet just emits the right shape for it.
+//
+// buildcache arrives with the BuildKit cache-export spec (2026-09-03, kind
+// registry): the one tool whose backend is genuinely writable. Its "push" is
+// BuildKit's own `--cache-to type=registry` flag baked into the buildx invocation
+// this tool emits -- not a separate CLI -- so PushCommands stays empty for it too;
+// the flag rides in Files instead.
 const (
 	SnippetToolYocto      = "yocto"
 	SnippetToolMoon       = "moon"
@@ -109,12 +115,14 @@ const (
 	SnippetToolBuildkit   = "buildkit"
 	SnippetToolPodman     = "podman"
 	SnippetToolDocker     = "docker"
+	SnippetToolBuildcache = "buildcache"
 )
 
 // snippetTools is the closed set, in the order the 422 message lists them.
 var snippetTools = []string{
 	SnippetToolYocto, SnippetToolMoon, SnippetToolCcache, SnippetToolSccache, SnippetToolBazel,
 	SnippetToolContainerd, SnippetToolBuildkit, SnippetToolPodman, SnippetToolDocker,
+	SnippetToolBuildcache,
 }
 
 func knownSnippetTool(tool string) bool {
@@ -258,7 +266,7 @@ func (a *API) handleGenerateSnippet(w http.ResponseWriter, r *http.Request) erro
 	if !knownSnippetTool(tool) {
 		return errValidation("tool",
 			`tool must be one of "yocto", "moon", "ccache", "sccache", "bazel", `+
-				`"containerd", "buildkit", "podman", "docker"`)
+				`"containerd", "buildkit", "podman", "docker", "buildcache"`)
 	}
 
 	keyScope, err := a.snippetScope(req.Scope, p, s)
@@ -511,6 +519,10 @@ func buildSnippet(t snippetTarget) snippetContent {
 	case SnippetToolDocker:
 		return gateOn(t, repository.BackendKindOci, func() snippetContent {
 			return dockerSnippet(t)
+		})
+	case SnippetToolBuildcache:
+		return gateOn(t, repository.BackendKindRegistry, func() snippetContent {
+			return buildcacheSnippet(t)
 		})
 	default: // yocto -- three independent backends, three independent blocks
 		return yoctoSnippet(t)
@@ -878,6 +890,46 @@ func dockerSnippet(t snippetTarget) snippetContent {
 				"It is never logged. Works only against an OCI backend with authenticated " +
 				"reads turned off: Docker Engine cannot present a Bakery key.",
 		},
+	}
+}
+
+// buildcacheSnippet builds the BuildKit `--cache-to type=registry` / `--cache-from`
+// invocation against Bakery's writable buildcache namespace (kind registry; see
+// cache/oci.BuildCache). Unlike the seven pull-through OCI tools above, this one
+// genuinely pushes -- but the push is BuildKit's own flag, not a separate CLI, so
+// it rides Files, not PushCommands (see the SnippetTool doc comment).
+//
+// <repo>:<tag> are LEFT AS LITERAL PLACEHOLDERS. A cache-to ref names one image's
+// cache, and Bakery has no way to know which image(s) a project builds or what
+// cache tag it wants -- unlike the mirror tools above, whose ref is the whole
+// per-project mount, this one is scoped narrower than the project. Filling them in
+// is the user's job; org/project are the only segments this generator can know.
+//
+// ignore-error=true is LOAD-BEARING (spec §1): without it a failed export
+// hard-fails the build (BuildKit's solver/llbsolver/export.go), so a Bakery outage
+// would fail every consumer build. image-manifest=true + oci-mediatypes=true
+// selects the config-blob manifest shape (application/vnd.buildkit.cacheconfig.v0)
+// over the default index-of-descriptors shape; Bakery stores and serves BOTH
+// verbatim (it parses neither), but the config-blob shape is the one that also
+// round-trips through registries that validate or allowlist manifest config types.
+func buildcacheSnippet(t snippetTarget) snippetContent {
+	ref := v2MirrorPath(t.host, t.org, t.project) + "/buildcache/<repo>:<tag>"
+
+	script := strings.Join([]string{
+		"# Replace <repo>:<tag> with your own image name and cache tag below.",
+		"docker buildx create --driver docker-container --use",
+		"",
+		fmt.Sprintf("docker login %s -u %s -p %s", t.host, t.token, t.token),
+		"",
+		"docker buildx build \\",
+		fmt.Sprintf("  --cache-to type=registry,ref=%s,mode=max,image-manifest=true,"+
+			"oci-mediatypes=true,ignore-error=true \\", ref),
+		fmt.Sprintf("  --cache-from type=registry,ref=%s \\", ref),
+		"  .",
+	}, "\n") + "\n"
+
+	return snippetContent{
+		files: []SnippetFile{{Path: "build-with-cache.sh", Language: "shell", Content: script}},
 	}
 }
 

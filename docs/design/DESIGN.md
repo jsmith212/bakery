@@ -179,6 +179,7 @@ Each is independently shippable and leaves the tree green.
 - **M5 — Docker OCI pull-through proxy. ✅ DONE** (see "M5 as landed" below). Byte-exact manifests, stale-while-revalidate, own Bearer challenge; ships containerd, BuildKit, podman/skopeo and Docker Engine.
 - **M6 — GC, retention, quotas. ✅ DONE** (see "M6 as landed" below). ([spec](specs/2026-08-14-m6-gc-retention-quotas.md)) Product decisions confirmed 2026-08-14: retention ships ON with per-kind defaults, `downloads` is an archive (never auto-evicts), org quota is a seed default only, OCI gets no quota, scheduling is a plain interval. (UI polish descoped to the SPA wiring wave.)
 - **SPA → API wiring wave. ✅ DONE** (see "SPA wiring as landed" below). ([spec](specs/2026-08-15-spa-api-wiring.md)) The console is real: every screen wired to `/api/v1`, zero mock data, path-based tenancy, session auth end to end, the snippet generator rebuilt (backend-aware, gRPC endpoint fixed, preview mode), new usage/objects/instance/GC-activity endpoints, and a Playwright e2e driving the real binary in CI.
+- **BuildKit cache export. ✅ DONE** (see "BuildKit cache export as landed" below). ([spec](specs/2026-09-03-buildkit-cache-export.md)) A new `registry` backend kind gives BuildKit's `--cache-to type=registry` a real, writable OCI namespace (`.../buildcache/<repo>:<tag>`) — the pull-through mirror's first write path. Cache-first, not a general registry: v1 documents, gates and supports only the cache-export/import round trip.
 
 ### M3: what the pre-implementation review got right, and what it got wrong
 
@@ -564,6 +565,67 @@ access tokens (placeholder ships; future milestone), invitations, multi-IdP, org
 mutation, ESLint-for-web. Known pre-existing flake: dbtest container provisioning can
 lose a race under full-suite parallelism (`TestCleanupDropsDatabase` et al.) — re-run the
 package; not caused by this wave.
+
+### BuildKit cache export as landed (2026-09-03)
+
+([spec](specs/2026-09-03-buildkit-cache-export.md)) A new `registry` backend kind gives
+the OCI mirror its first WRITE path: `internal/cache/oci/registry.go` +
+`registry_push.go` implement `BuildCache`, target of BuildKit's
+`--cache-to type=registry` at `.../buildcache/<repo>:<tag>`, registered as literal
+segments beside the mirror's `{rest...}` on both existing route families (no
+`splitRef` change, no registration panic). Migration `000017` adds only the enum value
+(`ALTER TYPE backend_kind ADD VALUE`, transaction-safe on the project's PG18 target;
+its down is a documented no-op — Postgres has no `DROP VALUE` — but a full
+down-to-zero round trip still lands clean because `000001`'s down drops the whole
+type). No new table, no new column: `BuildCache` reuses the mirror's three
+`cache_objects` namespaces (`blobs`, `manifests`, `tags`) verbatim under this kind's
+own `backend_id`.
+
+**The type has no `Fetcher` field, and `NewBuildCache` takes no upstream parameter at
+all** — the open-relay bug class the mirror spends a whole gate defending against is
+not merely disabled on this backend, it is unrepresentable. A small,
+behaviour-preserving refactor extracted an unexported `core` (the mirror's
+`writeManifest`/`writeBlob`/`challenge`/`authorize` machinery) that both `Backend` and
+`BuildCache` now embed, plus a new `core.authorizeWrite`: no/foreign credential → 401 +
+the existing Bearer challenge, authenticated-but-not-write-scoped → 403 `DENIED`. New
+OCI-envelope codes `DENIED`, `DIGEST_INVALID`, `MANIFEST_INVALID`, `UNKNOWN` — a
+push-path fault renders 500 `UNKNOWN`, deliberately, since a push has nothing to fall
+back to. The five headline wire/GC invariants (structural no-upstream, self-computed
+digest now also on a write path, 201-never-202 + exact `Docker-Content-Digest` on
+HEAD, `ignore-error=true` load-bearing in the snippet, the OCI GC ladder plus a quota
+`oci` itself refuses) are recorded in CLAUDE.md rather than restated here.
+
+**Kind plumbing** (sqlc, the metrics label, `backendKindOf`, `backendQuotaPatch`,
+`stagesFor`) shipped as its own stage ahead of the backend code: `registry` is the
+OCI-*shaped* kind that KEEPS quota enforcement — `mode=max` exports run multi-GB by
+design, so `registry` is deliberately absent from the refusal switch that excludes
+`hashserv`/`oci` — while inheriting `oci`'s 30-day retention default.
+
+**Console and snippet:** a sixth `BackendKind` and a new snippet tool `buildcache`
+join every exhaustive kind switch on both sides (`internal/api` gating and 422
+messages; web `KIND_META`/`KNOWN_KINDS`/`backendEndpoints`). The buildcache snippet is
+the first to populate `SnippetResponse.Files` rather than `PushCommands` — closing a
+long-standing "Files is a known gap" note in the golden-fixture contract test — because
+the export is BuildKit's own flag, not a separate CLI push.
+
+**The CI gate** (`just registry-conformance`, in `image.needs`): the real `docker
+buildx` container driver against a live `bakery serve`, both manifest shapes (the
+default index and `image-manifest=true`), a cold export → `buildx prune` → warm import
+cycle asserted against RECORDED TRAFFIC — POST upload 202, blob PUT 201, manifest PUT
+201, no 5xx, then `importing cache manifest` + `CACHED` on the warm build — **never
+the build's exit status**, because the snippet's own `ignore-error=true` makes a green
+build meaningless as a signal on its own. A read-only-key subtest proves writes
+401/403 while import still succeeds, and `skopeo inspect --raw` proves a byte-exact
+round trip on a manifest shaped so no JSON codec could reproduce it by accident. A
+`Fetcher`-backed mirror shares the project so the gate's zero-upstream-requests
+assertion has something to catch.
+
+**What this did NOT build (recorded):** PATCH chunked upload, the cross-repo mount's
+201 fast path, DELETE/untag, repo and tag listing (UI or API), generic image hosting
+or a `docker push` snippet, and per-repo quotas. Manifest→blob reachability marking is
+a follow-up, not a v1 gap papered over: blob liveness is `accessed_at` only, so a live
+tag can age out a blob nothing has imported — but BuildKit's cache import failure is
+unconditionally soft, so the failure mode is a cold build, never a broken one.
 
 ---
 

@@ -21,8 +21,10 @@ const anonymousToken = "anonymous"
 // auth.Principal (sealed, unforgeable, no exported constructor) satisfies it
 // structurally and this package never imports auth's concrete identity type.
 //
-// CanWriteProject is here even though the proxy has NO client-facing write path,
-// because the write question is what the UPSTREAM leg is gated on -- see upstream.go.
+// CanWriteProject answers two different questions in this package. On the MIRROR it
+// gates the UPSTREAM leg (see upstream.go), which has no client-facing write path. On
+// the writable buildcache namespace it is the real thing: every push verb is refused
+// unless it answers true -- see core.authorizeWrite.
 type Principal interface {
 	CanReadProject(orgID, projectID pgtype.UUID) bool
 	CanWriteProject(orgID, projectID pgtype.UUID) bool
@@ -131,6 +133,28 @@ func isBakeryToken(s string) bool {
 	return auth.LooksLikeBakeryToken(s)
 }
 
+// principal resolves the request's credential to a Principal, or nil for "anonymous".
+//
+// THE SHAPE GATE RUNS FIRST. credentialToken discards anything that is not
+// bkry_-shaped before it can reach the Authenticator, so a forwarded Docker Hub PAT
+// never costs a database probe, an error metric, or a log line -- on the read path or
+// on the write path. An authenticator error is nil, not an error: the caller decides
+// what "no identity" means, and the two callers decide differently (an open read is
+// served anonymously; every write is refused).
+func (b *core) principal(r *http.Request) Principal {
+	token, ok := credentialToken(r)
+	if !ok {
+		return nil
+	}
+
+	p, err := b.authn.AuthenticateToken(r.Context(), token)
+	if err != nil {
+		return nil
+	}
+
+	return p
+}
+
 // authorize resolves the caller's identity for a read.
 //
 // ROUTE BEFORE AUTH is already done by the caller (an unconfigured backend is 404 to
@@ -150,17 +174,11 @@ func isBakeryToken(s string) bool {
 //
 // A nil Principal is the anonymous caller, and it is meaningful downstream: no
 // principal means no upstream fetch, structurally (see upstream.go). An anonymous
-// caller is served from cache and gets a 404 on a miss.
-func (b *Backend) authorize(w http.ResponseWriter, r *http.Request, route cache.Route) (Principal, bool) {
-	token, ok := credentialToken(r)
-
-	var principal Principal
-
-	if ok {
-		if p, err := b.authn.AuthenticateToken(r.Context(), token); err == nil {
-			principal = p
-		}
-	}
+// caller is served from cache and gets a 404 on a miss. The writable buildcache
+// backend shares this gate and simply discards the principal -- it has no upstream to
+// spend it on, and its writes go through authorizeWrite instead.
+func (b *core) authorize(w http.ResponseWriter, r *http.Request, route cache.Route) (Principal, bool) {
+	principal := b.principal(r)
 
 	if !route.ReadAuthRequired {
 		// OPEN BACKEND: a principal that does not admit THIS route is downgraded to
@@ -186,4 +204,41 @@ func (b *Backend) authorize(w http.ResponseWriter, r *http.Request, route cache.
 	}
 
 	return principal, true
+}
+
+// authorizeWrite clears the WRITE gate for the buildcache namespace.
+//
+// A WRITE ALWAYS REQUIRES A WRITE-SCOPED KEY, whatever ReadAuthRequired says. That is
+// the standing cache invariant and the reason there is no WriteAuthRequired column: an
+// unauthenticated write is a cache-poisoning vector, so it must not be a representable
+// state. An open-read buildcache still refuses an anonymous push.
+//
+// The two denials are DIFFERENT CODES on purpose:
+//
+//   - No credential, an invalid one, or a FOREIGN-SHAPED one (a Docker Hub PAT a
+//     logged-in engine forwarded; credentialToken discarded it before it could reach
+//     the authenticator) are all "no credential" -> 401 WITH the Bearer challenge. The
+//     challenge is what sends BuildKit through the token dance instead of giving up:
+//     its authorizer only attempts auth for a host it has harvested a challenge from.
+//   - Authenticated but not write-scoped -> 403 DENIED, and 403 is safe here in a way
+//     it is not on the read path: the caller named its own project (so there is no
+//     existence oracle), and re-running the token dance would return the same read-only
+//     key, so 401 would be an infinite retry loop rather than a hint.
+func (b *core) authorizeWrite(w http.ResponseWriter, r *http.Request, route cache.Route) bool {
+	principal := b.principal(r)
+
+	if principal == nil {
+		b.challenge(w, r, route)
+		writeError(w, http.StatusUnauthorized, codeUnauthorized, "authentication required")
+
+		return false
+	}
+
+	if !principal.CanWriteProject(route.OrgID, route.ProjectID) {
+		writeError(w, http.StatusForbidden, codeDenied, "a write-scoped key is required")
+
+		return false
+	}
+
+	return true
 }

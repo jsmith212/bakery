@@ -55,6 +55,11 @@ SELECT * FROM cache_backends WHERE project_id = $1 ORDER BY kind;
 --     downloads KEEPS the org default (spec §1.2: only its retention_window is
 --     archived; its quota stays advisory-only, which the console renders, not
 --     forbidden the way hashserv's and oci's are).
+--     kind = 'registry' ALSO KEEPS the org default (buildkit-cache-export spec
+--     §5): unlike oci this kind has no upstream to fall back to on eviction, so
+--     `mode=max` exports run multi-GB by design and a byte quota is the
+--     operator's only ceiling -- the opposite of oci's product decision, not an
+--     oversight.
 --
 -- name: CreateBackend :one
 WITH org AS (
@@ -76,6 +81,7 @@ VALUES (
                 WHEN 'hashserv' THEN interval '90 days'
                 WHEN 'bazel'    THEN interval '30 days'
                 WHEN 'oci'      THEN interval '30 days'
+                WHEN 'registry' THEN interval '30 days'
                 ELSE NULL
             END)
     END,

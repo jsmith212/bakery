@@ -24,6 +24,7 @@ const testGRPCAddr = "127.0.0.1:9092"
 var allSnippetBackends = []repository.BackendKind{
 	repository.BackendKindSstate, repository.BackendKindDownloads,
 	repository.BackendKindHashserv, repository.BackendKindBazel, repository.BackendKindOci,
+	repository.BackendKindRegistry,
 }
 
 // snippetStore is fixtureStore with the named backends configured and ENABLED on
@@ -689,6 +690,7 @@ func TestSnippetRefusesBazelMoonWhenGRPCDisabled(t *testing.T) {
 	for _, tool := range []string{
 		SnippetToolYocto, SnippetToolCcache, SnippetToolSccache,
 		SnippetToolContainerd, SnippetToolBuildkit, SnippetToolPodman, SnippetToolDocker,
+		SnippetToolBuildcache,
 	} {
 		t.Run(tool+" is unaffected", func(t *testing.T) {
 			w := snippetPost(t, a, principals(t)["proj_write"], fmt.Sprintf(`{"tool":%q}`, tool), nil)
@@ -876,10 +878,11 @@ func TestSnippetRejectsUnknownTool(t *testing.T) {
 
 // TestSnippetSingleBackendToolsAreGated: ccache, sccache, bazel and moon all ride
 // the BAZEL backend (/ac, /cas and the sccache WebDAV mount are all kind=bazel);
-// containerd, buildkit, podman and docker all ride the OCI backend. With that
-// backend absent there is nothing to configure, so the response is a warning and NO
-// config -- not a file naming a mount that 404s, which every one of these clients
-// treats as an ordinary miss and reports to nobody.
+// containerd, buildkit, podman and docker all ride the OCI backend; buildcache
+// rides the REGISTRY backend, alone. With that backend absent there is nothing to
+// configure, so the response is a warning and NO config -- not a file naming a
+// mount that 404s, which every one of these clients treats as an ordinary miss and
+// reports to nobody.
 func TestSnippetSingleBackendToolsAreGated(t *testing.T) {
 	tests := []struct {
 		tool string
@@ -893,6 +896,7 @@ func TestSnippetSingleBackendToolsAreGated(t *testing.T) {
 		{tool: SnippetToolBuildkit, kind: repository.BackendKindOci},
 		{tool: SnippetToolPodman, kind: repository.BackendKindOci},
 		{tool: SnippetToolDocker, kind: repository.BackendKindOci},
+		{tool: SnippetToolBuildcache, kind: repository.BackendKindRegistry},
 	}
 
 	for _, tt := range tests {
@@ -1182,6 +1186,76 @@ func TestSnippetOCIToolsHaveNoPushCommands(t *testing.T) {
 		if len(out.PushCommands) != 0 {
 			t.Errorf("%s: push_commands = %v, want none (pull-through only)", tool, out.PushCommands)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// buildcache (kind registry)
+// ---------------------------------------------------------------------------
+
+// TestSnippetBuildcacheRegistryPush pins the wire shape of BuildKit's registry
+// cache-export invocation: the docker-container driver (the classic driver has no
+// registry cache-to/cache-from support), a login line carrying the token in BOTH
+// fields (one opaque bkry_ token, no id:secret split -- same rule as every other
+// tool), paired --cache-to/--cache-from flags at the SAME ref, ignore-error=true
+// (load-bearing: without it a failed export hard-fails the build, so a Bakery
+// outage would fail every consumer build), and the image-manifest + oci-mediatypes
+// pair that selects the config-blob cache shape.
+func TestSnippetBuildcacheRegistryPush(t *testing.T) {
+	out := snippetFor(t, SnippetToolBuildcache, "write", "https", "bakery.corp")
+
+	script := snippetFileContent(t, out)
+	const ref = "bakery.corp/acme/firmware/buildcache/<repo>:<tag>"
+
+	if !strings.Contains(script, "docker buildx create --driver docker-container") {
+		t.Errorf("must create a docker-container buildx driver:\n%s", script)
+	}
+
+	if !strings.Contains(script, "docker login bakery.corp -u "+snippetToken+" -p "+snippetToken) {
+		t.Errorf("must document BOTH credential fields with the real token:\n%s", script)
+	}
+
+	wantCacheTo := "--cache-to type=registry,ref=" + ref +
+		",mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"
+	if !strings.Contains(script, wantCacheTo) {
+		t.Errorf("cache-to must carry mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true:\n%s", script)
+	}
+
+	wantCacheFrom := "--cache-from type=registry,ref=" + ref
+	if !strings.Contains(script, wantCacheFrom) {
+		t.Errorf("cache-from must target the SAME ref as cache-to:\n%s", script)
+	}
+
+	if len(out.PushCommands) != 0 {
+		t.Errorf("push_commands = %v, want none -- the push is BuildKit's own flag, not a separate CLI",
+			out.PushCommands)
+	}
+}
+
+// TestSnippetBuildcachePreviewPlaceholder: a preview must not leak a real token
+// into the docker login line, and must still render the full ref-and-flags shape
+// so the console can show a complete preview before a key is minted.
+func TestSnippetBuildcachePreviewPlaceholder(t *testing.T) {
+	a := snippetAPI(t, snippetStore(t, allSnippetBackends...), &fakeMinter{token: snippetToken})
+
+	hdr := map[string]string{"X-Forwarded-Proto": "https", "X-Forwarded-Host": "bakery.corp"}
+	out := decodeSnippet(t, snippetPost(t, a, principals(t)["proj_write"],
+		`{"tool":"buildcache","preview":true}`, hdr), http.StatusOK)
+
+	script := snippetFileContent(t, out)
+
+	if !strings.Contains(script,
+		"docker login bakery.corp -u "+snippetTokenPlaceholder+" -p "+snippetTokenPlaceholder) {
+		t.Errorf("a preview must carry the placeholder, never a real token:\n%s", script)
+	}
+
+	if strings.Contains(script, snippetToken) {
+		t.Errorf("a preview must not contain a real token:\n%s", script)
+	}
+
+	if !strings.Contains(script,
+		"--cache-to type=registry,ref=bakery.corp/acme/firmware/buildcache/<repo>:<tag>") {
+		t.Errorf("a preview must still render the full ref:\n%s", script)
 	}
 }
 

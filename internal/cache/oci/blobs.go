@@ -136,7 +136,7 @@ func (b *Backend) ingestBlob(ctx context.Context, req request, hex string) (blob
 // with Range, and layers are the largest objects this system moves. httpblob.ServeObject
 // gives 206/416/If-Range through http.ServeContent, exactly as distribution's own
 // blobserver does.
-func (b *Backend) writeBlob(w http.ResponseWriter, r *http.Request, ref blob.Ref, meta blob.Meta) {
+func (b *core) writeBlob(w http.ResponseWriter, r *http.Request, ref blob.Ref, meta blob.Meta) {
 	b.blobHeaders(w, meta.Digest.String(), meta.Size)
 
 	if r.Method == http.MethodHead {
@@ -171,9 +171,12 @@ func (b *Backend) writeBlob(w http.ResponseWriter, r *http.Request, ref blob.Ref
 // Content-Type is octet-stream and is deliberately NOT the layer's declared media type:
 // a blob is opaque bytes to a registry, the manifest is what types it, and inventing a
 // type here would be a guess that clients have no reason to trust.
-func (b *Backend) blobHeaders(w http.ResponseWriter, hex string, size int64) {
+func (b *core) blobHeaders(w http.ResponseWriter, hex string, size int64) {
 	w.Header().Set("Docker-Content-Digest", "sha256:"+hex)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	w.Header().Set("Accept-Ranges", "bytes")
+	// Blob bytes are arbitrary tenant content on the buildcache namespace; a browser
+	// must take the octet-stream at its word rather than sniffing HTML out of it.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 }

@@ -52,14 +52,18 @@ import (
 //
 // # Known gaps, not this test's job to close
 //
-// Two fields exist on their Go type but are exercised by NO fixture row, so
-// the populated values below deliberately leave them at their zero value
-// (omitempty then drops them, matching the fixture): Member.ProjectRole (no
-// fixture carries a project's OWN member-list response, only an org's) and
-// SnippetResponse.Files (no fixture exercises the docker/OCI snippet tool,
-// which is the one that populates it). Populating either here would make this
-// test fail against fixtures that are simply incomplete, not wrong -- widening
-// the fixtures is a separate, TS-side change.
+// One field exists on its Go type but is exercised by NO fixture row, so the
+// populated value below deliberately leaves it at its zero value (omitempty
+// then drops it, matching the fixture): Member.ProjectRole (no fixture carries
+// a project's OWN member-list response, only an org's). Populating it here would
+// make this test fail against a fixture that is simply incomplete, not wrong --
+// widening the fixture is a separate, TS-side change.
+//
+// SnippetResponse.Files WAS this kind of gap (no fixture exercised an M4/M5
+// snippet tool) until the buildcache tool (2026-09-03, kind registry) landed --
+// snippet-buildcache.json is a real minted buildcache response and is unioned
+// into the SnippetResponse subtest below alongside the yocto preview and the
+// sccache mint.
 // ---------------------------------------------------------------------------
 
 // repoRoot walks up from this test file's own path (via runtime.Caller) to the
@@ -483,14 +487,16 @@ func TestWireTypesMatchTSFixtures(t *testing.T) {
 	})
 
 	t.Run("SnippetResponse", func(t *testing.T) {
-		// SnippetResponse.Files is a known gap -- see the package doc above -- so it
-		// is deliberately left unset here.
 		key := populatedAPIKey()
 		created := CreatedAPIKey{APIKey: key, Token: "bkry_" + "0123456789abcdef"}
 
 		resp := SnippetResponse{
 			Tool: "sccache", Host: "bakery.corp", BaseURL: "https://bakery.corp/cache/acme/firmware",
 			LocalConf: "", Netrc: "", PushCommands: []string{},
+			Files: []SnippetFile{{
+				Path: "build-with-cache.sh", Language: "shell",
+				Content: "docker buildx create --driver docker-container --use\n",
+			}},
 			Env:      []SnippetEnvVar{{Name: "SCCACHE_WEBDAV_TOKEN", Value: created.Token}},
 			APIKey:   &created,
 			Preview:  false,
@@ -500,6 +506,7 @@ func TestWireTypesMatchTSFixtures(t *testing.T) {
 		want := unionKeySet(
 			objectKeySet(t, readTestdata(t, "snippet-preview.json")),
 			objectKeySet(t, readTestdata(t, "snippet-minted.json")),
+			objectKeySet(t, readTestdata(t, "snippet-buildcache.json")),
 		)
 
 		assertSameKeySet(t, "SnippetResponse", marshaledKeySet(t, resp), want)

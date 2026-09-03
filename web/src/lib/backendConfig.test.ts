@@ -90,6 +90,12 @@ describe('backendEndpoints', () => {
 			{ label: 'Endpoint', value: '/cache/acme/firmware/sstate/{path}' }
 		]);
 	});
+
+	it('names both route families for registry -- the writable buildcache subtree', () => {
+		const eps = backendEndpoints('registry', 'acme', 'firmware');
+		expect(eps[0].value).toBe('/cache/acme/firmware/docker/v2/buildcache/{rest}');
+		expect(eps[1].value).toBe('/v2/acme/firmware/buildcache/{rest}');
+	});
 });
 
 describe('parseHashservConfig', () => {

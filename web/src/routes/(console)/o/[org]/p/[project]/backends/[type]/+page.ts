@@ -7,7 +7,14 @@ import type { BackendKind } from '$lib/api/types';
 
 import type { PageLoad } from './$types';
 
-const KNOWN_KINDS: readonly BackendKind[] = ['sstate', 'downloads', 'hashserv', 'bazel', 'oci'];
+const KNOWN_KINDS: readonly BackendKind[] = [
+	'sstate',
+	'downloads',
+	'hashserv',
+	'bazel',
+	'oci',
+	'registry'
+];
 
 function isBackendKind(value: string): value is BackendKind {
 	return (KNOWN_KINDS as readonly string[]).includes(value);

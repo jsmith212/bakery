@@ -91,6 +91,13 @@ var (
 	// cache_objects btree can hold. Caught here so it is a clean 400 rather than a
 	// runtime index failure on INSERT.
 	ErrInvalidKey = errors.New("blob: invalid object key")
+
+	// ErrReadOnly means the Service was built without a Txer and cannot write --
+	// the deliberate shape of read-only fixtures and of the fakeReader unit
+	// harnesses. Callers whose write is best-effort liveness (a Touch on a read
+	// path) test for this sentinel and skip silently; every other caller should
+	// treat it as the configuration error it is.
+	ErrReadOnly = errors.New("blob: service is read-only (no Txer configured)")
 )
 
 // errRevived aborts the reap transaction when the recheck finds the blob revived. It
@@ -609,7 +616,7 @@ var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 // where some future caller does not.
 func (s *Service) Touch(ctx context.Context, ref Ref) (bool, error) {
 	if s.tx == nil {
-		return false, errors.New("blob: service is read-only (no Txer configured)")
+		return false, ErrReadOnly
 	}
 
 	if err := ref.validate(); err != nil {
@@ -1009,7 +1016,7 @@ func (s *Service) put(ctx context.Context, ref Ref, r io.Reader, opts PutOptions
 	}
 
 	if s.tx == nil {
-		return PutResult{}, errors.New("blob: service is read-only (no Txer configured)")
+		return PutResult{}, ErrReadOnly
 	}
 
 	w, err := s.store.Create(ctx)
@@ -1183,7 +1190,7 @@ func (s *Service) cache(ref Ref, digest Digest, size int64, contentType string, 
 // zero.
 func (s *Service) Delete(ctx context.Context, ref Ref) (bool, error) {
 	if s.tx == nil {
-		return false, errors.New("blob: service is read-only (no Txer configured)")
+		return false, ErrReadOnly
 	}
 
 	var n int64
@@ -1243,7 +1250,7 @@ func (s *Service) Delete(ctx context.Context, ref Ref) (bool, error) {
 // and neither is an error.
 func (s *Service) ReapDigest(ctx context.Context, digest Digest) (bool, error) {
 	if s.tx == nil {
-		return false, errors.New("blob: service is read-only (no Txer configured)")
+		return false, ErrReadOnly
 	}
 
 	reaped := false

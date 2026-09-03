@@ -243,6 +243,54 @@ oci-conformance: generate
     fi; \
     echo "oci-conformance: containerd + crane + skopeo + the Docker Engine URL shape ran green" '
 
+# Drive the REAL docker buildx at the WRITABLE buildcache namespace (a skip FAILS)
+registry-conformance: generate
+  # The buildkit-cache-export gate (spec §8). Unlike every other conformance recipe here
+  # it drives a real DAEMON: `docker buildx create --driver docker-container
+  # --driver-opt network=host` starts a real buildkitd, and the suite writes it a
+  # buildkitd.toml marking the test's own listener `http = true` -- BuildKit has no
+  # localhost-implies-http rule, so without that every request is attempted over TLS
+  # against a cleartext server.
+  #
+  # WHAT IT PROVES THAT A UNIT TEST CANNOT. A cache export failure is INVISIBLE by
+  # design: the snippet carries ignore-error=true, because without it a Bakery outage
+  # HARD-FAILS every arcturus build. So a totally broken buildcache produces green
+  # builds and a permanently cold cache, and "the build passed" is worth nothing. Every
+  # assertion here is against the server's RECORDED TRAFFIC -- the 202 that starts an
+  # upload, the 201 that completes it (containerd hard-rejects a 202 there), the 201 on
+  # the manifest, and on the warm build the 200s that served it back. Both manifest
+  # shapes run: the default OCI index of blob descriptors, and image-manifest=true with
+  # its vnd.buildkit.cacheconfig.v0 config -- the two shapes validating registries
+  # reject, and Bakery accepts because it parses neither.
+  #
+  # A read-scoped key gets its own subtest: the export must be refused 401/403 AND the
+  # build must still exit 0, because ignore-error=true is under test rather than
+  # assumed; the import must still work with no write authority.
+  #
+  # Plus skopeo (installed by CI), which is the byte-identity proof: --raw prints the
+  # manifest bytes a third-party stack actually received, and comparing them to the
+  # pushed bytes is how "never re-serialize a manifest" is proved by something other
+  # than the code that stores them.
+  #
+  # Not in `just test-db` (which globs ./internal/...): both halves legitimately skip on
+  # a laptop with no docker and no skopeo. This recipe is their home, and here a skip is
+  # a failure -- including the skip for a daemon whose host network cannot reach this
+  # test's listener (Docker Desktop, a remote daemon), because on a native dockerd it
+  # always can.
+  #
+  # bash + pipefail (not `sh`): with `sh` the exit status of `go test | tee` is TEE's, so a
+  # failing suite would report as a pass -- the same trap `test-db`, `conformance`,
+  # `hashserv-conformance`, `bazel-conformance` and `oci-conformance` document.
+  mkdir -p build
+  bash -euo pipefail -c ' \
+    go test -v -count=1 -timeout 20m ./test/registry/... 2>&1 | tee build/registry-conformance.log; \
+    if grep -q -- "--- SKIP" build/registry-conformance.log; then \
+      grep -- "--- SKIP" build/registry-conformance.log; \
+      echo "FAIL: the registry conformance suite SKIPPED -- a real client did not run. Ensure docker or TEST_DB_URL, docker with the buildx plugin on a daemon whose host network reaches this machine, and skopeo."; \
+      exit 1; \
+    fi; \
+    echo "registry-conformance: the real docker buildx cache export/import + skopeo ran green" '
+
 # Run the shared storage conformance suite against BOTH drivers, S3 on a real minio (a skip FAILS)
 storage-conformance: generate
   # Feedback wave 1's gate for the S3 driver. The suite in

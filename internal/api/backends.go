@@ -422,6 +422,11 @@ func retentionWindowPatch(raw json.RawMessage, field string) (pgtype.Interval, b
 // one (that is why internal/gc still evicts OCI namespaces in stage order) -- so
 // this validation is the whole of the rule, and relaxing it later requires no
 // migration.
+//
+// registry -- the OTHER OCI-shaped kind -- is DELIBERATELY NOT in this switch (spec
+// buildkit-cache-export §5): it has no upstream to fall back to, `mode=max` exports
+// run multi-GB by design, and a byte quota is the operator's only ceiling. Same
+// storage shape as oci, opposite product decision.
 func backendQuotaPatch(
 	raw json.RawMessage, kind repository.BackendKind,
 ) (pgtype.Int8, bool, error) {
