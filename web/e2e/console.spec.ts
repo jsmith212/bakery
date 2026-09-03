@@ -316,8 +316,14 @@ test.describe('console: personal access tokens and robots (wave 1)', () => {
 		});
 
 		await test.step('the token now appears live in the table', async () => {
-			await expect(page.getByText(tokenName)).toBeVisible();
-			await expect(page.getByText('live')).toBeVisible();
+			// Scope to the row this test just created: a bare getByText('live')
+			// matches every live token's status badge, and the seeded dev user's
+			// table is not guaranteed to hold exactly one -- a reused local
+			// database carries rows from earlier runs (CI's fresh database
+			// masks the ambiguity). Same class as the robot-row locator fix.
+			const row = page.getByRole('row').filter({ hasText: tokenName });
+			await expect(row).toBeVisible();
+			await expect(row.getByText('live')).toBeVisible();
 		});
 	});
 
