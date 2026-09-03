@@ -351,13 +351,25 @@ func (a *API) handleGenerateSnippet(w http.ResponseWriter, r *http.Request) erro
 // snippetResponse assembles the wire body. key == nil is a PREVIEW: 200, no
 // credential, snippetTokenPlaceholder wherever a token would be.
 func snippetResponse(t snippetTarget, c snippetContent, key *CreatedAPIKey) SnippetResponse {
+	// push_commands is an ARRAY on the wire, always -- never null. It is legitimately
+	// empty for eight of the nine tools (they write to the cache themselves) and for
+	// a yocto project with neither sstate nor downloads, and every builder leaves it
+	// nil in those cases. A nil slice marshals as `null`, the console reads
+	// `.length` off it and throws before it can render the warnings that say WHY
+	// the snippet is thin -- a blank screen where the explanation should be. Same
+	// convention as newProject's backends.
+	push := c.pushCommands
+	if push == nil {
+		push = []string{}
+	}
+
 	return SnippetResponse{
 		Tool:         t.tool,
 		Host:         hostOnly(t.host),
 		BaseURL:      t.baseURL,
 		LocalConf:    c.localConf,
 		Netrc:        c.netrc,
-		PushCommands: c.pushCommands,
+		PushCommands: push,
 		Files:        c.files,
 		Env:          c.env,
 		APIKey:       key,

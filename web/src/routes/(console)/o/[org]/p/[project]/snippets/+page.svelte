@@ -142,6 +142,11 @@
 	}
 
 	const gotcha = $derived(gotchas[selected]);
+	const selectedTile = $derived(tiles.find((t) => t.id === selected) ?? tiles[0]);
+	// The server guarantees an array, but `.length` on a missing field is how this
+	// screen blanked in v0.1.0 (nil slice -> `null`), so read it defensively --
+	// same as `files` and `env` below.
+	const pushCommands = $derived(response?.push_commands ?? []);
 </script>
 
 {#snippet block(title: string, content: string)}
@@ -252,8 +257,8 @@
 				{#if response.netrc}
 					{@render block('~/.netrc', response.netrc)}
 				{/if}
-				{#if response.push_commands.length > 0}
-					{@render block('after a build — push to the cache', response.push_commands.join('\n'))}
+				{#if pushCommands.length > 0}
+					{@render block('after a build — push to the cache', pushCommands.join('\n'))}
 				{/if}
 				{#each response.files ?? [] as f (f.path)}
 					<div class="flex flex-col gap-1">
@@ -267,12 +272,18 @@
 						response.env.map((e) => `export ${e.name}="${e.value}"`).join('\n')
 					)}
 				{/if}
-				{#if !response.local_conf && !response.netrc && response.push_commands.length === 0 && (!response.files || response.files.length === 0) && (!response.env || response.env.length === 0)}
+				{#if !response.local_conf && !response.netrc && pushCommands.length === 0 && (!response.files || response.files.length === 0) && (!response.env || response.env.length === 0)}
 					<EmptyState
 						glyph="∅"
-						title="Nothing to show"
-						desc="This project has no backend configured that {selected} can target. See the warning above."
-					/>
+						title="Nothing to generate for {selectedTile.name}"
+						desc="{selectedTile.name} needs a {selectedTile.backend} backend on this project, and there isn't one. Add it, then pick this tile again — the warnings above say exactly what was left out."
+					>
+						{#snippet action()}
+							<Button variant="secondary" size="md" href="/o/{org.slug}/p/{project.slug}/backends"
+								>Configure backends</Button
+							>
+						{/snippet}
+					</EmptyState>
 				{/if}
 			{/if}
 		</div>
