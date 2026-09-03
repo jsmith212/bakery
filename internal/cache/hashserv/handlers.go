@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
-	"strings"
 
 	"github.com/jsmith212/bakery/internal/auth"
 	"github.com/jsmith212/bakery/internal/cache"
@@ -187,11 +186,14 @@ func (s *session) handleAuth(ctx context.Context, payload json.RawMessage) error
 }
 
 // authenticate probes the token field, then the username field. The shape check keeps a
-// username that is plainly not a token from costing a database round trip.
+// username that is plainly not a token from costing a database round trip -- and it MUST
+// be the whole token family (auth.LooksLikeBakeryToken, bkry_/bkru_/bkro_), never a
+// bkry_-only prefix test: a narrower gate here denied valid personal tokens in-band
+// while every HTTP plane accepted them. AuthenticateToken dispatches by kind.
 func (s *session) authenticate(ctx context.Context, req authRequest) (Principal, error) {
 	candidates := make([]string, 0, 2)
 	for _, f := range []string{req.Token, req.Username} {
-		if strings.HasPrefix(f, auth.TokenPrefix) {
+		if auth.LooksLikeBakeryToken(f) {
 			candidates = append(candidates, f)
 		}
 	}

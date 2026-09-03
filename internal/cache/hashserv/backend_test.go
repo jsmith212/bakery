@@ -54,6 +54,12 @@ func (s staticRoutes) Resolve(context.Context, string, string, repository.Backen
 const writeToken = "bkry_wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
 const readToken = "bkry_rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
 
+// Personal and robot tokens: the in-band gate must admit the whole token family,
+// not just project keys -- a bkry_-only prefix test here once denied these two
+// kinds in-band (build-halting) while every HTTP plane accepted them.
+const userWriteToken = "bkru_uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+const orgWriteToken = "bkro_ooooooooooooooooooooooooooooooooooooooooo"
+
 // rawClient is a hand-rolled hashserv client: it writes the exact WebSocket messages bitbake
 // writes, and nothing more.
 type rawClient struct {
@@ -150,8 +156,10 @@ func newBackend(t *testing.T, readAuthRequired bool) (*httptest.Server, cache.Ro
 	deps := cache.Deps{Blobs: &blob.Service{}, Metrics: metrics.New(), Logger: discardLogger()}
 
 	authn := fakeAuthenticator{
-		writeToken: {read: true, write: true},
-		readToken:  {read: true},
+		writeToken:     {read: true, write: true},
+		readToken:      {read: true},
+		userWriteToken: {read: true, write: true},
+		orgWriteToken:  {read: true, write: true},
 	}
 
 	b := New(deps, staticRoutes{route: route}, authn, s, nil)
@@ -262,18 +270,30 @@ func TestBadCredentialIsDeniedInBand(t *testing.T) {
 	}
 }
 
-// TestAuthAcceptsTheTokenInEitherField: a Bakery cache credential is ONE opaque bkry_ token,
-// not an id:secret pair. There is no secret half to split off, so it must authenticate whether
-// the client put it in the token field or the username field.
+// TestAuthAcceptsTheTokenInEitherField: a Bakery cache credential is ONE opaque token,
+// not an id:secret pair. There is no secret half to split off, so it must authenticate
+// whether the client put it in the token field or the username field -- and it must do
+// so for EVERY token kind (project key, personal token, robot token): this exercises
+// the real in-band pre-gate at session.authenticate, which once admitted bkry_ only.
 func TestAuthAcceptsTheTokenInEitherField(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
+	type authCase struct {
 		name string
 		auth map[string]any
-	}{
-		{name: "token field", auth: map[string]any{"username": "anything", "token": writeToken}},
-		{name: "username field", auth: map[string]any{"username": writeToken, "token": ""}},
+	}
+
+	var tests []authCase
+
+	for _, tok := range []struct{ kind, token string }{
+		{"project key", writeToken},
+		{"personal token", userWriteToken},
+		{"robot token", orgWriteToken},
+	} {
+		tests = append(tests,
+			authCase{name: tok.kind + "/token field", auth: map[string]any{"username": "anything", "token": tok.token}},
+			authCase{name: tok.kind + "/username field", auth: map[string]any{"username": tok.token, "token": ""}},
+		)
 	}
 
 	for _, tt := range tests {

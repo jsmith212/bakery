@@ -2,6 +2,7 @@ package bazel
 
 import (
 	"context"
+	"encoding/base64"
 	"testing"
 
 	repb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
@@ -62,9 +63,16 @@ func callRPC(b *Backend, ctx context.Context, rpc string, write bool) error {
 func TestAuthorizationMatrix(t *testing.T) {
 	// A ReadAuthRequired backend: reads need a read key, writes need a write key.
 	res := fakeResolver{org: "acme", project: "widget", route: testRoute(true), ok: true}
+	// All three token kinds: the credential gate must admit the whole family
+	// (a bkry_-only gate once bounced personal tokens as Unauthenticated before
+	// validation ever ran). What each principal may DO is the auth package's
+	// business -- these fakes only encode the outcome.
 	authn := fakeAuthn{byToken: map[string]fakePrincipal{
 		"bkry_read":  {read: true, write: false},
 		"bkry_write": {read: true, write: true},
+		"bkru_read":  {read: true, write: false},
+		"bkru_write": {read: true, write: true},
+		"bkro_write": {read: true, write: true},
 	}}
 
 	rpcs := []struct {
@@ -88,6 +96,9 @@ func TestAuthorizationMatrix(t *testing.T) {
 		{"no credential", context.Background()},
 		{"read key", bearerCtx("bkry_read")},
 		{"write key", bearerCtx("bkry_write")},
+		{"read personal token", bearerCtx("bkru_read")},
+		{"write personal token", bearerCtx("bkru_write")},
+		{"write robot token", bearerCtx("bkro_write")},
 	}
 
 	for _, rpc := range rpcs {
@@ -121,16 +132,22 @@ func TestAuthorizationMatrix(t *testing.T) {
 // the password field first: a token in EITHER field authenticates, mirroring
 // AuthenticateCache. A Bakery credential is one opaque token, so there is no id:secret.
 func TestAuthenticate_BasicCredential(t *testing.T) {
-	authn := fakeAuthn{byToken: map[string]fakePrincipal{"bkry_tok": {read: true, write: true}}}
+	authn := fakeAuthn{byToken: map[string]fakePrincipal{
+		"bkry_tok": {read: true, write: true},
+		"bkru_tok": {read: true, write: true},
+		"bkro_tok": {read: true, write: true},
+	}}
 	b := &Backend{authn: authn}
 
-	// token in the password field
-	if _, err := b.authenticate(basicCtx("ignored", "bkry_tok")); err != nil {
-		t.Errorf("token in password field: %v", err)
+	// every token kind, in the password field
+	for _, tok := range []string{"bkry_tok", "bkru_tok", "bkro_tok"} {
+		if _, err := b.authenticate(basicCtx("ignored", tok)); err != nil {
+			t.Errorf("%s in password field: %v", tok, err)
+		}
 	}
 
 	// token in the username field (empty password)
-	if _, err := b.authenticate(basicCtx("bkry_tok", "")); err != nil {
+	if _, err := b.authenticate(basicCtx("bkru_tok", "")); err != nil {
 		t.Errorf("token in username field: %v", err)
 	}
 
@@ -140,13 +157,54 @@ func TestAuthenticate_BasicCredential(t *testing.T) {
 	}
 }
 
+// TestCredentialCandidatesAcceptEveryTokenKind pins the gate itself: every arm
+// (bearer, basic, schemeless) must pass every Bakery token kind through to the
+// authenticator, and must drop foreign-shaped values without one. The
+// bkry_-only version of this gate is how personal tokens returned
+// Unauthenticated on gRPC while authenticating on every HTTP plane.
+func TestCredentialCandidatesAcceptEveryTokenKind(t *testing.T) {
+	basic := func(user, pass string) string {
+		return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
+	}
+
+	tests := []struct {
+		name    string
+		headers []string
+		want    []string
+	}{
+		{"bearer project key", []string{"Bearer bkry_t"}, []string{"bkry_t"}},
+		{"bearer personal token", []string{"Bearer bkru_t"}, []string{"bkru_t"}},
+		{"bearer robot token", []string{"Bearer bkro_t"}, []string{"bkro_t"}},
+		{"schemeless personal token", []string{"bkru_t"}, []string{"bkru_t"}},
+		{"basic personal token in password", []string{basic("ignored", "bkru_t")}, []string{"bkru_t"}},
+		{"basic robot token in username", []string{basic("bkro_t", "")}, []string{"bkro_t"}},
+		{"foreign bearer is dropped", []string{"Bearer ghp_notours"}, []string{}},
+		{"foreign basic is dropped", []string{basic("user", "hunter2")}, []string{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := credentialCandidates(tt.headers)
+			if len(got) != len(tt.want) {
+				t.Fatalf("candidates = %v, want %v", got, tt.want)
+			}
+
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("candidates = %v, want %v", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
 // deniedCode gives the expected auth-denial code for (write?, credential) against a
 // ReadAuthRequired backend, or denied=false when the credential is authorized.
 func deniedCode(write bool, cred string) (codes.Code, bool) {
 	switch {
 	case cred == "no credential":
 		return codes.Unauthenticated, true
-	case write && cred == "read key":
+	case write && (cred == "read key" || cred == "read personal token"):
 		return codes.PermissionDenied, true
 	default:
 		return codes.OK, false

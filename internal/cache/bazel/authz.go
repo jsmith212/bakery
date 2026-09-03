@@ -112,14 +112,19 @@ func (b *Backend) authenticate(ctx context.Context) (Principal, error) {
 	return nil, err
 }
 
-// credentialCandidates extracts the bkry_-shaped tokens from the "authorization"
-// metadata values. The shape check (auth.TokenPrefix) is what keeps a non-token from
-// costing a database round trip.
+// credentialCandidates extracts the Bakery-token-shaped values from the
+// "authorization" metadata. The shape check (auth.LooksLikeBakeryToken) is what
+// keeps a non-token from costing a database round trip -- and it MUST be the
+// whole token family (bkry_/bkru_/bkro_), never a bkry_-only prefix test: a
+// narrower gate here rejected valid personal tokens as Unauthenticated before
+// validation ever ran, silently on this one backend while every other plane
+// accepted them. AuthenticateToken dispatches by kind; the gate's only job is
+// "plausibly ours".
 func credentialCandidates(headers []string) []string {
 	out := make([]string, 0, 2)
 
 	add := func(field string) {
-		if strings.HasPrefix(field, auth.TokenPrefix) {
+		if auth.LooksLikeBakeryToken(field) {
 			out = append(out, field)
 		}
 	}
@@ -128,7 +133,7 @@ func credentialCandidates(headers []string) []string {
 		scheme, rest, ok := strings.Cut(h, " ")
 		if !ok {
 			// No scheme prefix: a bare `authorization: bkry_...`. add() shape-checks it
-			// with auth.TokenPrefix, so a non-token value costs nothing. A Bakery
+			// with auth.LooksLikeBakeryToken, so a non-token value costs nothing. A Bakery
 			// credential is ONE opaque token; a client that sends it schemeless still
 			// authenticates rather than silently running with the cache disabled.
 			add(strings.TrimSpace(h))
