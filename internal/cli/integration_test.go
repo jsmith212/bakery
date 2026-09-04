@@ -464,7 +464,7 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("the key LIST leaked the token: %s", raw)
 	}
 
-	if err := c.DeleteKey(ctx, testOrg, "yocto", keys[0].ID); err != nil {
+	if err := c.DeleteKey(ctx, testOrg, "yocto", keys[0].ID, false); err != nil {
 		t.Fatalf("DeleteKey: %v", err)
 	}
 

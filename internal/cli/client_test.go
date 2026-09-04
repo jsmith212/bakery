@@ -404,10 +404,83 @@ func TestClientVerbs(t *testing.T) {
 				return true
 			},
 			call: func(ctx context.Context, c *Client) error {
-				return c.DeleteKey(ctx, "acme", "widgets", "k1")
+				return c.DeleteKey(ctx, "acme", "widgets", "k1", false)
 			},
 			wantMethod: http.MethodDelete,
 			wantPath:   "/orgs/acme/projects/widgets/keys/k1",
+			wantBody:   "",
+		},
+		{
+			name: "key revoke --purge carries purge=true",
+			respond: func(w http.ResponseWriter, _ *http.Request) bool {
+				w.WriteHeader(http.StatusNoContent)
+
+				return true
+			},
+			call: func(ctx context.Context, c *Client) error {
+				return c.DeleteKey(ctx, "acme", "widgets", "k1", true)
+			},
+			wantMethod: http.MethodDelete,
+			wantPath:   "/orgs/acme/projects/widgets/keys/k1",
+			wantQuery:  "purge=true",
+			wantBody:   "",
+		},
+		{
+			name: "token revoke",
+			respond: func(w http.ResponseWriter, _ *http.Request) bool {
+				w.WriteHeader(http.StatusNoContent)
+
+				return true
+			},
+			call: func(ctx context.Context, c *Client) error {
+				return c.RevokeUserToken(ctx, "t1", false)
+			},
+			wantMethod: http.MethodDelete,
+			wantPath:   "/user/tokens/t1",
+			wantBody:   "",
+		},
+		{
+			name: "token revoke --purge carries purge=true",
+			respond: func(w http.ResponseWriter, _ *http.Request) bool {
+				w.WriteHeader(http.StatusNoContent)
+
+				return true
+			},
+			call: func(ctx context.Context, c *Client) error {
+				return c.RevokeUserToken(ctx, "t1", true)
+			},
+			wantMethod: http.MethodDelete,
+			wantPath:   "/user/tokens/t1",
+			wantQuery:  "purge=true",
+			wantBody:   "",
+		},
+		{
+			name: "org robot revoke",
+			respond: func(w http.ResponseWriter, _ *http.Request) bool {
+				w.WriteHeader(http.StatusNoContent)
+
+				return true
+			},
+			call: func(ctx context.Context, c *Client) error {
+				return c.RevokeOrgToken(ctx, "acme", "r1", "t1", false)
+			},
+			wantMethod: http.MethodDelete,
+			wantPath:   "/orgs/acme/robots/r1/tokens/t1",
+			wantBody:   "",
+		},
+		{
+			name: "org robot revoke --purge carries purge=true",
+			respond: func(w http.ResponseWriter, _ *http.Request) bool {
+				w.WriteHeader(http.StatusNoContent)
+
+				return true
+			},
+			call: func(ctx context.Context, c *Client) error {
+				return c.RevokeOrgToken(ctx, "acme", "r1", "t1", true)
+			},
+			wantMethod: http.MethodDelete,
+			wantPath:   "/orgs/acme/robots/r1/tokens/t1",
+			wantQuery:  "purge=true",
 			wantBody:   "",
 		},
 		{

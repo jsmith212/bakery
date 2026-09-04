@@ -400,9 +400,11 @@ func (c *Client) CreateUserToken(
 	return out, err
 }
 
-// RevokeUserToken is DELETE /user/tokens/{id}.
-func (c *Client) RevokeUserToken(ctx context.Context, id string) error {
-	return c.do(ctx, http.MethodDelete, "/user/tokens/"+seg(id), nil, nil, withAuth)
+// RevokeUserToken is DELETE /user/tokens/{id}. purge asks the server to erase
+// the record of an ALREADY-revoked token (?purge=true) instead of revoking a
+// live one -- see purgeQuery.
+func (c *Client) RevokeUserToken(ctx context.Context, id string, purge bool) error {
+	return c.do(ctx, http.MethodDelete, "/user/tokens/"+seg(id)+purgeQuery(purge), nil, nil, withAuth)
 }
 
 // ListRobots is GET /orgs/{org}/robots. Each robot carries its tokens (live
@@ -443,10 +445,12 @@ func (c *Client) CreateOrgToken(
 	return out, err
 }
 
-// RevokeOrgToken is DELETE /orgs/{org}/robots/{robot}/tokens/{token}.
-func (c *Client) RevokeOrgToken(ctx context.Context, org, robot, token string) error {
+// RevokeOrgToken is DELETE /orgs/{org}/robots/{robot}/tokens/{token}. purge
+// asks the server to erase the record of an ALREADY-revoked token
+// (?purge=true) instead of revoking a live one -- see purgeQuery.
+func (c *Client) RevokeOrgToken(ctx context.Context, org, robot, token string, purge bool) error {
 	return c.do(ctx, http.MethodDelete,
-		"/orgs/"+seg(org)+"/robots/"+seg(robot)+"/tokens/"+seg(token), nil, nil, withAuth)
+		"/orgs/"+seg(org)+"/robots/"+seg(robot)+"/tokens/"+seg(token)+purgeQuery(purge), nil, nil, withAuth)
 }
 
 // ListOrgs is GET /orgs.
@@ -585,14 +589,31 @@ func (c *Client) CreateKey(
 	return out, err
 }
 
-// DeleteKey is DELETE /orgs/{org}/projects/{project}/keys/{key}.
-func (c *Client) DeleteKey(ctx context.Context, org, project, key string) error {
+// DeleteKey is DELETE /orgs/{org}/projects/{project}/keys/{key}. purge asks
+// the server to erase the record of an ALREADY-revoked key (?purge=true)
+// instead of revoking a live one -- see purgeQuery.
+func (c *Client) DeleteKey(ctx context.Context, org, project, key string, purge bool) error {
 	return c.do(ctx, http.MethodDelete,
-		projectPath(org, project)+"/keys/"+seg(key), nil, nil, withAuth)
+		projectPath(org, project)+"/keys/"+seg(key)+purgeQuery(purge), nil, nil, withAuth)
 }
 
 func projectPath(org, project string) string {
 	return "/orgs/" + seg(org) + "/projects/" + seg(project)
+}
+
+// purgeQuery builds the query string for a credential-revoke DELETE. Empty
+// when purge is false, so the plain revoke path stays byte-identical; the
+// server reads it via its own wantsPurge (internal/api/keys.go) and answers a
+// still-live credential with 409 not_revoked.
+func purgeQuery(purge bool) string {
+	if !purge {
+		return ""
+	}
+
+	q := url.Values{}
+	q.Set("purge", "true")
+
+	return "?" + q.Encode()
 }
 
 // TriggerGCRun is POST /gc/run. The server answers 202 the instant the sweep has

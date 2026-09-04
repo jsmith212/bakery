@@ -140,6 +140,8 @@ type TokenCreateCmd struct {
 // server scopes the revoke by user_id in the query's own predicate.
 type TokenRevokeCmd struct {
 	Token string `arg:"" help:"Token id, as shown by bakery token list."`
+
+	Purge bool `help:"Delete the record of an ALREADY-revoked credential. A live one is refused -- revoke it first." name:"purge"`
 }
 
 // OrgCmd groups the organization verbs.
@@ -232,6 +234,8 @@ type OrgRobotRevokeCmd struct {
 	Org   string `arg:"" help:"Organization slug."`
 	Robot string `arg:"" help:"Robot id, as shown by bakery org robot list."`
 	Token string `arg:"" help:"Token id, as shown by bakery org robot list."`
+
+	Purge bool `help:"Delete the record of an ALREADY-revoked credential. A live one is refused -- revoke it first." name:"purge"`
 }
 
 // OrgRobotDeleteCmd deletes a robot outright, cascading every token it holds.
@@ -370,6 +374,8 @@ type KeyRevokeCmd struct {
 	Org     string `arg:"" help:"Organization slug."`
 	Project string `arg:"" help:"Project slug."`
 	Key     string `arg:"" help:"Key id, as shown by bakery key list."`
+
+	Purge bool `help:"Delete the record of an ALREADY-revoked credential. A live one is refused -- revoke it first." name:"purge"`
 }
 
 // SstateCmd groups the sstate verbs. The only one is push: reads are BitBake's, and it

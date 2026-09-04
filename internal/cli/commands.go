@@ -467,11 +467,15 @@ func printCreatedKey(out io.Writer, key api.CreatedAPIKey, storedAt string) {
 }
 
 func keyRevoke(ctx context.Context, c *Client, out io.Writer, cmd config.KeyRevokeCmd) error {
-	if err := c.DeleteKey(ctx, cmd.Org, cmd.Project, cmd.Key); err != nil {
+	if err := c.DeleteKey(ctx, cmd.Org, cmd.Project, cmd.Key, cmd.Purge); err != nil {
 		return err
 	}
 
-	fmt.Fprintf(out, "revoked key %s\n", cmd.Key)
+	if cmd.Purge {
+		fmt.Fprintf(out, "deleted key %s\n", cmd.Key)
+	} else {
+		fmt.Fprintf(out, "revoked key %s\n", cmd.Key)
+	}
 
 	return nil
 }
@@ -556,11 +560,15 @@ func printCreatedUserToken(out io.Writer, token api.CreatedUserToken, storedAt s
 }
 
 func tokenRevoke(ctx context.Context, c *Client, out io.Writer, cmd config.TokenRevokeCmd) error {
-	if err := c.RevokeUserToken(ctx, cmd.Token); err != nil {
+	if err := c.RevokeUserToken(ctx, cmd.Token, cmd.Purge); err != nil {
 		return err
 	}
 
-	fmt.Fprintf(out, "revoked token %s\n", cmd.Token)
+	if cmd.Purge {
+		fmt.Fprintf(out, "deleted token %s\n", cmd.Token)
+	} else {
+		fmt.Fprintf(out, "revoked token %s\n", cmd.Token)
+	}
 
 	return nil
 }
@@ -661,11 +669,15 @@ func printCreatedOrgToken(out io.Writer, org string, robot api.Robot, token api.
 }
 
 func orgRobotRevoke(ctx context.Context, c *Client, out io.Writer, cmd config.OrgRobotRevokeCmd) error {
-	if err := c.RevokeOrgToken(ctx, cmd.Org, cmd.Robot, cmd.Token); err != nil {
+	if err := c.RevokeOrgToken(ctx, cmd.Org, cmd.Robot, cmd.Token, cmd.Purge); err != nil {
 		return err
 	}
 
-	fmt.Fprintf(out, "revoked token %s on robot %s\n", cmd.Token, cmd.Robot)
+	if cmd.Purge {
+		fmt.Fprintf(out, "deleted token %s on robot %s\n", cmd.Token, cmd.Robot)
+	} else {
+		fmt.Fprintf(out, "revoked token %s on robot %s\n", cmd.Token, cmd.Robot)
+	}
 
 	return nil
 }
