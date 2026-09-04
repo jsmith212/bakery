@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
-import { backendEndpoints, buildOciConfig, parseHashservConfig, parseOciConfig } from './backendConfig';
+import {
+	backendEndpoints,
+	buildOciConfig,
+	parseHashservConfig,
+	parseOciConfig,
+	quotaApplicable
+} from './backendConfig';
+import { BACKEND_KINDS } from './api/types';
 
 describe('parseOciConfig', () => {
 	it('applies the server defaults for an empty config', () => {
@@ -108,5 +115,44 @@ describe('parseHashservConfig', () => {
 		expect(parseHashservConfig({ upstream: 'wss://hashserv.example/ws' })).toEqual({
 			upstream: 'wss://hashserv.example/ws'
 		});
+	});
+});
+
+describe('quotaApplicable', () => {
+	// Mirrors internal/api/backends.go's backendQuotaPatch. The three screens
+	// that ask (new, detail, index) all read this one answer, so a kind that
+	// drifts from the server's rule cannot drift on only one of them.
+	it('refuses a quota for hashserv and oci, and accepts one for everything else', () => {
+		expect(quotaApplicable('hashserv')).toBe(false);
+		expect(quotaApplicable('oci')).toBe(false);
+
+		for (const kind of BACKEND_KINDS) {
+			if (kind === 'hashserv' || kind === 'oci') continue;
+			expect(quotaApplicable(kind)).toBe(true);
+		}
+	});
+
+	// registry is the one that looks like oci and is not: mode=max exports run
+	// multi-GB with no upstream ceiling to bound them.
+	it('accepts a quota for registry', () => {
+		expect(quotaApplicable('registry')).toBe(true);
+	});
+});
+
+describe('BACKEND_KINDS', () => {
+	// The list is the console's only runtime enumeration of the union -- the
+	// route guard, the new-backend tiles, the overview's "of N kinds" and the
+	// index's all-configured check all read it. A kind added to the union and
+	// forgotten here would type-check everywhere and silently vanish from all
+	// four; `backendEndpoints`' switch IS total over the union, so requiring an
+	// endpoint for every listed kind ties the two together.
+	it('lists every kind exactly once, and each one has a real endpoint', () => {
+		expect(new Set(BACKEND_KINDS).size).toBe(BACKEND_KINDS.length);
+
+		for (const kind of BACKEND_KINDS) {
+			const eps = backendEndpoints(kind, 'acme', 'firmware');
+			expect(eps.length).toBeGreaterThan(0);
+			expect(eps[0].value).not.toBe('');
+		}
 	});
 });

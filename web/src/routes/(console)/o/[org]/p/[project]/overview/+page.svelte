@@ -4,7 +4,7 @@
 	import { backendStatus, isUnmeasured } from '$lib/backendStatus';
 	import { formatBytes, formatCount, formatDateTimeUTC, formatQuota, formatRetentionWindow } from '$lib/format';
 	import { projectPath } from '$lib/tenancy';
-	import type { BackendKind, ProjectBackendUsage } from '$lib/api/types';
+	import { BACKEND_KINDS, type BackendKind, type ProjectBackendUsage } from '$lib/api/types';
 
 	import { Button } from '$lib/components/buttons';
 	import { Badge } from '$lib/components/badges';
@@ -100,7 +100,7 @@
 				: 'no cap'}
 		caption={headroomCaption}
 	/>
-	<StatTile label="Backends configured" value={backends.length} unit="of 5 kinds" />
+	<StatTile label="Backends configured" value={backends.length} unit="of {BACKEND_KINDS.length} kinds" />
 </div>
 
 <div class="rounded-2 border border-border-0 bg-bg-1">

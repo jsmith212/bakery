@@ -3,21 +3,12 @@ import { error } from '@sveltejs/kit';
 import { getBackend } from '$lib/api/backends';
 import { getProjectUsage } from '$lib/api/projects';
 import { isApiError } from '$lib/api/errors';
-import type { BackendKind } from '$lib/api/types';
+import { BACKEND_KINDS, type BackendKind } from '$lib/api/types';
 
 import type { PageLoad } from './$types';
 
-const KNOWN_KINDS: readonly BackendKind[] = [
-	'sstate',
-	'downloads',
-	'hashserv',
-	'bazel',
-	'oci',
-	'registry'
-];
-
 function isBackendKind(value: string): value is BackendKind {
-	return (KNOWN_KINDS as readonly string[]).includes(value);
+	return (BACKEND_KINDS as readonly string[]).includes(value);
 }
 
 /**

@@ -13,7 +13,8 @@
 		backendEndpoints,
 		buildOciConfig,
 		parseHashservConfig,
-		parseOciConfig
+		parseOciConfig,
+		quotaApplicable
 	} from '$lib/backendConfig';
 	import {
 		formatApproxAccessed,
@@ -56,10 +57,7 @@
 		kind === 'bazel' ? 'bazel' : kind === 'oci' ? 'containerd' : kind === 'registry' ? 'buildcache' : 'yocto'
 	);
 
-	// A backend cannot have a quota if it structurally can never be reached
-	// (hashserv stores no cache objects) or is bounded a different way (oci by
-	// its retention window) -- internal/api/backends.go's backendQuotaPatch.
-	const quotaApplicable = $derived(kind !== 'hashserv' && kind !== 'oci');
+	const hasQuota = $derived(quotaApplicable(kind));
 
 	const protocolFacts: Record<BackendKind, { label: string; value: string }[]> = {
 		sstate: [{ label: 'Verify key = sha256', value: 'no (sstate keys are unihashes)' }],
@@ -98,7 +96,7 @@
 			{ key: 'Retention', value: formatRetentionWindow(backend.retention_window) },
 			{
 				key: 'Quota',
-				value: quotaApplicable ? formatQuota(backend.quota_bytes) : 'not applicable to this kind'
+				value: hasQuota ? formatQuota(backend.quota_bytes) : 'not applicable to this kind'
 			}
 		];
 
@@ -169,7 +167,10 @@
 			const res = await listCacheObjects(org.slug, project.slug, kind, {
 				namespace,
 				after_key: reset ? undefined : (cursor ?? undefined),
-				limit: 50
+				// The API clamps at 200 and defaults to 50. 100 halves the number of
+				// "Load more" round trips on a real backend while staying well inside
+				// the ceiling.
+				limit: 100
 			});
 			objects = reset ? res.items : [...objects, ...res.items];
 			cursor = res.next_cursor;
@@ -254,7 +255,7 @@
 		}
 
 		let quotaBytes: number | null = null;
-		if (quotaApplicable) {
+		if (hasQuota) {
 			if (!editQuotaNoCap) {
 				if (editQuotaValue.trim() === '') {
 					editError = 'Enter a quota like "500 GB", or check "no cap".';
@@ -294,7 +295,7 @@
 				read_auth_required: editReadAuth,
 				config,
 				retention_window: tri(retentionWindow, 'retention_window'),
-				...(quotaApplicable ? { quota_bytes: tri(quotaBytes, 'quota_bytes') } : {})
+				...(hasQuota ? { quota_bytes: tri(quotaBytes, 'quota_bytes') } : {})
 			});
 			pushToast({ variant: 'success', title: `Updated ${kind}` });
 			showEdit = false;
@@ -318,6 +319,10 @@
 		>{org.slug}/{project.slug}</a
 	>
 	<span>/</span>
+	<a href="/o/{org.slug}/p/{project.slug}/backends" class="text-accent-text hover:underline"
+		>backends</a
+	>
+	<span>/</span>
 	<span class="font-mono text-text-2">{kind}</span>
 </div>
 
@@ -339,17 +344,23 @@
 <div class="grid grid-cols-4 gap-2">
 	<StatTile label="Objects" value={formatCount(usageRow?.objects_count ?? null)} />
 	<StatTile label="Size" value={formatBytes(usageRow?.logical_bytes ?? null)} />
-	<StatTile label="Quota" value={quotaApplicable ? formatQuota(backend.quota_bytes) : 'n/a'} />
+	<StatTile label="Quota" value={hasQuota ? formatQuota(backend.quota_bytes) : 'n/a'} />
 	<StatTile label="Retention" value={formatRetentionWindow(backend.retention_window)} />
 </div>
 
-<EmptyState
-	glyph="∅"
-	title="Rates over time are not recorded"
-	desc="Bakery keeps no rollup table. Scrape --metrics-addr with Prometheus for live hit/miss and size counters."
-/>
+<!-- One muted line, not an EmptyState block: this says nothing that changes,
+     and as a full dashed panel it pushed the object table -- the only thing on
+     this page with real content -- below the fold on a 1080p viewport. -->
+<p class="text-xs text-text-3">
+	Rates over time are not recorded. Bakery keeps no rollup table. Scrape --metrics-addr with
+	Prometheus for live hit/miss and size counters.
+</p>
 
-<div class="grid grid-cols-[3fr_2fr] items-start gap-2">
+<!-- The table takes every pixel the config card does not need: `minmax(0,1fr)`
+     (never `1fr` alone, which floors at the content's min-content width and
+     re-clips two 64-hex columns) beside a fixed 320px card, stacking under
+     `lg`. -->
+<div class="grid grid-cols-1 items-start gap-2 lg:grid-cols-[minmax(0,1fr)_320px]">
 	<div class="flex min-w-0 flex-col gap-[14px]">
 		{#if kind === 'hashserv'}
 			<EmptyState
@@ -396,8 +407,17 @@
 						<tbody>
 							{#each objects as o (o.namespace + '/' + o.key)}
 								<Tr>
-									<Td mono>{o.key}</Td>
-									<Td mono>{o.digest}</Td>
+									<!-- Keys and digests are up to 64 hex characters and there are
+									     two of them per row: rendered in full they push the Created
+									     and Last accessed columns off a 1080p viewport. Truncated to
+									     a fixed width with the whole value on hover; the wrap scrolls
+									     horizontally as the fallback. -->
+									<Td mono>
+										<span class="block max-w-[28ch] truncate" title={o.key}>{o.key}</span>
+									</Td>
+									<Td mono>
+										<span class="block max-w-[28ch] truncate" title={o.digest}>{o.digest}</span>
+									</Td>
 									<Td num>{formatBytes(o.size_bytes)}</Td>
 									<Td class="whitespace-nowrap">{formatDateTimeUTC(o.created_at)}</Td>
 									<Td class="whitespace-nowrap">{formatApproxAccessed(o.accessed_at)}</Td>
@@ -408,11 +428,26 @@
 				</TableWrap>
 			{/if}
 
-			{#if cursor}
-				<div>
-					<Button variant="secondary" size="sm" disabled={objectsPending} onclick={() => loadObjects(false)}>
-						{objectsPending ? 'Loading…' : 'Load more'}
-					</Button>
+			{#if objects.length > 0}
+				<div class="flex items-center gap-2">
+					{#if cursor}
+						<Button
+							variant="secondary"
+							size="sm"
+							disabled={objectsPending}
+							onclick={() => loadObjects(false)}
+						>
+							{objectsPending ? 'Loading…' : 'Load more'}
+						</Button>
+					{/if}
+					<!-- The total is the backend's whole `cache_backend_usage` count and
+					     the page is one namespace, so on a multi-namespace kind this is an
+					     approximation -- and it is still the only figure that says whether
+					     "Load more" has 40 rows behind it or four million. It carries
+					     `measured_at`'s staleness with it, like every usage figure here. -->
+					<span class="text-xs text-text-3">
+						Showing {formatCount(objects.length)} of {formatCount(usageRow?.objects_count)}
+					</span>
 				</div>
 			{/if}
 		{/if}
@@ -456,7 +491,7 @@
 				{/snippet}
 			</Field>
 
-			{#if quotaApplicable}
+			{#if hasQuota}
 				<Field label="Quota">
 					{#snippet children(f)}
 						<div class="flex flex-col gap-1.5">

@@ -1,4 +1,10 @@
-export const bkTableWrap = 'border border-border-0 rounded-2 overflow-hidden bg-bg-1';
+// `overflow-x-auto`, not `overflow-hidden`: a table wider than its column
+// SCROLLS rather than being silently cut off (the objects browser's two 64-hex
+// columns lost the Created column entirely at 1080p, with no scrollbar to say
+// so). Per CSS overflow, an `auto` on one axis computes the `visible` other
+// axis to `auto` too, so the rounded corners still clip the header row's
+// `bg-bg-2` exactly as before.
+export const bkTableWrap = 'border border-border-0 rounded-2 overflow-x-auto bg-bg-1';
 
 export const bkTable = 'w-full border-collapse text-sm text-text-1';
 

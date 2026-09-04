@@ -2,10 +2,8 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
 
 // The DESIGN.md:545 flow, driven against the real `bakery serve` binary and a
 // real Chromium (see playwright.config.ts). Every step below is a click or a
-// fill against the actual console -- no route is reached by constructing a
-// URL for a screen the app itself would navigate to, except the one hop
-// (`backends/new` a second time) that has no in-app link to it at all, noted
-// at that call site.
+// fill against the actual console -- no route in this flow is reached by
+// constructing a URL for a screen the app itself would navigate to.
 //
 // A fresh org+project pair is minted per run (see `unique`) so the suite is
 // safe to run repeatedly against one long-lived Postgres, the way a laptop
@@ -84,19 +82,35 @@ async function addFirstBackend(page: Page, orgSlug: string, projectSlug: string)
 }
 
 /**
- * Adds a second backend of `kind`. There is no in-app link to `backends/new`
- * once a project already has a backend (Overview's empty-state action is
- * gone, and the backend detail page has no "add another" affordance) -- this
- * is the one hop in the whole flow reached by URL rather than a click, and it
- * still exercises the real route, guard and load function.
+ * Adds another backend of `kind`, entirely through the UI: the nav's
+ * "Backends" link, the index's "Add backend" action, then the form.
+ *
+ * This used to `page.goto('.../backends/new')` because there was no in-app
+ * link to it once a project had any backend at all -- the nav pointed at the
+ * project's first configured KIND and the "add" affordance existed only in
+ * Overview's empty state, which by definition was gone. The backends index is
+ * that missing link, so the hop is a click again, and `existing` asserts the
+ * index really lists what the project already has rather than merely routing.
  */
 async function addBackend(
 	page: Page,
 	orgSlug: string,
 	projectSlug: string,
-	kind: string
+	kind: string,
+	existing: string[]
 ): Promise<void> {
-	await page.goto(`/o/${orgSlug}/p/${projectSlug}/backends/new`);
+	await consoleNav(page).getByRole('link', { name: 'Backends' }).click();
+	await page.waitForURL(`**/o/${orgSlug}/p/${projectSlug}/backends`);
+
+	for (const configured of existing) {
+		await expect(page.getByRole('row').filter({ hasText: configured })).toBeVisible();
+	}
+
+	// A link, not a button: `Button href` renders an `<a>` so a link never
+	// wraps a `<button>` (FOUNDATION.md's Button contract).
+	await page.getByRole('link', { name: 'Add backend' }).click();
+	await page.waitForURL(`**/o/${orgSlug}/p/${projectSlug}/backends/new`);
+
 	await page.getByRole('button', { name: kind }).click();
 	await page.getByRole('button', { name: 'Create backend' }).click();
 	await page.waitForURL(`**/o/${orgSlug}/p/${projectSlug}/backends/${kind}`);
@@ -126,7 +140,18 @@ test.describe('console: dev-login through config snippets', () => {
 		});
 
 		await test.step('create hashserv backend', async () => {
-			await addBackend(page, orgSlug, projectSlug, 'hashserv');
+			await addBackend(page, orgSlug, projectSlug, 'hashserv', ['sstate']);
+		});
+
+		await test.step('the backends index lists both', async () => {
+			await consoleNav(page).getByRole('link', { name: 'Backends' }).click();
+			await page.waitForURL(`**/o/${orgSlug}/p/${projectSlug}/backends`);
+
+			await expect(page.getByRole('row').filter({ hasText: 'sstate' })).toBeVisible();
+			await expect(page.getByRole('row').filter({ hasText: 'hashserv' })).toBeVisible();
+			// Four kinds are still unconfigured, so the action stays live -- the
+			// disabled "All N kinds configured" state is the other branch.
+			await expect(page.getByRole('link', { name: 'Add backend' })).toBeVisible();
 		});
 
 		await test.step('mint a project API key', async () => {

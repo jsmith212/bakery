@@ -4,8 +4,8 @@
 	import { createBackend } from '$lib/api/backends';
 	import { isApiError } from '$lib/api/errors';
 	import { tri } from '$lib/api/patch';
-	import type { BackendKind } from '$lib/api/types';
-	import { backendEndpoints, buildOciConfig } from '$lib/backendConfig';
+	import { BACKEND_KINDS, type BackendKind } from '$lib/api/types';
+	import { backendEndpoints, buildOciConfig, quotaApplicable } from '$lib/backendConfig';
 	import { parseHumanBytes } from '$lib/format';
 	import { projectPath } from '$lib/tenancy';
 	import { toastError, pushToast } from '$lib/toasts';
@@ -29,16 +29,14 @@
 		oci: { hint: 'pull-through proxy', section: 'oci — pull-through proxy' },
 		registry: { hint: 'BuildKit cache export', section: 'registry — writable buildcache' }
 	};
-	const KIND_ORDER: BackendKind[] = ['sstate', 'downloads', 'hashserv', 'bazel', 'oci', 'registry'];
-
 	// Default to the first kind this project has not already configured, so
 	// the common "add the next backend" path lands on a useful choice rather
 	// than always re-offering sstate.
-	const firstUnconfigured = KIND_ORDER.find((k) => !project.backends.includes(k));
+	const firstUnconfigured = BACKEND_KINDS.find((k) => !project.backends.includes(k));
 	let kind = $state<BackendKind>(firstUnconfigured ?? 'sstate');
 
 	const alreadyConfigured = $derived(project.backends.includes(kind));
-	const quotaApplicable = $derived(kind !== 'hashserv' && kind !== 'oci');
+	const hasQuota = $derived(quotaApplicable(kind));
 	const endpoints = $derived(backendEndpoints(kind, org.slug, project.slug));
 
 	let readAuthRequired = $state(true);
@@ -87,7 +85,7 @@
 		} else retentionWindow = retentionCustom.trim();
 
 		let quotaBytes: number | null | undefined;
-		if (!quotaApplicable || quotaMode === 'default') quotaBytes = undefined;
+		if (!hasQuota || quotaMode === 'default') quotaBytes = undefined;
 		else if (quotaMode === 'nocap') quotaBytes = null;
 		else {
 			try {
@@ -143,6 +141,9 @@
 	<div class="flex items-center gap-1.5 text-sm text-text-3">
 		<a href="{projectPath(org.slug, project.slug)}/overview" class="text-accent-text hover:underline"
 			>{org.slug}/{project.slug}</a
+		><span>/</span><a
+			href="{projectPath(org.slug, project.slug)}/backends"
+			class="text-accent-text hover:underline">backends</a
 		><span>/</span><span class="text-text-2">New backend</span>
 	</div>
 
@@ -156,7 +157,7 @@
 	<div class="flex flex-col gap-1">
 		<Label>Type</Label>
 		<div class="grid grid-cols-6 gap-1.5">
-			{#each KIND_ORDER as id (id)}
+			{#each BACKEND_KINDS as id (id)}
 				<button
 					type="button"
 					onclick={() => (kind = id)}
@@ -231,7 +232,7 @@
 			{/snippet}
 		</Field>
 
-		{#if quotaApplicable}
+		{#if hasQuota}
 			<Field label="Quota" error={quotaError ?? undefined}>
 				{#snippet children(f)}
 					<div class="flex flex-col gap-1.5">
@@ -291,7 +292,7 @@
 	{/if}
 
 	<div class="flex justify-end gap-2">
-		<Button href="{projectPath(org.slug, project.slug)}/overview" variant="ghost" disabled={submitting}
+		<Button href="{projectPath(org.slug, project.slug)}/backends" variant="ghost" disabled={submitting}
 			>Cancel</Button
 		>
 		<Button variant="primary" onclick={submit} disabled={submitting}>

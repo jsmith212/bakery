@@ -61,6 +61,26 @@ export type SiteRole = 'user' | 'admin';
 export type KeyScope = 'read' | 'write';
 export type BackendKind = 'sstate' | 'downloads' | 'hashserv' | 'bazel' | 'oci' | 'registry';
 
+/**
+ * Every backend kind, in the order the console presents them.
+ *
+ * The union above cannot be iterated -- it is erased at runtime -- so the four
+ * places that needed a list of kinds each carried their own copy: the new-backend
+ * form's tile order, the `[type]` loader's route guard, the overview's "of N
+ * kinds" figure (which said 5 for a month after `registry` landed), and the
+ * backends index's "everything is configured" check. Same pattern, and same
+ * reason, as `SNIPPET_TOOLS`: one array, and a kind added to the union without
+ * being added here is a `readonly BackendKind[]` that no longer covers it.
+ */
+export const BACKEND_KINDS: readonly BackendKind[] = [
+	'sstate',
+	'downloads',
+	'hashserv',
+	'bazel',
+	'oci',
+	'registry'
+] as const;
+
 export interface MeOrg {
 	id: string;
 	slug: string;

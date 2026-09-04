@@ -38,45 +38,29 @@
 		currentOrg && currentProject ? projectPath(currentOrg, currentProject) : null
 	);
 
-	// A hardcoded `/backends/sstate` 404s for a project whose only configured
-	// kind is, say, `oci` -- there is no sstate mount to land on. Point at the
-	// current project's own first configured kind instead, falling back to the
-	// "add a backend" screen when it has none yet.
-	//
-	// That fallback is only honest when `projects` was actually loaded: on a
-	// global page (`/user`, `/gc`, ...) with a remembered project, `projects`
-	// is `null` and `currentProjectObj` can never resolve, so guessing
-	// "/backends/new" would point at the create-a-backend form for a project
-	// that may already have five. `!projectsLoaded` -> no href at all, and the
-	// nav below omits the link rather than guess -- same rule as the "an
-	// absent link says the same thing honestly" comment just below.
-	const currentProjectObj = $derived(
-		(projects ?? []).find((p) => p.slug === currentProject) ?? null
-	);
-	const backendsHref = $derived.by(() => {
-		if (!projectBase || !projectsLoaded) return null;
-		const kind = currentProjectObj?.backends[0];
-
-		return kind ? `${projectBase}/backends/${kind}` : `${projectBase}/backends/new`;
-	});
-
 	// Nav sections appear only when their scope exists. A "Backends" link with no
 	// project in the path would resolve to nothing; an absent link says the same
-	// thing honestly. "Backends" itself is independently omitted when its href
-	// is unknown (see backendsHref) -- the other three links are still correct
-	// on a global page with a remembered project, so they stay.
-	const projectNav = $derived.by(() => {
-		if (!projectBase) return [];
-
-		const nav = [{ label: 'Overview', href: `${projectBase}/overview` }];
-		if (backendsHref) nav.push({ label: 'Backends', href: backendsHref });
-		nav.push(
-			{ label: 'API keys', href: `${projectBase}/keys` },
-			{ label: 'Config snippets', href: `${projectBase}/snippets` }
-		);
-
-		return nav;
-	});
+	// thing honestly.
+	//
+	// "Backends" used to be the exception: with no index page under
+	// `/backends`, this derived its target from the project's own first
+	// configured kind (a hardcoded `/backends/sstate` 404s for a project whose
+	// only kind is `oci`), fell back to `/backends/new`, and had to omit itself
+	// entirely on a global page where `projects` is `null` and no kind could be
+	// resolved. `/backends` is now a real index that lists every configured
+	// backend and carries the "Add backend" action, so there is nothing left to
+	// derive -- the link is the same for every project and needs no roster to
+	// point at it.
+	const projectNav = $derived(
+		projectBase
+			? [
+					{ label: 'Overview', href: `${projectBase}/overview` },
+					{ label: 'Backends', href: `${projectBase}/backends` },
+					{ label: 'API keys', href: `${projectBase}/keys` },
+					{ label: 'Config snippets', href: `${projectBase}/snippets` }
+				]
+			: []
+	);
 
 	const orgNav = $derived(
 		orgBase
@@ -100,19 +84,12 @@
 			: []
 	);
 
+	// "Backends" stays lit across `/backends/sstate`, `/backends/oci` and
+	// `/backends/new` for free now that the link points at the subtree root --
+	// the prefix branch below is the whole rule, and the special case this
+	// function used to carry for a kind-specific href is gone with it.
 	function active(href: string): boolean {
 		return path === href || path.startsWith(`${href}/`);
-	}
-
-	// "Backends" stays lit across `/backends/sstate`, `/backends/oci` and
-	// `/backends/new`, which `active()` alone would not do for a link that names
-	// one kind.
-	function navActive(href: string): boolean {
-		if (projectBase && href.startsWith(`${projectBase}/backends`)) {
-			return path.startsWith(`${projectBase}/backends`);
-		}
-
-		return active(href);
 	}
 
 	const userActive = $derived(path === '/user');
@@ -302,8 +279,8 @@
 		{#each projectNav as it (it.href)}
 			<a
 				href={it.href}
-				aria-current={navActive(it.href) ? 'page' : undefined}
-				class="{itemChrome} h-7 {navActive(it.href) ? itemActive : itemIdle}">{it.label}</a
+				aria-current={active(it.href) ? 'page' : undefined}
+				class="{itemChrome} h-7 {active(it.href) ? itemActive : itemIdle}">{it.label}</a
 			>
 		{/each}
 	{/if}

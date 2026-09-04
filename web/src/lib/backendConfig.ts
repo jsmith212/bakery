@@ -57,6 +57,24 @@ export function backendEndpoints(kind: BackendKind, org: string, project: string
 	}
 }
 
+/**
+ * Whether a quota is a representable setting for this kind.
+ *
+ * Mirrors `internal/api/backends.go`'s `backendQuotaPatch`: `hashserv` stores no
+ * cache objects at all, and `oci` is bounded by its retention window instead, so
+ * neither accepts one. `registry` deliberately DOES -- `mode=max` cache exports
+ * run multi-GB by design and the mirror's implicit upstream ceiling does not
+ * apply to a namespace nothing upstream fills.
+ *
+ * Lives here rather than inline on each screen because three of them ask
+ * (the new-backend form, the detail page, the backends index) and a fourth
+ * answer that drifted from the server's would render an editable field the API
+ * refuses.
+ */
+export function quotaApplicable(kind: BackendKind): boolean {
+	return kind !== 'hashserv' && kind !== 'oci';
+}
+
 // Mirrors internal/cache/oci/config.go's defaultUpstream / defaultTagTTL.
 const OCI_DEFAULT_UPSTREAM = 'docker.io';
 const OCI_DEFAULT_TAG_TTL = '10m';
