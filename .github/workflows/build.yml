@@ -25,9 +25,9 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
@@ -35,13 +35,13 @@ jobs:
       # Pinned rather than read from web/package.json: that file declares no
       # `engines.node`, which is the only thing node-version-file reads there.
       # Keep this major in step with the node stage in the Dockerfile.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "25"
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
 
       - name: Check
         run: just check
@@ -74,20 +74,20 @@ jobs:
       TEST_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "25"
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
 
       - name: Build
         run: just build
@@ -115,20 +115,20 @@ jobs:
         run: just coverage
 
       - name: Upload coverage artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: build/coverage*
 
       - name: Upload the test log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-log
           path: build/test-db.log
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bakery
           path: build/bakery
@@ -163,21 +163,21 @@ jobs:
       TEST_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
 
       # Cache the 13 MB shallow bitbake clone. `just conformance` clones into
       # build/bitbake only on a cache miss; a hit restores it and the recipe reuses
       # it, so the conformance run needs zero network. Key on the pinned tag, which
       # the recipe's bb_tag must match -- bump both together.
       - name: Cache the bitbake checkout
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build/bitbake
           key: bitbake-2.8.0
@@ -189,7 +189,7 @@ jobs:
 
       - name: Upload the conformance log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: conformance-log
           path: build/conformance.log
@@ -229,21 +229,21 @@ jobs:
       TEST_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
 
       # ubuntu-latest's system python is EXTERNALLY-MANAGED (PEP 668): a bare
       # `pip3 install websockets` there dies with `error: externally-managed-environment`.
       # setup-python puts an interpreter we own first on PATH -- and it is the SAME python3
       # the Go harness exec.Commands and the same one `just hashserv-conformance` installs
       # the pinned websockets for, because all three resolve `python3` from PATH.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -251,7 +251,7 @@ jobs:
       # checkout, cached once, restored by both. Key on the pinned tag, which the recipe's
       # bb_tag must match -- bump both together.
       - name: Cache the bitbake checkout
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build/bitbake
           key: bitbake-2.8.0
@@ -261,7 +261,7 @@ jobs:
 
       - name: Upload the hashserv conformance log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hashserv-conformance-log
           path: build/hashserv-conformance.log
@@ -301,14 +301,14 @@ jobs:
       TEST_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
 
       # ccache from apt; sccache from its release binary (apt has no reliable sccache). No
       # setup action for sccache -- mozilla-actions/sccache-action exports SCCACHE_GHA_*
@@ -330,7 +330,7 @@ jobs:
 
       - name: Upload the bazel conformance log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bazel-conformance-log
           path: build/bazel-conformance.log
@@ -373,14 +373,14 @@ jobs:
       TEST_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
 
       # skopeo from apt. ubuntu-latest carries it in universe, and the version there is
       # new enough to speak the whole pull API this gate uses. No registry login and no
@@ -397,7 +397,7 @@ jobs:
 
       - name: Upload the oci conformance log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: oci-conformance-log
           path: build/oci-conformance.log
@@ -443,14 +443,14 @@ jobs:
       TEST_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
 
       - name: Install skopeo
         run: |
@@ -473,7 +473,7 @@ jobs:
 
       - name: Upload the registry conformance log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: registry-conformance-log
           path: build/registry-conformance.log
@@ -494,21 +494,21 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
 
       - name: Storage conformance (local + a real minio; a skip fails the job)
         run: just storage-conformance
 
       - name: Upload the storage conformance log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: storage-conformance-log
           path: build/storage-conformance.log
@@ -552,20 +552,20 @@ jobs:
       TEST_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "25"
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
 
       # A FRESH runner has no browser and none of the OS libraries Chromium
       # needs to launch -- --with-deps installs both via apt. `just web-e2e`
@@ -584,7 +584,7 @@ jobs:
 
       - name: Upload the web e2e log + report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: web-e2e-report
           path: |
@@ -594,7 +594,7 @@ jobs:
   commit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -630,13 +630,13 @@ jobs:
       digest: ${{ steps.build-and-push.outputs.digest }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -674,7 +674,7 @@ jobs:
       # builds the frontend and compiles the binary from source itself.
       - name: Build and push image
         id: build-and-push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -713,24 +713,24 @@ jobs:
 
     steps:
       # Full history: `cz changelog` walks the tag graph to bound the section.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "25"
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
