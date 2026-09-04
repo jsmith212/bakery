@@ -56,6 +56,13 @@ SELECT id, robot_id, org_id, name, token_prefix, scope,
 UPDATE org_tokens SET revoked_at = now()
  WHERE id = $1 AND robot_id = $2 AND org_id = $3 AND revoked_at IS NULL;
 
+-- The purge of an already-revoked token: scoped by robot AND org like the revoke,
+-- and gated on revoked_at IS NOT NULL in the statement (see DeleteRevokedAPIKey).
+--
+-- name: DeleteRevokedOrgToken :execrows
+DELETE FROM org_tokens
+ WHERE id = $1 AND robot_id = $2 AND org_id = $3 AND revoked_at IS NOT NULL;
+
 -- COALESCED, NEVER per-request. See api_keys.sql's TouchAPIKey.
 --
 -- name: TouchOrgTokens :exec

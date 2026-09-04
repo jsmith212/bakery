@@ -325,6 +325,22 @@ test.describe('console: personal access tokens and robots (wave 1)', () => {
 			await expect(row).toBeVisible();
 			await expect(row.getByText('live')).toBeVisible();
 		});
+
+		await test.step('revoke it, then delete the revoked record', async () => {
+			const row = page.getByRole('row').filter({ hasText: tokenName });
+			await row.getByRole('button', { name: 'Revoke' }).click();
+			await page.getByRole('dialog').getByRole('button', { name: 'Revoke token' }).click();
+			// Non-exact, same as the 'live' check above: the Badge renders a
+			// glyph ('✕') alongside the status text, so an exact match never
+			// hits.
+			await expect(row.getByText('revoked')).toBeVisible();
+
+			// The action column turns into Delete for a revoked row; the purge is what
+			// keeps the list from accumulating every revoked generation of a name.
+			await row.getByRole('button', { name: 'Delete' }).click();
+			await page.getByRole('dialog').getByRole('button', { name: 'Delete token' }).click();
+			await expect(row).toBeHidden();
+		});
 	});
 
 	test('org members: create a robot, mint its token, one-time reveal, bkro_ prefix', async ({

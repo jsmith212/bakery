@@ -39,6 +39,19 @@ export function createKey(
 	);
 }
 
+/**
+ * 204. Erases the record of an ALREADY-revoked key; a live key answers 409
+ * `not_revoked`. Explicit `?purge=true` -- a plain DELETE is and stays the revoke.
+ */
+export function purgeKey(
+	org: string,
+	project: string,
+	key: string,
+	opts?: RequestOptions
+): Promise<void> {
+	return del<void>(`/orgs/${seg(org)}/projects/${seg(project)}/keys/${seg(key)}?purge=true`, opts);
+}
+
 /** 204, idempotent. */
 export function revokeKey(
 	org: string,

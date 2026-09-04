@@ -8,7 +8,7 @@
 		putOrgMember,
 		putProjectMember
 	} from '$lib/api/members';
-	import { createRobot, createOrgToken, deleteRobot, revokeOrgToken } from '$lib/api/robots';
+	import { createRobot, createOrgToken, deleteRobot, revokeOrgToken, purgeOrgToken } from '$lib/api/robots';
 	import { isApiError } from '$lib/api/errors';
 	import type { CreatedOrgToken, KeyScope, Member, OrgRole, OrgToken, ProjectRole, Robot } from '$lib/api/types';
 	import { memberProvenance } from '$lib/api/types';
@@ -259,7 +259,7 @@
 		{ value: '365', label: '1 year' }
 	];
 
-	let robotModal = $state<null | 'create-robot' | 'create-token' | 'reveal' | 'revoke-token' | 'delete-robot'>(
+	let robotModal = $state<null | 'create-robot' | 'create-token' | 'reveal' | 'revoke-token' | 'delete-token' | 'delete-robot'>(
 		null
 	);
 
@@ -377,6 +377,31 @@
 
 	let revokeTokenTarget = $state<{ robot: Robot; token: OrgToken } | null>(null);
 	let revokeTokenPending = $state(false);
+	let deleteTokenTarget = $state<{ robot: Robot; token: OrgToken } | null>(null);
+	let deleteTokenPending = $state(false);
+
+	function openDeleteToken(robot: Robot, token: OrgToken) {
+		deleteTokenTarget = { robot, token };
+		robotModal = 'delete-token';
+	}
+
+	// The purge of a revoked record; the server refuses a live token (409
+	// not_revoked), so the revoked-only button is belt and braces.
+	async function confirmDeleteToken() {
+		if (!deleteTokenTarget || deleteTokenPending) return;
+		deleteTokenPending = true;
+		try {
+			await purgeOrgToken(org.slug, deleteTokenTarget.robot.id, deleteTokenTarget.token.id);
+			pushToast({ variant: 'success', title: `Deleted ${deleteTokenTarget.token.name}` });
+			robotModal = null;
+			deleteTokenTarget = null;
+			await invalidateAll();
+		} catch (err) {
+			toastError(err, 'Could not delete token');
+		} finally {
+			deleteTokenPending = false;
+		}
+	}
 
 	function openRevokeToken(robot: Robot, token: OrgToken) {
 		revokeTokenTarget = { robot, token };
@@ -657,13 +682,18 @@
 														>{expiry.label}</Td
 													>
 													<Td class="text-right">
-														<Button
-															variant="ghost"
-															size="sm"
-															class="text-err! hover:text-err!"
-															disabled={!!t.revoked_at}
-															onclick={() => openRevokeToken(robot, t)}>Revoke</Button
-														>
+														{#if t.revoked_at}
+															<Button variant="ghost" size="sm" onclick={() => openDeleteToken(robot, t)}
+																>Delete</Button
+															>
+														{:else}
+															<Button
+																variant="ghost"
+																size="sm"
+																class="text-err! hover:text-err!"
+																onclick={() => openRevokeToken(robot, t)}>Revoke</Button
+															>
+														{/if}
 													</Td>
 												</Tr>
 											{/each}
@@ -878,6 +908,23 @@
 			>
 			<Button variant="danger" size="md" onclick={confirmDeleteRobot} disabled={deleteRobotPending}>
 				{deleteRobotPending ? 'Deleting…' : 'Delete robot'}
+			</Button>
+		{/snippet}
+	</Modal>
+{/if}
+
+{#if robotModal === 'delete-token' && deleteTokenTarget}
+	<Modal title={`Delete ${deleteTokenTarget.token.name}`} onclose={closeRobotModal}>
+		This token of <span class="font-mono text-[length:var(--mono-xs)] text-text-1"
+			>{deleteTokenTarget.robot.name}</span
+		> was revoked and can no longer authenticate. Deleting it removes the record from this list for
+		good.
+		{#snippet footer()}
+			<Button variant="ghost" size="md" onclick={closeRobotModal} disabled={deleteTokenPending}
+				>Cancel</Button
+			>
+			<Button variant="danger" size="md" onclick={confirmDeleteToken} disabled={deleteTokenPending}>
+				{deleteTokenPending ? 'Deleting…' : 'Delete token'}
 			</Button>
 		{/snippet}
 	</Modal>

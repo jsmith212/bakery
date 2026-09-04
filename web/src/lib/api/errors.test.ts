@@ -17,8 +17,8 @@ describe('the closed code vocabulary', () => {
 	// fourteenth, this fails -- which is the point: the union is exhaustive over
 	// the SERVER's vocabulary, not over the subset a screen happens to have met.
 	it('has exactly the thirteen codes errors.go declares', () => {
-		expect(API_ERROR_CODES).toHaveLength(13);
-		expect(new Set(API_ERROR_CODES).size).toBe(13);
+		expect(API_ERROR_CODES).toHaveLength(14);
+		expect(new Set(API_ERROR_CODES).size).toBe(14);
 	});
 
 	it('includes claim_derived_role and not_implemented', () => {

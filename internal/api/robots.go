@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -271,6 +272,10 @@ func (a *API) handleRevokeOrgToken(w http.ResponseWriter, r *http.Request) error
 		return err
 	}
 
+	if wantsPurge(r) {
+		return a.purgeOrgToken(ctx, w, s.OrgID, robotID, tokenID)
+	}
+
 	n, err := a.store.RevokeOrgToken(ctx, repository.RevokeOrgTokenParams{
 		ID: tokenID, RobotID: robotID, OrgID: s.OrgID,
 	})
@@ -338,4 +343,43 @@ func newOrgToken(row repository.ListOrgTokensForOrgRow) OrgToken {
 		LastUsedAt:     timePtr(row.LastUsedAt),
 		RevokedAt:      timePtr(row.RevokedAt),
 	}
+}
+
+// purgeOrgToken erases the record of an already-revoked robot token. Org-scoped
+// listing, robot-matched: a token of another robot or another org is absent and
+// answers 204 like "already gone" (the same indistinguishability the revoke keeps);
+// a LIVE token is the one refusal (409 not_revoked), and the DELETE statement's
+// revoked_at IS NOT NULL predicate enforces that even without this check.
+func (a *API) purgeOrgToken(
+	ctx context.Context, w http.ResponseWriter, orgID, robotID, tokenID pgtype.UUID,
+) error {
+	rows, err := a.store.ListOrgTokensForOrg(ctx, orgID)
+	if err != nil {
+		return fmt.Errorf("list org tokens: %w", err)
+	}
+
+	for _, row := range rows {
+		if row.ID != tokenID || row.RobotID != robotID {
+			continue
+		}
+
+		if !row.RevokedAt.Valid {
+			return errConflict(CodeNotRevoked, "revoke this token before deleting it")
+		}
+
+		if _, err := a.store.DeleteRevokedOrgToken(ctx, repository.DeleteRevokedOrgTokenParams{
+			ID: tokenID, RobotID: robotID, OrgID: orgID,
+		}); err != nil {
+			return fmt.Errorf("delete revoked org token: %w", err)
+		}
+
+		a.log.InfoContext(ctx, "deleted a revoked robot token",
+			"robot_id", uuidString(robotID), "token_id", uuidString(tokenID))
+
+		break
+	}
+
+	writeJSON(w, http.StatusNoContent, nil)
+
+	return nil
 }

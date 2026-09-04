@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { invalidateAll } from '$app/navigation';
 
-	import { createKey, revokeKey } from '$lib/api/keys';
+	import { createKey, revokeKey, purgeKey } from '$lib/api/keys';
 	import { isApiError } from '$lib/api/errors';
 	import type { APIKey, CreatedAPIKey, KeyScope } from '$lib/api/types';
 	import { canMintKey } from '$lib/roles';
@@ -57,7 +57,7 @@
 		{ value: '365', label: '1 year' }
 	];
 
-	let modal = $state<null | 'create' | 'reveal' | 'revoke'>(null);
+	let modal = $state<null | 'create' | 'reveal' | 'revoke' | 'delete'>(null);
 	let ack = $state(false);
 	let draftName = $state('');
 	let draftScope = $state<KeyScope>('write');
@@ -68,6 +68,8 @@
 
 	let revokeTarget = $state<APIKey | null>(null);
 	let revokePending = $state(false);
+	let deleteTarget = $state<APIKey | null>(null);
+	let deletePending = $state(false);
 
 	let revealedKey = $state<CreatedAPIKey | null>(null);
 
@@ -115,6 +117,30 @@
 		}
 	}
 
+	function openDelete(key: APIKey) {
+		deleteTarget = key;
+		modal = 'delete';
+	}
+
+	// The purge of a revoked record. The button only renders on revoked rows and
+	// the server refuses a live key (409 not_revoked), so this can never be the
+	// first thing that happens to a working credential.
+	async function confirmDelete() {
+		if (!deleteTarget || deletePending) return;
+		deletePending = true;
+		try {
+			await purgeKey(org.slug, project.slug, deleteTarget.id);
+			pushToast({ variant: 'success', title: `Deleted ${deleteTarget.name}` });
+			modal = null;
+			deleteTarget = null;
+			await invalidateAll();
+		} catch (err) {
+			toastError(err, 'Could not delete key');
+		} finally {
+			deletePending = false;
+		}
+	}
+
 	function openRevoke(key: APIKey) {
 		revokeTarget = key;
 		modal = 'revoke';
@@ -138,7 +164,7 @@
 	}
 
 	function closeModal() {
-		if (createPending || revokePending) return;
+		if (createPending || revokePending || deletePending) return;
 		modal = null;
 		revokeTarget = null;
 		revealedKey = null;
@@ -218,13 +244,16 @@
 							>
 							<Td class="whitespace-nowrap {expiryClass[expiry.kind]}">{expiry.label}</Td>
 							<Td class="text-right">
-								<Button
-									variant="ghost"
-									size="sm"
-									class="text-err! hover:text-err!"
-									disabled={!!k.revoked_at}
-									onclick={() => openRevoke(k)}>Revoke</Button
-								>
+								{#if k.revoked_at}
+									<Button variant="ghost" size="sm" onclick={() => openDelete(k)}>Delete</Button>
+								{:else}
+									<Button
+										variant="ghost"
+										size="sm"
+										class="text-err! hover:text-err!"
+										onclick={() => openRevoke(k)}>Revoke</Button
+									>
+								{/if}
 							</Td>
 						</Tr>
 					{/each}
@@ -328,6 +357,22 @@
 			>
 			<Button variant="danger" size="md" onclick={confirmRevoke} disabled={revokePending}>
 				{revokePending ? 'Revoking…' : 'Revoke key'}
+			</Button>
+		{/snippet}
+	</Modal>
+{/if}
+
+{#if modal === 'delete' && deleteTarget}
+	<Modal title={`Delete ${deleteTarget.name}`} onclose={closeModal}>
+		This key was revoked {formatDateTimeUTC(deleteTarget.revoked_at ?? deleteTarget.created_at)} and
+		can no longer authenticate. Deleting it removes the record from this list — its name, prefix and
+		last-used time are gone for good.
+		{#snippet footer()}
+			<Button variant="ghost" size="md" onclick={closeModal} disabled={deletePending}
+				>Cancel</Button
+			>
+			<Button variant="danger" size="md" onclick={confirmDelete} disabled={deletePending}>
+				{deletePending ? 'Deleting…' : 'Delete key'}
 			</Button>
 		{/snippet}
 	</Modal>

@@ -281,6 +281,7 @@ type fakeStore struct {
 	// the downgrade-revokes-write-keys transaction is asserted.
 	revokedForMembership []repository.RevokeAPIKeysForMembershipParams
 	revokedKeys          []pgtype.UUID
+	deletedKeys          []pgtype.UUID
 
 	// orgMemberReads records every ListOrgMembers(orgID). Key-owner decoration must
 	// resolve names through THIS (an org-scoped, bounded read), never through a
@@ -686,6 +687,24 @@ func (s *fakeStore) RevokeAPIKey(_ context.Context, id pgtype.UUID) (int64, erro
 	s.revokedKeys = append(s.revokedKeys, id)
 
 	return 1, nil
+}
+
+// DeleteRevokedAPIKey mirrors the statement's revoked_at IS NOT NULL predicate: a
+// live key matches nothing here, so a test cannot pass against this fake and fail
+// against Postgres.
+func (s *fakeStore) DeleteRevokedAPIKey(_ context.Context, id pgtype.UUID) (int64, error) {
+	s.note("DeleteRevokedAPIKey:" + uuidString(id))
+
+	for i, row := range s.keys {
+		if row.ID == id && row.RevokedAt.Valid {
+			s.keys = append(s.keys[:i], s.keys[i+1:]...)
+			s.deletedKeys = append(s.deletedKeys, id)
+
+			return 1, nil
+		}
+	}
+
+	return 0, nil
 }
 
 func (s *fakeStore) ListBackendsForProject(
@@ -1169,6 +1188,41 @@ func (s *fakeStore) ListOrgTokensForOrg(
 	}
 
 	return out, nil
+}
+
+// DeleteRevokedUserToken mirrors the statement: owner-scoped AND revoked_at IS NOT
+// NULL, so a live or foreign token matches nothing.
+func (s *fakeStore) DeleteRevokedUserToken(
+	_ context.Context, arg repository.DeleteRevokedUserTokenParams,
+) (int64, error) {
+	s.note("DeleteRevokedUserToken:" + uuidString(arg.ID))
+
+	for i, row := range s.userTokens {
+		if row.ID == arg.ID && row.UserID == arg.UserID && row.RevokedAt.Valid {
+			s.userTokens = append(s.userTokens[:i], s.userTokens[i+1:]...)
+
+			return 1, nil
+		}
+	}
+
+	return 0, nil
+}
+
+// DeleteRevokedOrgToken mirrors the statement: robot- and org-scoped AND revoked.
+func (s *fakeStore) DeleteRevokedOrgToken(
+	_ context.Context, arg repository.DeleteRevokedOrgTokenParams,
+) (int64, error) {
+	s.note("DeleteRevokedOrgToken:" + uuidString(arg.ID))
+
+	for i, row := range s.orgTokens {
+		if row.ID == arg.ID && row.RobotID == arg.RobotID && row.OrgID == arg.OrgID && row.RevokedAt.Valid {
+			s.orgTokens = append(s.orgTokens[:i], s.orgTokens[i+1:]...)
+
+			return 1, nil
+		}
+	}
+
+	return 0, nil
 }
 
 func (s *fakeStore) RevokeOrgToken(

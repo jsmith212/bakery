@@ -241,6 +241,30 @@ func (a *API) handleRevokeKey(w http.ResponseWriter, r *http.Request) error {
 		return errForbidden("you may only revoke your own keys")
 	}
 
+	if wantsPurge(r) {
+		// Purge: erase the record of an ALREADY-revoked key. A separate intent from
+		// revoke, carried by a query flag rather than by "DELETE twice": the plain
+		// DELETE stays idempotent revocation, so a retried revoke can never quietly
+		// escalate into erasing the row. The statement carries the revoked_at IS NOT
+		// NULL predicate too, so live-to-gone is unrepresentable even under a race;
+		// this check only shapes the error.
+		if !target.RevokedAt.Valid {
+			return errConflict(CodeNotRevoked, "revoke this key before deleting it")
+		}
+
+		if _, err := a.store.DeleteRevokedAPIKey(ctx, keyID); err != nil {
+			return fmt.Errorf("delete revoked api key: %w", err)
+		}
+
+		a.log.InfoContext(ctx, "deleted a revoked API key",
+			"project", s.ProjectSlug, "name", target.Name, "prefix", target.TokenPrefix,
+		)
+
+		writeJSON(w, http.StatusNoContent, nil)
+
+		return nil
+	}
+
 	n, err := a.store.RevokeAPIKey(ctx, keyID)
 	if err != nil {
 		return fmt.Errorf("revoke api key: %w", err)
@@ -261,4 +285,14 @@ func (a *API) handleRevokeKey(w http.ResponseWriter, r *http.Request) error {
 	writeJSON(w, http.StatusNoContent, nil)
 
 	return nil
+}
+
+// wantsPurge reports whether a credential DELETE asks to erase the row of an
+// already-revoked credential rather than revoke a live one. `?purge=true`, and
+// nothing else, is that request: it is the one mutation flag the API carries in a
+// query string, chosen over a second route because the purge is the same resource,
+// the same verb and the same authorization as the revoke -- only the intent differs,
+// and it must be explicit, never inferred from state.
+func wantsPurge(r *http.Request) bool {
+	return r.URL.Query().Get("purge") == "true"
 }

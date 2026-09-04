@@ -91,6 +91,7 @@ type Store interface {
 		ctx context.Context, projectID pgtype.UUID,
 	) ([]repository.ListAPIKeysForProjectRow, error)
 	RevokeAPIKey(ctx context.Context, id pgtype.UUID) (int64, error)
+	DeleteRevokedAPIKey(ctx context.Context, id pgtype.UUID) (int64, error)
 
 	// Personal access tokens. Same absence as above: no query here returns a hash.
 	//
@@ -101,6 +102,7 @@ type Store interface {
 		ctx context.Context, userID pgtype.UUID,
 	) ([]repository.ListUserTokensForUserRow, error)
 	RevokeUserToken(ctx context.Context, arg repository.RevokeUserTokenParams) (int64, error)
+	DeleteRevokedUserToken(ctx context.Context, arg repository.DeleteRevokedUserTokenParams) (int64, error)
 
 	// Robots and their org tokens. Every query is scoped by org_id, which the guard
 	// resolved and authorized -- so a robot id from another tenant is simply not in
@@ -113,6 +115,7 @@ type Store interface {
 		ctx context.Context, orgID pgtype.UUID,
 	) ([]repository.ListOrgTokensForOrgRow, error)
 	RevokeOrgToken(ctx context.Context, arg repository.RevokeOrgTokenParams) (int64, error)
+	DeleteRevokedOrgToken(ctx context.Context, arg repository.DeleteRevokedOrgTokenParams) (int64, error)
 
 	// Cache backends. Reads go through ListBackendsForProject (a project has at most
 	// a handful of backends) so every row carries its full column set -- created_at

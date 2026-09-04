@@ -27,6 +27,7 @@ const (
 	CodeNotFound       = "not_found"
 	CodeConflict       = "conflict"
 	CodeClaimDerived   = "claim_derived_role"
+	CodeNotRevoked     = "not_revoked"
 	CodeUnsupported    = "unsupported_media_type"
 	CodeScopeExceeded  = "scope_exceeds_role"
 	CodeInternal       = "internal_error"

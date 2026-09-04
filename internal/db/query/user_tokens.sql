@@ -33,6 +33,14 @@ SELECT id, user_id, name, token_prefix, max_scope,
 UPDATE user_tokens SET revoked_at = now()
  WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL;
 
+-- The purge of an already-revoked token: owner-scoped like RevokeUserToken, and
+-- gated on revoked_at IS NOT NULL in the statement so a live token can never be
+-- erased through this path (see api_keys.sql's DeleteRevokedAPIKey).
+--
+-- name: DeleteRevokedUserToken :execrows
+DELETE FROM user_tokens
+ WHERE id = $1 AND user_id = $2 AND revoked_at IS NOT NULL;
+
 -- name: GetUserTokenForUser :one
 SELECT id, user_id, name, token_prefix, max_scope,
        expires_at, revoked_at, last_used_at, created_at

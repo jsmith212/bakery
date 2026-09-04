@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/jsmith212/bakery/internal/auth"
 	"github.com/jsmith212/bakery/internal/db/repository"
 )
@@ -322,4 +324,92 @@ func hasCall(store *fakeStore, want string) bool {
 	}
 
 	return false
+}
+
+// TestUserTokenPurge: the purge is owner-scoped like the revoke (a colleague's
+// revoked token is absent from your listing and answers 204 without touching the
+// store -- "not yours" stays indistinguishable from "gone"), refuses your own LIVE
+// token with 409 not_revoked, and erases your own revoked one.
+func TestUserTokenPurge(t *testing.T) {
+	revokedAt := pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true}
+
+	store := credentialFixture(t)
+	store.userTokens[1].RevokedAt = revokedAt // marko's, revoked
+
+	a := testAPI(t, store, newCredentialMinter(userTokenPlaintext))
+	anna := principals(t)["proj_admin"]
+
+	// Marko's revoked token, presented by Anna: absent from her listing, so 204 and
+	// no delete ever reaches the store.
+	res := do(t, a, anna, http.MethodDelete, Prefix+"/user/tokens/"+keyMarkoID+"?purge=true", "")
+	if res.Code != http.StatusNoContent {
+		t.Fatalf("purge of another user's token = %d, want 204 (%s)", res.Code, res.Body)
+	}
+
+	if hasCall(store, "DeleteRevokedUserToken:"+keyMarkoID) {
+		t.Error("a foreign token's purge reached the store; the listing is not owner-scoped")
+	}
+
+	// Anna's own LIVE token: refused.
+	res = do(t, a, anna, http.MethodDelete, Prefix+"/user/tokens/"+keyAnnaID+"?purge=true", "")
+	if res.Code != http.StatusConflict || decodeErr(t, res).Code != CodeNotRevoked {
+		t.Fatalf("purge of a live token = %d %s, want 409 not_revoked", res.Code, res.Body)
+	}
+
+	// Revoked, then purged: gone.
+	store.userTokens[0].RevokedAt = revokedAt
+
+	res = do(t, a, anna, http.MethodDelete, Prefix+"/user/tokens/"+keyAnnaID+"?purge=true", "")
+	if res.Code != http.StatusNoContent {
+		t.Fatalf("purge of own revoked token = %d, want 204 (%s)", res.Code, res.Body)
+	}
+
+	for _, row := range store.userTokens {
+		if uuidString(row.ID) == keyAnnaID {
+			t.Error("the revoked token is still in the store after its purge")
+		}
+	}
+}
+
+// TestOrgTokenPurge: robot- and org-scoped like the revoke. A live token is refused
+// (409 not_revoked); a revoked one is erased; a token that is not this robot's is
+// absent and answers 204 with the store untouched.
+func TestOrgTokenPurge(t *testing.T) {
+	revokedAt := pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true}
+
+	store := credentialFixture(t)
+	a := testAPI(t, store, newCredentialMinter(userTokenPlaintext))
+	admin := principals(t)["org_admin"]
+
+	// The fixture token (keyMarkoID) belongs to robot keyAnnaID.
+	target := Prefix + "/orgs/acme/robots/" + keyAnnaID + "/tokens/" + keyMarkoID + "?purge=true"
+
+	res := do(t, a, admin, http.MethodDelete, target, "")
+	if res.Code != http.StatusConflict || decodeErr(t, res).Code != CodeNotRevoked {
+		t.Fatalf("purge of a live robot token = %d %s, want 409 not_revoked", res.Code, res.Body)
+	}
+
+	store.orgTokens[0].RevokedAt = revokedAt
+
+	// Wrong robot: absent, 204, nothing erased.
+	wrongRobot := Prefix + "/orgs/acme/robots/" + keyMarkoID + "/tokens/" + keyMarkoID + "?purge=true"
+
+	res = do(t, a, admin, http.MethodDelete, wrongRobot, "")
+	if res.Code != http.StatusNotFound && res.Code != http.StatusNoContent {
+		t.Fatalf("purge via the wrong robot = %d, want 404 or 204 (%s)", res.Code, res.Body)
+	}
+
+	if hasCall(store, "DeleteRevokedOrgToken:"+keyMarkoID) {
+		t.Fatal("a purge through the wrong robot reached the store")
+	}
+
+	// The right robot, revoked: gone.
+	res = do(t, a, admin, http.MethodDelete, target, "")
+	if res.Code != http.StatusNoContent {
+		t.Fatalf("purge of a revoked robot token = %d, want 204 (%s)", res.Code, res.Body)
+	}
+
+	if len(store.orgTokens) != 0 {
+		t.Error("the revoked robot token is still in the store after its purge")
+	}
 }

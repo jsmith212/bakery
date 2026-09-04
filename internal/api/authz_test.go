@@ -69,6 +69,7 @@ func fixtureStore(t *testing.T) *fakeStore {
 		calls:                nil,
 		revokedForMembership: nil,
 		revokedKeys:          nil,
+		deletedKeys:          nil,
 		desiredErr:           nil,
 	}
 }

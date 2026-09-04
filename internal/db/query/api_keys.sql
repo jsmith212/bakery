@@ -68,13 +68,23 @@ SELECT id, user_id, project_id, name, token_prefix, scope,
  ORDER BY created_at DESC;
 
 -- Soft, and it is the one soft-state column in the schema. The console must show
--- "revoked 3 days ago", and a revoked key's hash must stay reserved. The price is
--- one partial unique index (api_keys_active_name_key) so that revoking the key named
--- "ci" does not permanently burn the name "ci".
+-- "revoked 3 days ago", and a revoked key's hash stays reserved until the row is
+-- purged. The price is one partial unique index (api_keys_active_name_key) so that
+-- revoking the key named "ci" does not permanently burn the name "ci".
 --
 -- name: RevokeAPIKey :execrows
 UPDATE api_keys SET revoked_at = now()
  WHERE id = $1 AND revoked_at IS NULL;
+
+-- The purge. A revoked key is a record, not a credential, and the owner decides
+-- when the record has said all it will. The revoked_at IS NOT NULL predicate is
+-- the guard, IN THE STATEMENT: a live key cannot go straight to gone through this
+-- path however the handler is called, so "delete" can never be the first thing
+-- that happens to a working credential.
+--
+-- name: DeleteRevokedAPIKey :execrows
+DELETE FROM api_keys
+ WHERE id = $1 AND revoked_at IS NOT NULL;
 
 -- Used when a project role is downgraded: revoke, in the same transaction as the
 -- downgrade, every key whose scope now exceeds the role.

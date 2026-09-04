@@ -29,6 +29,7 @@ export type ApiErrorCode =
 	| 'not_found'
 	| 'conflict'
 	| 'claim_derived_role'
+	| 'not_revoked'
 	| 'unsupported_media_type'
 	| 'scope_exceeds_role'
 	| 'internal_error'
@@ -50,6 +51,7 @@ export const API_ERROR_CODES: readonly ApiErrorCode[] = [
 	'not_found',
 	'conflict',
 	'claim_derived_role',
+	'not_revoked',
 	'unsupported_media_type',
 	'scope_exceeds_role',
 	'internal_error',
@@ -93,6 +95,7 @@ export function treatmentFor(code: ApiErrorCode): ErrorTreatment {
 		case 'not_found':
 			return 'context';
 		case 'bad_request':
+		case 'not_revoked':
 		case 'conflict':
 		case 'unsupported_media_type':
 		case 'internal_error':
@@ -128,6 +131,8 @@ export function fallbackMessage(code: ApiErrorCode): string {
 			return 'That does not exist, or you cannot see it.';
 		case 'conflict':
 			return 'That conflicts with the current state.';
+		case 'not_revoked':
+			return 'Revoke it before deleting it.';
 		case 'claim_derived_role':
 			return 'That role comes from an identity-provider group and cannot be changed here.';
 		case 'unsupported_media_type':

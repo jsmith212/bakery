@@ -49,6 +49,16 @@ export function createOrgToken(
 }
 
 /** 204, idempotent. */
+/** 204. Erases the record of an ALREADY-revoked token; a live one is a 409 `not_revoked`. */
+export function purgeOrgToken(
+	org: string,
+	robot: string,
+	token: string,
+	opts?: RequestOptions
+): Promise<void> {
+	return del<void>(`/orgs/${seg(org)}/robots/${seg(robot)}/tokens/${seg(token)}?purge=true`, opts);
+}
+
 export function revokeOrgToken(
 	org: string,
 	robot: string,

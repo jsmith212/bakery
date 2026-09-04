@@ -1,10 +1,13 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/jsmith212/bakery/internal/auth"
 	"github.com/jsmith212/bakery/internal/db/repository"
@@ -149,6 +152,10 @@ func (a *API) handleRevokeUserToken(w http.ResponseWriter, r *http.Request) erro
 		return err
 	}
 
+	if wantsPurge(r) {
+		return a.purgeUserToken(ctx, w, p.UserID(), tokenID)
+	}
+
 	n, err := a.store.RevokeUserToken(ctx, repository.RevokeUserTokenParams{
 		ID: tokenID, UserID: p.UserID(),
 	})
@@ -184,4 +191,46 @@ func newUserToken(row repository.ListUserTokensForUserRow) UserToken {
 		LastUsedAt:  timePtr(row.LastUsedAt),
 		RevokedAt:   timePtr(row.RevokedAt),
 	}
+}
+
+// purgeUserToken erases the record of an already-revoked personal token.
+//
+// The listing is owner-scoped, so a token that is not yours is simply absent -- and
+// absent answers 204, the same as "already gone", for the same no-oracle reason the
+// revoke path gives: "not yours" must never be distinguishable from "no such
+// token". A LIVE token of your own is the one refusal (409 not_revoked): the purge
+// is a cleanup of a dead record, never a first action against a working credential,
+// and the DELETE statement's revoked_at IS NOT NULL predicate holds that line even
+// if this check were somehow skipped.
+func (a *API) purgeUserToken(
+	ctx context.Context, w http.ResponseWriter, userID, tokenID pgtype.UUID,
+) error {
+	rows, err := a.store.ListUserTokensForUser(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("list user tokens: %w", err)
+	}
+
+	for _, row := range rows {
+		if row.ID != tokenID {
+			continue
+		}
+
+		if !row.RevokedAt.Valid {
+			return errConflict(CodeNotRevoked, "revoke this token before deleting it")
+		}
+
+		if _, err := a.store.DeleteRevokedUserToken(ctx, repository.DeleteRevokedUserTokenParams{
+			ID: tokenID, UserID: userID,
+		}); err != nil {
+			return fmt.Errorf("delete revoked user token: %w", err)
+		}
+
+		a.log.InfoContext(ctx, "deleted a revoked personal access token", "token_id", uuidString(tokenID))
+
+		break
+	}
+
+	writeJSON(w, http.StatusNoContent, nil)
+
+	return nil
 }

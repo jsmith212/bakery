@@ -26,6 +26,11 @@ export function createUserToken(
 	return post<CreatedUserToken>('/user/tokens', body, opts);
 }
 
+/** 204. Erases the record of an ALREADY-revoked token; a live one is a 409 `not_revoked`. */
+export function purgeUserToken(id: string, opts?: RequestOptions): Promise<void> {
+	return del<void>(`/user/tokens/${seg(id)}?purge=true`, opts);
+}
+
 /** 204, idempotent -- a double-revoke is not an error. */
 export function revokeUserToken(id: string, opts?: RequestOptions): Promise<void> {
 	return del<void>(`/user/tokens/${seg(id)}`, opts);

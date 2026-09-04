@@ -2,7 +2,7 @@
 	import { invalidateAll } from '$app/navigation';
 
 	import { theme, setTheme, type Theme } from '$lib/theme';
-	import { createUserToken, revokeUserToken } from '$lib/api/tokens';
+	import { createUserToken, revokeUserToken, purgeUserToken } from '$lib/api/tokens';
 	import { isApiError } from '$lib/api/errors';
 	import type { CreatedUserToken, KeyScope, UserToken } from '$lib/api/types';
 	import { formatDateTimeUTC, formatExpiry } from '$lib/format';
@@ -78,7 +78,7 @@
 		{ value: '', label: 'Never' }
 	];
 
-	let modal = $state<null | 'create' | 'reveal' | 'revoke'>(null);
+	let modal = $state<null | 'create' | 'reveal' | 'revoke' | 'delete'>(null);
 	let ack = $state(false);
 	let draftName = $state('');
 	let draftScope = $state<KeyScope>('write');
@@ -88,6 +88,8 @@
 
 	let revokeTarget = $state<UserToken | null>(null);
 	let revokePending = $state(false);
+	let deleteTarget = $state<UserToken | null>(null);
+	let deletePending = $state(false);
 
 	let revealedToken = $state<CreatedUserToken | null>(null);
 
@@ -128,6 +130,29 @@
 			}
 		} finally {
 			createPending = false;
+		}
+	}
+
+	function openDelete(t: UserToken) {
+		deleteTarget = t;
+		modal = 'delete';
+	}
+
+	// The purge of a revoked record; the server refuses a live token (409
+	// not_revoked), so the button's revoked-only rendering is belt and braces.
+	async function confirmDelete() {
+		if (!deleteTarget || deletePending) return;
+		deletePending = true;
+		try {
+			await purgeUserToken(deleteTarget.id);
+			pushToast({ variant: 'success', title: `Deleted ${deleteTarget.name}` });
+			modal = null;
+			deleteTarget = null;
+			await invalidateAll();
+		} catch (err) {
+			toastError(err, 'Could not delete token');
+		} finally {
+			deletePending = false;
 		}
 	}
 
@@ -282,13 +307,16 @@
 								>
 								<Td class="whitespace-nowrap {expiryClass[expiry.kind]}">{expiry.label}</Td>
 								<Td class="text-right">
-									<Button
-										variant="ghost"
-										size="sm"
-										class="text-err! hover:text-err!"
-										disabled={!!t.revoked_at}
-										onclick={() => openRevoke(t)}>Revoke</Button
-									>
+									{#if t.revoked_at}
+										<Button variant="ghost" size="sm" onclick={() => openDelete(t)}>Delete</Button>
+									{:else}
+										<Button
+											variant="ghost"
+											size="sm"
+											class="text-err! hover:text-err!"
+											onclick={() => openRevoke(t)}>Revoke</Button
+										>
+									{/if}
 								</Td>
 							</Tr>
 						{/each}
@@ -395,6 +423,21 @@
 			>
 			<Button variant="danger" size="md" onclick={confirmRevoke} disabled={revokePending}>
 				{revokePending ? 'Revoking…' : 'Revoke token'}
+			</Button>
+		{/snippet}
+	</Modal>
+{/if}
+
+{#if modal === 'delete' && deleteTarget}
+	<Modal title={`Delete ${deleteTarget.name}`} onclose={closeModal}>
+		This token was revoked {formatDateTimeUTC(deleteTarget.revoked_at ?? deleteTarget.created_at)}
+		and can no longer authenticate. Deleting it removes the record from this list for good.
+		{#snippet footer()}
+			<Button variant="ghost" size="md" onclick={closeModal} disabled={deletePending}
+				>Cancel</Button
+			>
+			<Button variant="danger" size="md" onclick={confirmDelete} disabled={deletePending}>
+				{deletePending ? 'Deleting…' : 'Delete token'}
 			</Button>
 		{/snippet}
 	</Modal>

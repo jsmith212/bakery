@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -428,4 +429,92 @@ func store(a *API) *fakeStore {
 	}
 
 	return s
+}
+
+// TestPurgeKeyRequiresRevocation pins the purge's two rules. It is an EXPLICIT
+// intent -- `?purge=true`; a plain DELETE on a revoked key stays the idempotent 204
+// it always was and erases nothing, so a retried revoke can never escalate into
+// erasing the record. And it refuses a LIVE key with 409 not_revoked: the record is
+// what gets deleted, never a working credential. Ownership and tenancy answer
+// exactly as revoke does, because it is the same handler.
+func TestPurgeKeyRequiresRevocation(t *testing.T) {
+	foreignKeyID := "99999999-9999-9999-9999-999999999999"
+	revokedAt := pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true}
+
+	tests := []struct {
+		name    string
+		role    string
+		keyID   string
+		revoked bool // the fixture state of keyMarko
+		purge   bool
+		want    int
+		deleted bool
+	}{
+		{
+			name: "purging a LIVE key is refused", role: "proj_admin",
+			keyID: keyMarkoID, revoked: false, purge: true, want: http.StatusConflict, deleted: false,
+		},
+		{
+			name: "an admin purges a revoked key", role: "proj_admin",
+			keyID: keyMarkoID, revoked: true, purge: true, want: http.StatusNoContent, deleted: true,
+		},
+		{
+			name: "the owner purges their own revoked key", role: "own_key_reader",
+			keyID: keyMarkoID, revoked: true, purge: true, want: http.StatusNoContent, deleted: true,
+		},
+		{
+			name: "a reader may NOT purge a colleague's revoked key", role: "proj_read",
+			keyID: keyMarkoID, revoked: true, purge: true, want: http.StatusForbidden, deleted: false,
+		},
+		{
+			name: "a revoked key from another project is a 404", role: "proj_admin",
+			keyID: foreignKeyID, revoked: true, purge: true, want: http.StatusNotFound, deleted: false,
+		},
+		{
+			name:  "a plain DELETE on a revoked key is still the idempotent revoke and erases nothing",
+			role:  "proj_admin",
+			keyID: keyMarkoID, revoked: true, purge: false, want: http.StatusNoContent, deleted: false,
+		},
+	}
+
+	cast := principals(t)
+	cast["own_key_reader"] = &fakePrincipal{
+		userID: mustUUID(t, userMarkoID), email: "marko@acme.dev", displayName: "Marko Ilic",
+		method: auth.MethodSession, siteRole: auth.SiteRoleUser,
+		orgs:     map[pgtype.UUID]auth.OrgRole{mustUUID(t, orgAcmeID): auth.OrgRoleMember},
+		projects: map[pgtype.UUID]auth.ProjectRole{mustUUID(t, projFirmwareID): auth.ProjectRoleReader},
+		key:      nil,
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := keyFixture(t)
+			if tt.revoked {
+				store.keys[1].RevokedAt = revokedAt // keyMarko
+			}
+
+			a := testAPI(t, store, nil)
+
+			path := Prefix + "/orgs/acme/projects/firmware/keys/" + tt.keyID
+			if tt.purge {
+				path += "?purge=true"
+			}
+
+			w := do(t, a, cast[tt.role], http.MethodDelete, path, "")
+
+			if w.Code != tt.want {
+				t.Fatalf("status = %d, want %d (body %s)", w.Code, tt.want, w.Body.String())
+			}
+
+			if tt.want == http.StatusConflict {
+				if got := decodeErr(t, w).Code; got != CodeNotRevoked {
+					t.Errorf("error code = %q, want %q", got, CodeNotRevoked)
+				}
+			}
+
+			if got := len(store.deletedKeys) > 0; got != tt.deleted {
+				t.Errorf("deleted = %v, want %v", got, tt.deleted)
+			}
+		})
+	}
 }
