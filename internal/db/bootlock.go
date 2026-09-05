@@ -40,6 +40,20 @@ const (
 // Postgres restart or a killed backend fast enough while costing nothing.
 const defaultWatchInterval = 5 * time.Second
 
+// How long recover() keeps re-trying pg_try_advisory_lock after a session death
+// before it concludes the lock is held by someone else, and how long it waits
+// between attempts. Postgres releases a dead backend's advisory locks
+// asynchronously, so the first attempt after a failover routinely loses to a lock
+// nobody holds any more; see recover().
+//
+// The window is bounded by what a genuine steal costs: a stolen lock is only
+// detected once it closes, and the process shuts down that much later. Seconds are
+// cheap against a process lifetime; minutes would not be.
+const (
+	recoverRetryWindow = 5 * time.Second
+	recoverRetryStep   = 250 * time.Millisecond
+)
+
 // BootLock is a session-scoped advisory lock held for the process lifetime.
 //
 // It pins a DEDICATED connection, and that is not an optimisation. Advisory
@@ -66,10 +80,10 @@ const defaultWatchInterval = 5 * time.Second
 //
 //   - re-acquired -> the common case (a single instance survived a Postgres
 //     restart); keep serving, now on the new session.
-//   - held by someone else -> another instance booted during our outage and took
-//     the lock; we can no longer guarantee we are the sole writer, so we SIGNAL
-//     LOSS on Lost() and stop. The server must treat a closed Lost() channel as
-//     fatal and shut down.
+//   - still held once the retry window closes -> another instance booted during our
+//     outage and took the lock; we can no longer guarantee we are the sole writer,
+//     so we SIGNAL LOSS on Lost() and stop. The server must treat a closed Lost()
+//     channel as fatal and shut down.
 //   - database unreachable -> nobody else can hold the lock while the server is
 //     down either, so keep the belief and retry on the next tick.
 type BootLock struct {
@@ -218,7 +232,7 @@ const (
 	checkHeld      checkResult = iota // the pinned session answered; we still hold the lock
 	checkRecovered                    // the session died but we re-took the lock on a fresh one
 	checkRetry                        // could not verify (database unreachable); try again next tick
-	checkLost                         // the session died and someone else now holds the lock
+	checkLost                         // the session died and the lock was still held when the retry window closed
 )
 
 // check verifies the lock is still ours. When the pinned session is alive it is a
@@ -247,8 +261,21 @@ func (l *BootLock) check(ctx context.Context) checkResult {
 }
 
 // recover runs after the pinned session has failed a ping. It tears the dead
-// session down (which releases any lock it might still hold) and tries to re-take
-// the lock on a fresh connection.
+// session down and tries to re-take the lock on a fresh connection.
+//
+// The re-take is RETRIED on a bounded window, and that is the difference between
+// surviving a failover and shutting down in the middle of one. PostgreSQL releases
+// a terminated backend's advisory locks ASYNCHRONOUSLY: the backend must finish
+// dying before its locks come free, so for a short interval after a restart, a
+// failover or a pg_terminate_backend the lock is still recorded against a session
+// that no longer exists. A single pg_try_advisory_lock inside that interval returns
+// false, and a false read as "held by someone else" makes a healthy SOLE instance
+// close Lost() and shut itself down on a routine Postgres restart -- the loudest
+// possible response to the one event the watcher exists to survive.
+//
+// So a held lock is only a verdict once the window closes. Until then it is
+// indistinguishable from our own corpse still draining, and the safe reading of an
+// ambiguous answer is to ask again.
 func (l *BootLock) recover(ctx context.Context) checkResult {
 	l.mu.Lock()
 	old := l.conn
@@ -258,15 +285,63 @@ func (l *BootLock) recover(ctx context.Context) checkResult {
 	if old != nil {
 		// Destroy the broken connection rather than return it to the pool, so its
 		// (possibly still-lingering) server-side session is torn down and cannot keep
-		// holding the lock against our own re-acquire attempt below.
+		// holding the lock against our own re-acquire attempts below.
 		old.Release()
 	}
 
+	deadline := time.Now().Add(recoverRetryWindow)
+
+	for attempt := 1; ; attempt++ {
+		switch res := l.tryTakeLock(ctx); res {
+		case checkRecovered:
+			l.log.Warn("boot lock: the database session was lost; the lock was re-acquired on a new connection",
+				"attempts", attempt)
+
+			return checkRecovered
+		case checkRetry:
+			// The database is unreachable -- e.g. Postgres is still restarting. Nobody
+			// else can hold the lock while the server is down, so keep believing we hold
+			// it and try again on the next tick.
+			return checkRetry
+		case checkHeld, checkLost:
+			// Held right now: either the dead session's lock has not been released yet,
+			// or another instance really took it. Only the window can tell them apart.
+		}
+
+		if !time.Now().Before(deadline) {
+			return checkLost
+		}
+
+		if attempt == 1 {
+			// Once, not per attempt: the retry window is the common path of a failover
+			// and its outcome is logged either way, so a line per attempt would bury the
+			// line that matters.
+			l.log.Warn("boot lock: the lock is still held just after the session died; retrying",
+				"retry_window", recoverRetryWindow, "retry_step", recoverRetryStep)
+		}
+
+		timer := time.NewTimer(recoverRetryStep)
+
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+
+			return checkRetry
+		case <-l.stop:
+			timer.Stop()
+
+			return checkRetry
+		case <-timer.C:
+		}
+	}
+}
+
+// tryTakeLock takes a fresh connection and attempts the lock on it, pinning it as
+// the session on success. checkLost here means only "held at this instant" -- see
+// recover, which owns the verdict.
+func (l *BootLock) tryTakeLock(ctx context.Context) checkResult {
 	conn, err := l.pool.Acquire(ctx)
 	if err != nil {
-		// The database is unreachable -- e.g. Postgres is still restarting. Nobody
-		// else can hold the lock while the server is down, so keep believing we hold
-		// it and try again on the next tick.
 		l.log.Warn("boot lock: database unreachable while verifying the lock; will retry", "error", err)
 
 		return checkRetry
@@ -285,8 +360,6 @@ func (l *BootLock) recover(ctx context.Context) checkResult {
 	}
 
 	if !ok {
-		// The lock is held -- and since our old session is gone, it is held by
-		// SOMEONE ELSE. We are no longer the sole writer.
 		conn.Release()
 
 		return checkLost
@@ -295,8 +368,6 @@ func (l *BootLock) recover(ctx context.Context) checkResult {
 	l.mu.Lock()
 	l.conn = conn
 	l.mu.Unlock()
-
-	l.log.Warn("boot lock: the database session was lost; the lock was re-acquired on a new connection")
 
 	return checkRecovered
 }

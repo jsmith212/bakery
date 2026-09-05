@@ -1125,7 +1125,14 @@ func TestBootLockReacquiresAfterSessionDeath(t *testing.T) {
 
 	// The lock must reappear, held by a DIFFERENT backend -- our watcher's fresh
 	// session, not the dead one.
-	waitUntil(t, 5*time.Second, func() bool {
+	//
+	// Generously bounded, and deliberately: Postgres releases the terminated
+	// backend's advisory lock asynchronously, so the watcher's first re-acquire
+	// attempts legitimately find the lock still held by the corpse and it retries
+	// across recoverRetryWindow. A deadline near that window makes this test a race
+	// against how fast the machine reaps a backend -- which is exactly how it flaked
+	// under -race in CI.
+	waitUntil(t, 30*time.Second, func() bool {
 		pid, ok := bootLockHolderPID(t, pool)
 
 		return ok && pid != oldPID
@@ -1215,8 +1222,11 @@ func TestBootLockSignalsLossWhenStolen(t *testing.T) {
 		t.Fatal("no backend holds the boot lock")
 	}
 
-	// Kill our session. The queued competitor is granted the lock, and our watcher's
-	// next non-blocking re-acquire therefore finds it held by someone else.
+	// Kill our session. The queued competitor is granted the lock, so every one of
+	// the watcher's non-blocking re-acquires -- the first and every retry across
+	// recoverRetryWindow -- finds it held by someone else. Loss is therefore signalled
+	// one window later than the steal, not instantly; the allowance below covers the
+	// watch interval plus that window with room to spare.
 	terminateBackend(t, pool, holderPID)
 
 	select {

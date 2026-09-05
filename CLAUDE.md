@@ -125,7 +125,7 @@ The auth model, the full `/api/v1` route table, and what M1/M1.5 did *not* build
 
 **`/readyz` really pings the pool; `/healthz` does not.** A readyz that returns 200 with a dead database keeps the node in rotation while every request behind it 500s, which is worse than having no readyz. Conflating the two in the other direction makes an orchestrator restart a healthy binary because Postgres blinked.
 
-**Boot takes `pg_try_advisory_lock` and refuses a second instance** unless `--allow-multi-instance`. That refusal is what makes the in-process LRU and route cache sound. It is taken **before** the migrations, so two instances starting together cannot race through the same migration.
+**Boot takes `pg_try_advisory_lock` and refuses a second instance** unless `--allow-multi-instance`. That refusal is what makes the in-process LRU and route cache sound. It is taken **before** the migrations, so two instances starting together cannot race through the same migration. **The watcher's post-failover re-acquire RETRIES on a bounded window before declaring the lock lost** — Postgres releases a terminated backend's advisory locks *asynchronously*, so a `pg_try_advisory_lock` issued in the seconds after a restart routinely returns false for a lock nobody holds any more, and reading that single false as "held elsewhere" makes a healthy sole instance close `Lost()` and shut itself down on a routine failover.
 
 **`DEV_LOGIN_ENABLED` is settable only via env var / CLI flag.** No UI or API path may enable it. Defaults off. When off, the endpoint is not registered at all and **404s** — a 403 confirms the endpoint exists and tells a scanner what to come back for.
 
