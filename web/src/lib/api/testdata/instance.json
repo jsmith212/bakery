@@ -13,6 +13,7 @@
   "allow_multi_instance": false,
   "gc_enabled": true,
   "gc_interval": "6h0m0s",
-  "gc_usage_interval": "6h0m0s",
+  "gc_usage_interval": "1h0m0s",
+  "usage_freshness": "1m0s",
   "gc_grace_period": "24h0m0s"
 }

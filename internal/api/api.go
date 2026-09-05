@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jsmith212/bakery/internal/auth"
 	"github.com/jsmith212/bakery/internal/gc"
@@ -58,6 +59,13 @@ type Config struct {
 	// index.
 	GC  *gc.Engine
 	Log *slog.Logger
+
+	// UsageFreshness is --usage-freshness: how stale a project's newest
+	// cache_backend_usage measurement may be before GET .../{project}/usage
+	// re-measures synchronously before answering. Zero disables read-triggered
+	// measurement entirely and leaves the figures to the periodic backstop, which is
+	// the behaviour every release before this one had.
+	UsageFreshness time.Duration
 
 	// AllowSelfServeOrgs lets ANY signed-in human create an organization (and become
 	// its local owner). Off restricts creation to site admins.
@@ -124,6 +132,15 @@ type API struct {
 	// wires a real engine.
 	gc  gcTrigger
 	log *slog.Logger
+
+	// measurer is the NARROWED usageMeasurer, nil-tolerant for the same reason gc is:
+	// an embedder or a test with no engine serves whatever is on file. Assigned via
+	// the same typed-nil dance New performs for gc.
+	measurer usageMeasurer
+
+	// usageFreshness: see Config.UsageFreshness. Read only by handleGetProjectUsage,
+	// never written after New.
+	usageFreshness time.Duration
 
 	// allowSelfServeOrgs: see Config.AllowSelfServeOrgs. Read only by
 	// handleCreateOrg, and never written after New.
@@ -195,8 +212,12 @@ func New(cfg Config) (*API, error) {
 	// nil pointer (Go's classic typed-nil trap), and a.gc == nil in the handler
 	// would then never be true. This is the one place that distinction is made.
 	var gcT gcTrigger
+
+	var measurer usageMeasurer
+
 	if cfg.GC != nil {
 		gcT = cfg.GC
+		measurer = cfg.GC
 	}
 
 	return &API{
@@ -204,6 +225,8 @@ func New(cfg Config) (*API, error) {
 		auth:                 cfg.Auth,
 		keys:                 serviceKeyMinter{svc: cfg.Auth},
 		gc:                   gcT,
+		measurer:             measurer,
+		usageFreshness:       cfg.UsageFreshness,
 		log:                  log,
 		allowSelfServeOrgs:   cfg.AllowSelfServeOrgs,
 		allowLocalSiteAdmins: cfg.AllowLocalSiteAdmins,
@@ -457,6 +480,14 @@ func (a *API) mount(mux *http.ServeMux) {
 	a.route(mux, AccessOrgView, "GET "+p+"/orgs/{org}/usage", a.handleGetOrgUsage)
 	a.route(mux, AccessProjectRead, "GET "+p+"/orgs/{org}/projects/{project}/usage",
 		a.handleGetProjectUsage)
+
+	// The EXPLICIT refresh. ProjectRead, the same floor as the GET it refreshes: it
+	// writes only cache_backend_usage, a derived figure about data the caller can
+	// already see, and putting it behind ProjectAdmin would leave a reader staring at
+	// a number they cannot make correct. Rate-limited server-side (minMeasureInterval)
+	// and always 200 -- "too soon" is not a condition a dashboard can act on.
+	a.route(mux, AccessProjectRead, "POST "+p+"/orgs/{org}/projects/{project}/usage/measure",
+		a.handleMeasureProjectUsage)
 
 	// ---- object browser (B3). ProjectRead, the same floor as the backend detail
 	// route it extends. {kind} is a LITERAL-adjacent path segment, not a second

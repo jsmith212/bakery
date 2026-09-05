@@ -659,6 +659,8 @@ export interface InstanceInfo {
 	gc_enabled: boolean;
 	gc_interval: string;
 	gc_usage_interval: string;
+	/** `--usage-freshness`. "0s" means reads never re-measure. */
+	usage_freshness: string;
 	gc_grace_period: string;
 }
 

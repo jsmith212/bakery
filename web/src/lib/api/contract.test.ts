@@ -529,6 +529,7 @@ describe('response fixtures', () => {
 			'oidc_issuer',
 			'public_addr',
 			'storage_driver',
+			'usage_freshness',
 			'version'
 		]);
 	});

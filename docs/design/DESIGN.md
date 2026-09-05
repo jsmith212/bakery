@@ -685,6 +685,55 @@ still has no production call site, so a marked backend keeps resolving for at mo
 
 ---
 
+### Responsive usage figures as landed (2026-09-04)
+
+Every objects/size figure in the console comes from `cache_backend_usage`, whose only
+writer was `gc.Engine.MeasureUsage` on `--gc-usage-interval` — default **six hours**.
+To anyone using the product the numbers never moved: create a backend, push a
+gigabyte, and the dashboard says "not yet measured" for the rest of the working day.
+
+**The rejected design is the interesting half.** A live counter — a trigger on
+`cache_objects` maintaining a per-backend total — is exact and instant, and would put
+a row-lock convoy on the single hottest write path in the product: every sstate PUT,
+every CAS upload and every `/ac` overwrite serialising behind one row per backend
+under a `BB_NUMBER_THREADS`-parallel storm. It is precisely the pattern the
+`accessed_at` toucher exists to avoid, and adopting it for a *dashboard figure* trades
+throughput for a number nobody reads at write time.
+
+**Measure on read instead, when the answer on file is stale.**
+`Engine.MeasureProject` runs `MeasureProjectUsage` — one grouped aggregate per
+backend, no keyset pages, no inter-chunk pause and **no `gc_runs` row**, because a
+measurement decides nothing and so needs no write barrier (borrowing the sweep's
+`ScanObjectsForGC` would have minted a run row per dashboard load). A per-project
+**singleflight** collapses the fan-out of one browser's parallel loads and several
+people opening the same dashboard. `hashserv` is excluded, matching `stagesFor`
+exactly, so "structurally never measured" stays true.
+
+`GET .../projects/{project}/usage` re-measures before answering when the project's
+**newest** `measured_at` is older than `--usage-freshness` (new knob, default 60s; 0
+restores the old behaviour exactly). Three guards deep: the window, the singleflight,
+and a hard 10s ceiling past which the **stale row is served unchanged** — not a
+fallback but the contract, since `measured_at` rides on every figure. A failed
+measurement never fails the read. `POST .../usage/measure` is the explicit Refresh:
+ProjectRead, rate-limited server-side to one measurement per project per 10s, and
+**always 200** — "you asked too soon" is not a condition a dashboard can act on.
+`--gc-usage-interval` drops 6h → **1h** as the backstop.
+
+**Org usage stays on the backstop, deliberately.** `GET /orgs/{org}/usage` is one
+request that would fan out into one aggregate per project — over every `cache_objects`
+row the org owns, on a page load, unbounded in the number of projects. The org grid
+keeps its (now hourly) periodic figures and states their age; the moment a human opens
+a project the per-project rule takes over.
+
+**Console:** a shared `RefreshUsage` (caption + ghost Refresh) on the overview, the
+backends index and the backend detail page, and `measured_at` now renders relatively
+("measured 3 min ago", `formatRelative`) with the absolute UTC in a `title` — what a
+reader wants from a usage figure is how much to trust it, and an ISO timestamp makes
+them do the subtraction. `--usage-freshness` joins the three GC knobs on
+`GET /instance`.
+
+---
+
 ---
 
 ## The three riskiest parts

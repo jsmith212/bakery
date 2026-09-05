@@ -10,7 +10,7 @@
 	import { Badge } from '$lib/components/badges';
 	import { EmptyState } from '$lib/components/feedback';
 	import { KeyValueList } from '$lib/components/content';
-	import { StatTile } from '$lib/components/data';
+	import { RefreshUsage, StatTile } from '$lib/components/data';
 	import { TableWrap, TableRoot, Tr, Th, Td } from '$lib/components/table';
 
 	import type { PageProps } from './$types';
@@ -25,6 +25,19 @@
 	const usageByKind = $derived(new Map<BackendKind, ProjectBackendUsage>(usage.map((u) => [u.kind, u])));
 
 	const anyMeasured = $derived(usage.some((u) => u.measured_at !== null));
+
+	// The NEWEST measurement across the rows on screen, which is what the caption is
+	// about: "how fresh is what I am looking at". The org rollup uses the OLDEST for
+	// its own SUM (a total is only as fresh as its stalest part) -- a different
+	// question, deliberately answered differently.
+	const newestMeasured = $derived(
+		usage.reduce<string | null>(
+			(newest, u) =>
+				u.measured_at && (newest === null || u.measured_at > newest) ? u.measured_at : newest,
+			null
+		)
+	);
+
 	const totalObjects = $derived(
 		anyMeasured ? usage.reduce((sum, u) => sum + (u.objects_count ?? 0), 0) : null
 	);
@@ -77,12 +90,15 @@
 		<h1 class="mb-0.5 text-lg font-semibold text-text-1">Overview</h1>
 		<div class="text-sm text-text-2">{project.org_slug}/{project.slug}</div>
 	</div>
-	<Button
-		variant="primary"
-		size="md"
-		onclick={() => goto(`${projectPath(org.slug, project.slug)}/snippets`)}
-		>Get config snippet</Button
-	>
+	<div class="flex items-center gap-3">
+		<RefreshUsage org={org.slug} project={project.slug} measuredAt={newestMeasured} />
+		<Button
+			variant="primary"
+			size="md"
+			onclick={() => goto(`${projectPath(org.slug, project.slug)}/snippets`)}
+			>Get config snippet</Button
+		>
+	</div>
 </div>
 
 <div class="grid grid-cols-4 gap-2">

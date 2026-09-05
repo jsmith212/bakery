@@ -4,3 +4,4 @@ export { default as Sparkline } from './Sparkline.svelte';
 export { default as TimeSeriesChart } from './TimeSeriesChart.svelte';
 export type { ChartSeries } from './TimeSeriesChart.svelte';
 export { default as Provenance } from './Provenance.svelte';
+export { default as RefreshUsage } from './RefreshUsage.svelte';

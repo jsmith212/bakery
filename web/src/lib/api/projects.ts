@@ -75,6 +75,27 @@ export function deleteProject(
 	return del<Project | undefined>(`/orgs/${seg(org)}/projects/${seg(project)}`, opts);
 }
 
+/**
+ * Measures this project's usage NOW and returns the fresh rows.
+ *
+ * Project READ, the same floor as the GET it refreshes: it writes only a derived
+ * figure about data the caller can already see. Rate-limited server-side to one
+ * measurement per project per 10s and always answers 200 -- "you asked too soon" is
+ * not a condition a dashboard can act on, and `measured_at` on every row already
+ * says exactly how fresh the answer is.
+ */
+export function measureProjectUsage(
+	org: string,
+	project: string,
+	opts?: RequestOptions
+): Promise<ListResponse<ProjectBackendUsage>> {
+	return post<ListResponse<ProjectBackendUsage>>(
+		`/orgs/${seg(org)}/projects/${seg(project)}/usage/measure`,
+		undefined,
+		opts
+	);
+}
+
 /** B2b. Per-backend, unaggregated; counts are NULLABLE when nothing has measured. */
 export function getProjectUsage(
 	org: string,

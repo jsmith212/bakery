@@ -23,6 +23,7 @@
 		formatCount,
 		formatDateTimeUTC,
 		formatQuota,
+		formatRelative,
 		formatRetentionWindow,
 		parseHumanBytes
 	} from '$lib/format';
@@ -34,7 +35,7 @@
 	import { KeyValueList } from '$lib/components/content';
 	import { Field, Input, Toggle, Checkbox } from '$lib/components/inputs';
 	import { Tabs } from '$lib/components/navigation';
-	import { StatTile } from '$lib/components/data';
+	import { RefreshUsage, StatTile } from '$lib/components/data';
 	import { TableWrap, TableRoot, Tr, Th, Td } from '$lib/components/table';
 
 	import type { PageProps } from './$types';
@@ -46,6 +47,11 @@
 	const kind = $derived(data.kind);
 	const backend = $derived(data.backend);
 	const usageRow = $derived(data.usage.find((u) => u.kind === kind) ?? null);
+
+	// This backend's OWN measurement, not the project's newest: the figures on this
+	// page are one kind's, so a caption naming another backend's refresh would be
+	// wrong about the very numbers it sits beside.
+	const measuredAt = $derived(usageRow?.measured_at ?? null);
 
 	const status = $derived(
 		backendStatus({
@@ -99,7 +105,9 @@
 	};
 
 	const configPairs = $derived.by(() => {
-		const pairs = [
+		// Annotated, not inferred: the literal's own union type has no `title`, so the
+		// relative "Measured" row below would not typecheck against it.
+		const pairs: { key: string; value: string; mono?: boolean; title?: string }[] = [
 			...backendEndpoints(kind, org.slug, project.slug).map((e) => ({
 				key: e.label,
 				value: e.value,
@@ -119,9 +127,13 @@
 		// stages), so there is nothing here to time-stamp -- everything else
 		// has an honest "not yet measured" until the first usage pass.
 		if (kind !== 'hashserv') {
+			// RELATIVE, with the absolute UTC instant behind it. What a reader wants from a
+			// usage figure is how much to trust it, and an ISO timestamp makes them do the
+			// subtraction. formatDateTimeUTC is still the value under the cursor.
 			pairs.push({
 				key: 'Measured',
-				value: usageRow?.measured_at ? formatDateTimeUTC(usageRow.measured_at) : 'not yet measured'
+				value: usageRow?.measured_at ? formatRelative(usageRow.measured_at) : 'not yet measured',
+				title: usageRow?.measured_at ? formatDateTimeUTC(usageRow.measured_at) : undefined
 			});
 		}
 
@@ -394,13 +406,18 @@
 			<span class="text-xs text-text-3">{status.caption}</span>
 		{/if}
 	</div>
-	{#if !deleting}
-		<div class="flex items-center gap-2">
+	<div class="flex items-center gap-3">
+		{#if kind !== 'hashserv'}
+			<!-- hashserv structurally never gets a usage row (the GC planner gives it no
+			     stages), so there is nothing here to refresh and no measurement to date. -->
+			<RefreshUsage org={org.slug} project={project.slug} {measuredAt} />
+		{/if}
+		{#if !deleting}
 			<Button href="/o/{org.slug}/p/{project.slug}/snippets?tool={snippetTool}" variant="secondary" size="md"
 				>Get config snippet</Button
 			>
-		</div>
-	{/if}
+		{/if}
+	</div>
 </div>
 
 <div class="grid grid-cols-4 gap-2">

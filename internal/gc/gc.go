@@ -48,6 +48,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/jsmith212/bakery/internal/blob"
 	"github.com/jsmith212/bakery/internal/db/repository"
@@ -213,6 +214,14 @@ type Queries interface {
 	ListPendingDeleteBlobs(ctx context.Context, limit int32) ([]repository.ListPendingDeleteBlobsRow, error)
 
 	UpsertBackendUsage(ctx context.Context, arg repository.UpsertBackendUsageParams) error
+
+	// MeasureProjectUsage is the READ-TRIGGERED refresh's one statement (measure.go).
+	// It is deliberately not the sweep's ScanObjectsForGC: a measurement decides
+	// nothing, so it needs neither the keyset pages nor the gc_runs row a frozen
+	// snapshot would cost.
+	MeasureProjectUsage(
+		ctx context.Context, projectID pgtype.UUID,
+	) ([]repository.MeasureProjectUsageRow, error)
 	InstancePhysicalBytes(ctx context.Context) (int64, error)
 
 	// RecordGCRunBackend is the SPA->API wiring wave's B7 write (000013): one row
@@ -382,6 +391,13 @@ type Engine struct {
 	// declines to scan would silently disappear from the scrape.
 	lastUsage map[int64]snapshot
 
+	// measureFlight collapses concurrent read-triggered measurements of the SAME
+	// project (measure.go). One person opening a project's overview fires several
+	// parallel loads and several people open the same dashboard at once; without this
+	// each one sees the same "stale" answer from the freshness gate and issues the
+	// same aggregate.
+	measureFlight singleflight.Group
+
 	// rampUntil is gc_state.touch_ramp_until as unix nanos, read ONCE at boot
 	// (LoadTouchRamp) and read on every toucher tick by TouchStaleness. Zero means
 	// "not read yet", which resolves to the RAMPED (conservative, fewer writes)
@@ -457,7 +473,10 @@ func New(ctx context.Context, deps Deps, cfg Config) (*Engine, error) {
 		measuredMu: sync.Mutex{},
 		measured:   map[int64]time.Time{},
 		lastUsage:  map[int64]snapshot{},
-		rampUntil:  atomic.Int64{},
+
+		measureFlight: singleflight.Group{},
+
+		rampUntil: atomic.Int64{},
 	}
 
 	return e, nil

@@ -14,6 +14,7 @@
 	import { Button } from '$lib/components/buttons';
 	import { Badge } from '$lib/components/badges';
 	import { EmptyState } from '$lib/components/feedback';
+	import { RefreshUsage } from '$lib/components/data';
 	import { TableWrap, TableRoot, Tr, Th, Td } from '$lib/components/table';
 
 	import type { PageProps } from './$types';
@@ -24,6 +25,19 @@
 	const project = $derived(data.project);
 	const backends = $derived(data.backends);
 	const usage = $derived(data.usage);
+
+	// The NEWEST measurement across the rows on screen, which is what the caption is
+	// about: "how fresh is what I am looking at". The org rollup uses the OLDEST for
+	// its own SUM (a total is only as fresh as its stalest part) -- a different
+	// question, deliberately answered differently.
+	const newestMeasured = $derived(
+		usage.reduce<string | null>(
+			(newest, u) =>
+				u.measured_at && (newest === null || u.measured_at > newest) ? u.measured_at : newest,
+			null
+		)
+	);
+
 
 	const base = $derived(projectPath(org.slug, project.slug));
 	const newHref = $derived(`${base}/backends/new`);
@@ -71,6 +85,8 @@
 		<div class="text-sm text-text-2">{project.org_slug}/{project.slug}</div>
 	</div>
 	{#if backends.length > 0}
+		<div class="flex items-center gap-3">
+			<RefreshUsage org={org.slug} project={project.slug} measuredAt={newestMeasured} />
 		<div class="flex flex-col items-end gap-1">
 			<Button href={newHref} variant="primary" size="md" disabled={allConfigured}>
 				Add backend
@@ -78,6 +94,7 @@
 			{#if allConfigured}
 				<span class="text-xs text-text-3">All {BACKEND_KINDS.length} kinds configured</span>
 			{/if}
+		</div>
 		</div>
 	{/if}
 </div>

@@ -687,7 +687,30 @@ type GCFlags struct {
 	// has turned retention off still needs storage and quota numbers, and a dashboard
 	// that goes stale exactly when someone reaches for the brake is a dashboard that
 	// lies during the incident it exists for.
-	GCUsageInterval time.Duration `default:"6h" env:"GC_USAGE_INTERVAL" help:"How often backend usage is measured, even with retention disabled." name:"gc-usage-interval"`
+	//
+	// ONE HOUR, DOWN FROM SIX. This is now the BACKSTOP rather than the only writer:
+	// a project somebody is actually looking at is measured on read (--usage-freshness
+	// below), so what is left for this pass is the Prometheus gauges and the projects
+	// nobody has open. Six hours was chosen when this was the sole writer and the
+	// figures visibly never moved; one hour is what a gauge an operator alerts on
+	// deserves, and the pass is a bounded scan of each backend rather than a sweep.
+	GCUsageInterval time.Duration `default:"1h" env:"GC_USAGE_INTERVAL" help:"Backstop interval for measuring backend usage, even with retention disabled. Projects being viewed are also measured on read (see --usage-freshness)." name:"gc-usage-interval"`
+
+	// READ-TRIGGERED MEASUREMENT (the responsive-usage change). How stale a project's
+	// newest measurement may be before GET .../{project}/usage measures it
+	// synchronously before answering.
+	//
+	// It sits in GCFlags because the measurement is the GC engine's, but it is not a
+	// sweep knob: it costs one grouped aggregate per backend of ONE project, taken at
+	// most once per project per window and collapsed across concurrent readers by a
+	// singleflight, with a hard 10s ceiling past which the stale row is served
+	// unchanged. Zero DISABLES it, restoring the pre-change behaviour exactly: every
+	// figure comes from the backstop above.
+	//
+	// Sixty seconds, not zero-and-always: a dashboard refreshed in a tight loop must
+	// not turn into a count over every cache_objects row of a ten-million-object
+	// backend per request.
+	UsageFreshness time.Duration `default:"60s" env:"USAGE_FRESHNESS" help:"How stale a project's usage figures may be before a read re-measures them. 0 disables read-triggered measurement." name:"usage-freshness"`
 
 	// THE RECOVERY WINDOW. It is frozen per run at start (gc_runs.grace_period), so
 	// raising it takes effect on the NEXT run -- it cannot rescue bytes a run in

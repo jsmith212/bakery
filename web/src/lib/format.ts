@@ -208,6 +208,45 @@ export function formatApproxAccessed(
 	return `~${pluralize(days, 'day')} ago`;
 }
 
+/**
+ * A measurement's age, as prose: "just now", "3 min ago", "2 hours ago".
+ *
+ * SEPARATE FROM `formatApproxAccessed`, which is the same shape and a different
+ * claim. `accessed_at` is deliberately approximate -- the toucher coalesces reads
+ * and flushes them at most once per `--gc-touch-staleness` -- so its output carries
+ * a `~` that says so. A `measured_at` is an exact instant a measurement happened,
+ * and prefixing it with `~` would apologise for a precision it actually has.
+ *
+ * Terser units too ("3 min", not "3 minutes"): this renders in a caption beside a
+ * Refresh button, where the interesting granularity is the first few minutes.
+ *
+ * `now` is a parameter rather than an internal `Date.now()` read, so this is
+ * deterministic under Vitest -- the convention every other function here follows.
+ */
+export function formatRelative(iso: string | null | undefined, now: number = Date.now()): string {
+	if (!iso) return 'never';
+
+	const then = new Date(iso).getTime();
+	if (Number.isNaN(then)) return 'never';
+
+	// Clamped at zero: a measurement stamped by the database a moment in the future
+	// (clock skew between the server and the browser is ordinary) must read as "just
+	// now", never as a negative age.
+	const seconds = Math.max(0, Math.round((now - then) / 1000));
+
+	if (seconds < 45) return 'just now';
+
+	const minutes = Math.round(seconds / 60);
+	if (minutes < 60) return `${minutes} min ago`;
+
+	const hours = Math.round(minutes / 60);
+	if (hours < 24) return `${pluralize(hours, 'hour')} ago`;
+
+	const days = Math.round(hours / 24);
+
+	return `${pluralize(days, 'day')} ago`;
+}
+
 export type ExpiryKind = 'none' | 'soon' | 'expired';
 
 export interface ExpiryInfo {

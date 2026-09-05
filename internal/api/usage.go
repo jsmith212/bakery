@@ -1,11 +1,16 @@
 package api
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/jsmith212/bakery/internal/db/repository"
+	"github.com/jsmith212/bakery/internal/gc"
 )
 
 // ---------------------------------------------------------------------------
@@ -45,6 +50,15 @@ func newOrgProjectUsage(r repository.GetOrgUsageByProjectRow) OrgProjectUsage {
 
 // handleGetOrgUsage is B2a. OrgView -- the same floor as GET /orgs/{org}/projects,
 // which this is meant to sit beside on the org projects screen.
+//
+// IT DOES NOT RE-MEASURE, deliberately. The freshness rule below is per PROJECT, and
+// an org's projects screen is one request that would fan out into one measurement per
+// project -- an aggregate over every cache_objects row the org owns, on a page load,
+// unbounded in the number of projects. That is the wrong trade at exactly the scale
+// where it starts to matter. The org grid stays on the periodic backstop (now one
+// hour rather than six), and the moment a human opens a project the per-project rule
+// takes over. Every figure here carries measured_at, so the staleness is stated
+// rather than hidden.
 func (a *API) handleGetOrgUsage(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	s := scopeFrom(ctx)
@@ -96,7 +110,48 @@ func newProjectBackendUsage(r repository.GetProjectBackendUsageRow) ProjectBacke
 	}
 }
 
-// handleGetProjectUsage is B2b. ProjectRead.
+// minMeasureInterval is the server-side rate limit on the EXPLICIT refresh
+// (POST .../usage/measure). It is deliberately tighter than --usage-freshness, whose
+// job is different: freshness decides whether an ordinary page load is worth a
+// measurement, while this decides how hard a human leaning on a Refresh button can
+// push. Ten seconds is short enough that a second click after reading the result
+// re-measures, and long enough that a held-down button is one query.
+//
+// Refusing is NOT an error. The endpoint answers 200 with the current row either way,
+// because "you asked too soon" is not information a dashboard can act on -- and
+// measured_at already tells the caller exactly how fresh the answer they got is.
+const minMeasureInterval = 10 * time.Second
+
+// usageMeasurer is the slice of *gc.Engine this package needs to refresh one
+// project's usage. An interface for the same reason gcTrigger is: the freshness
+// decision is ordinary handler logic and must be testable without an engine, a
+// database or a sweep.
+type usageMeasurer interface {
+	MeasureProject(ctx context.Context, projectID pgtype.UUID) error
+}
+
+// *gc.Engine must keep satisfying usageMeasurer.
+var _ usageMeasurer = (*gc.Engine)(nil)
+
+// handleGetProjectUsage is B2b, now with READ-TRIGGERED MEASUREMENT.
+//
+// WHY A READ MEASURES AT ALL. These figures had exactly one writer -- the periodic
+// pass on --gc-usage-interval, defaulting to six hours -- so to anyone using the
+// console they never moved: create a backend, push a gigabyte, and the dashboard says
+// "not yet measured" for the rest of the working day. The rejected alternative, a
+// trigger-maintained live counter, would put a row-lock convoy on the hottest write
+// path in the product for the sake of a dashboard figure (see internal/gc/measure.go).
+//
+// SO THE STALENESS RULE IS THE WHOLE FEATURE, and it is three guards deep: nothing
+// happens unless --usage-freshness is non-zero AND the newest measurement on file is
+// older than it; the engine collapses concurrent measurements of one project into a
+// single query; and the measurement itself is bounded, past which the STALE row is
+// served unchanged. That last one is not a fallback, it is the contract: measured_at
+// rides on every figure, so an old answer is an honest answer and a hung dashboard
+// is not.
+//
+// Nil-tolerant: an embedder or a test with no engine wired serves what is on file,
+// which is exactly the behaviour this endpoint had before.
 func (a *API) handleGetProjectUsage(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	s := scopeFrom(ctx)
@@ -106,12 +161,110 @@ func (a *API) handleGetProjectUsage(w http.ResponseWriter, r *http.Request) erro
 		return fmt.Errorf("get project usage: %w", err)
 	}
 
+	if a.staleEnough(rows, a.usageFreshness) {
+		rows, err = a.remeasure(ctx, s.ProjectID, rows)
+		if err != nil {
+			return err
+		}
+	}
+
+	writeJSON(w, http.StatusOK, list(newProjectBackendUsageList(rows)))
+
+	return nil
+}
+
+// handleMeasureProjectUsage is the EXPLICIT refresh: POST .../usage/measure.
+//
+// ProjectRead, the same floor as the GET it refreshes -- it writes only
+// cache_backend_usage, which is a derived figure about data the caller can already
+// see, and putting it behind ProjectAdmin would mean a reader staring at a number
+// they cannot make correct.
+//
+// It always answers 200 with the current rows, whether or not it measured. The rate
+// limit is a server-side floor on how often the work happens, not a condition the
+// client has to handle: a 429 here would give a dashboard nothing to do except show
+// the same rows it would have got anyway, with an error attached.
+func (a *API) handleMeasureProjectUsage(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+	s := scopeFrom(ctx)
+
+	rows, err := a.store.GetProjectBackendUsage(ctx, s.ProjectID)
+	if err != nil {
+		return fmt.Errorf("get project usage: %w", err)
+	}
+
+	if a.staleEnough(rows, minMeasureInterval) {
+		rows, err = a.remeasure(ctx, s.ProjectID, rows)
+		if err != nil {
+			return err
+		}
+	}
+
+	writeJSON(w, http.StatusOK, list(newProjectBackendUsageList(rows)))
+
+	return nil
+}
+
+// staleEnough reports whether a measurement is worth making.
+//
+// A NEVER-MEASURED project is stale (that is the case the whole feature exists for:
+// a backend created a moment ago, whose figures a human is looking at right now).
+// Otherwise the NEWEST measurement decides -- not the oldest, which is what the org
+// endpoint's own SUM uses. The two questions differ: an aggregate is only as fresh as
+// its stalest part, but "should I measure this project again" is answered by the last
+// time anything measured it, and using the minimum would re-measure the whole project
+// forever on account of one backend that will never report (there is none today --
+// hashserv is excluded from the measurement AND from this list's join in practice --
+// but the rule should not depend on that).
+//
+// A zero window disables the check entirely, which is what --usage-freshness=0 means.
+func (a *API) staleEnough(rows []repository.GetProjectBackendUsageRow, window time.Duration) bool {
+	if a.measurer == nil || window <= 0 {
+		return false
+	}
+
+	newest := time.Time{}
+
+	for _, row := range rows {
+		if row.MeasuredAt.Valid && row.MeasuredAt.Time.After(newest) {
+			newest = row.MeasuredAt.Time
+		}
+	}
+
+	return newest.IsZero() || time.Since(newest) > window
+}
+
+// remeasure measures and re-reads, and NEVER fails the request because of the
+// measurement.
+//
+// A timeout, a cancelled request or a database hiccup during the refresh leaves the
+// caller with the rows already in hand -- stale, and honestly labelled as such by
+// measured_at. The alternative, 500ing a read because a derived figure could not be
+// recomputed, would take the whole screen down over the freshest of its numbers.
+func (a *API) remeasure(
+	ctx context.Context, projectID pgtype.UUID, current []repository.GetProjectBackendUsageRow,
+) ([]repository.GetProjectBackendUsageRow, error) {
+	if err := a.measurer.MeasureProject(ctx, projectID); err != nil {
+		a.log.WarnContext(ctx, "could not refresh project usage; serving the last measurement",
+			slog.Any("error", err))
+
+		return current, nil
+	}
+
+	rows, err := a.store.GetProjectBackendUsage(ctx, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("re-read project usage: %w", err)
+	}
+
+	return rows, nil
+}
+
+// newProjectBackendUsageList maps a row set for the wire.
+func newProjectBackendUsageList(rows []repository.GetProjectBackendUsageRow) []ProjectBackendUsage {
 	out := make([]ProjectBackendUsage, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, newProjectBackendUsage(row))
 	}
 
-	writeJSON(w, http.StatusOK, list(out))
-
-	return nil
+	return out
 }

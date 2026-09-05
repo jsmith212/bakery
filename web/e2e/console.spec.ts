@@ -143,6 +143,35 @@ test.describe('console: dev-login through config snippets', () => {
 			await addBackend(page, orgSlug, projectSlug, 'hashserv', ['sstate']);
 		});
 
+		// RESPONSIVE USAGE. cache_backend_usage's only writer used to be the periodic
+		// pass on --gc-usage-interval, so a backend created a moment ago read "not yet
+		// measured" until the next sweep -- six hours by default. The overview now
+		// measures on read when the row is stale, and Refresh forces one.
+		//
+		// The assertion is that the figure RENDERS AS A MEASUREMENT: `0` with a
+		// "measured just now" caption, never an em dash. Those are different facts and
+		// the console has always been careful to distinguish them -- this is the change
+		// that makes the first one reachable within a working day.
+		await test.step('the overview measures usage on read and on Refresh', async () => {
+			await consoleNav(page).getByRole('link', { name: 'Overview' }).click();
+			await page.waitForURL(`**/o/${orgSlug}/p/${projectSlug}/overview`);
+
+			await page.getByRole('button', { name: 'Refresh' }).click();
+
+			await expect(page.getByText('measured just now')).toBeVisible();
+			await expect(page.getByText('not yet measured')).toHaveCount(0);
+
+			// And the Objects tile now carries a real zero rather than the "—" that means
+			// "nothing has ever reported". Scoped to the tile: an em dash is a legitimate
+			// value elsewhere on this page (hashserv structurally never gets a usage row),
+			// so a page-wide "no em dash" assertion would be asserting the wrong thing.
+			const objectsTile = page
+				.locator('div.rounded-2')
+				.filter({ has: page.getByText('Objects', { exact: true }) })
+				.first();
+			await expect(objectsTile.locator('span.tabular').first()).toHaveText('0');
+		});
+
 		await test.step('the backends index lists both', async () => {
 			await consoleNav(page).getByRole('link', { name: 'Backends' }).click();
 			await page.waitForURL(`**/o/${orgSlug}/p/${projectSlug}/backends`);

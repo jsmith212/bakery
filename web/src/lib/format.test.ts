@@ -8,9 +8,47 @@ import {
 	formatDuration,
 	formatExpiry,
 	formatQuota,
+	formatRelative,
 	formatRetentionWindow,
 	parseHumanBytes
 } from './format';
+
+describe('formatRelative', () => {
+	// A fixed "now" so the ladder is deterministic. Every case is an OFFSET from it,
+	// which is the only way a relative formatter can be table-driven at all.
+	const now = Date.UTC(2026, 8, 4, 12, 0, 0);
+	const ago = (ms: number) => new Date(now - ms).toISOString();
+
+	const cases: [string | null | undefined, string][] = [
+		[null, 'never'],
+		[undefined, 'never'],
+		['not a date', 'never'],
+		[ago(0), 'just now'],
+		[ago(30_000), 'just now'],
+		[ago(3 * 60_000), '3 min ago'],
+		[ago(59 * 60_000), '59 min ago'],
+		[ago(2 * 3_600_000), '2 hours ago'],
+		[ago(3_600_000), '1 hour ago'],
+		[ago(3 * 86_400_000), '3 days ago'],
+		// Clock skew: a measurement stamped by the database slightly in the future must
+		// read as "just now", never as a negative age.
+		[new Date(now + 5_000).toISOString(), 'just now']
+	];
+
+	for (const [input, expected] of cases) {
+		it(`formats ${String(input)} as ${expected}`, () => {
+			expect(formatRelative(input, now)).toBe(expected);
+		});
+	}
+
+	// It is NOT formatApproxAccessed. That one prefixes `~` because accessed_at is
+	// genuinely approximate (the toucher coalesces reads); a measured_at is an exact
+	// instant and must not apologise for a precision it has.
+	it('carries no approximation marker, unlike formatApproxAccessed', () => {
+		expect(formatRelative(ago(3 * 60_000), now)).not.toContain('~');
+		expect(formatApproxAccessed(ago(3 * 60_000), now)).toContain('~');
+	});
+});
 
 describe('formatBytes', () => {
 	const cases: [number | null | undefined, string][] = [

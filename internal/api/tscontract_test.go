@@ -482,7 +482,8 @@ func TestWireTypesMatchTSFixtures(t *testing.T) {
 			OIDCIssuer: "https://id.acme.dev/realms/main", DevLoginEnabled: false,
 			GRPCExternalEndpoint: "grpcs://bakery.corp:9092",
 			AllowSelfServeOrgs:   true, AllowLocalSiteAdmins: true, AllowMultiInstance: false,
-			GCEnabled: true, GCInterval: "6h0m0s", GCUsageInterval: "6h0m0s", GCGracePeriod: "24h0m0s",
+			GCEnabled: true, GCInterval: "6h0m0s", GCUsageInterval: "1h0m0s", GCGracePeriod: "24h0m0s",
+			UsageFreshness: "1m0s",
 		}
 
 		assertSameKeySet(t, "InstanceInfo", marshaledKeySet(t, info), objectKeySet(t, readTestdata(t, "instance.json")))

@@ -45,6 +45,15 @@ type InstanceInfo struct {
 	GCInterval      string `json:"gc_interval"`
 	GCUsageInterval string `json:"gc_usage_interval"`
 	GCGracePeriod   string `json:"gc_grace_period"`
+
+	// UsageFreshness is --usage-freshness: how stale a project's usage figures may be
+	// before a read re-measures them. "0s" means read-triggered measurement is off and
+	// every figure comes from gc_usage_interval's backstop.
+	//
+	// It belongs here for the same reason its three siblings do: this echo is what an
+	// operator reads to answer "why do these numbers look like that", and the answer
+	// to "why is my dashboard stale" is one of these two knobs.
+	UsageFreshness string `json:"usage_freshness"`
 }
 
 // handleGetInstance is B6. SiteAdmin.

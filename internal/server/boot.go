@@ -294,6 +294,11 @@ func Boot(ctx context.Context, p BootParams) error {
 		AllowLocalSiteAdmins: cmd.AllowLocalSiteAdmins,
 		Instance:             instanceInfo(cmd, p.Version),
 
+		// The read-triggered usage measurement's staleness window. The engine itself
+		// arrives as Config.GC above -- api.New narrows it to BOTH gcTrigger and
+		// usageMeasurer -- so there is nothing else to wire.
+		UsageFreshness: cmd.GC.UsageFreshness,
+
 		// B1: the config-snippet generator's origin inputs. ExternalURL is the SAME
 		// flag the OCI Bearer realm reads (boot's oci wiring below) -- one public
 		// origin, stated once. GRPCAddr is threaded so the generator can take the
@@ -903,6 +908,7 @@ func instanceInfo(cmd config.ServeCmd, version string) api.InstanceInfo {
 		GCEnabled:       cmd.GC.GCEnabled,
 		GCInterval:      cmd.GC.GCInterval.String(),
 		GCUsageInterval: cmd.GC.GCUsageInterval.String(),
+		UsageFreshness:  cmd.GC.UsageFreshness.String(),
 		GCGracePeriod:   cmd.GC.GCGracePeriod.String(),
 	}
 }

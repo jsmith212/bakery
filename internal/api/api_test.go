@@ -123,6 +123,9 @@ func TestRouteTable(t *testing.T) {
 
 		{AccessOrgView, "GET /api/v1/orgs/{org}/usage"},                        // B2a
 		{AccessProjectRead, "GET /api/v1/orgs/{org}/projects/{project}/usage"}, // B2b
+		// The explicit refresh sits at ProjectRead, the same floor as the GET: it
+		// writes only a derived figure about data the caller can already see.
+		{AccessProjectRead, "POST /api/v1/orgs/{org}/projects/{project}/usage/measure"},
 
 		{AccessProjectRead, "GET /api/v1/orgs/{org}/projects/{project}/backends/{kind}/objects"}, // B3
 

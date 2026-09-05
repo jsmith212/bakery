@@ -638,6 +638,43 @@ SELECT count(*)::bigint AS would_delete
 -- 000012 table comment explains; measured_at is what makes staleness detectable
 -- (bakery_gc_usage_measured_timestamp_seconds, spec §9.9).
 --
+-- ONE PROJECT'S USAGE, MEASURED IN ONE STATEMENT (the read-triggered refresh).
+--
+-- It is NOT the sweep's keyset cursor, and the difference is the whole point. The
+-- periodic pass measures as a by-product of a pass it is making anyway: it walks
+-- every row in --gc-batch-size pages, pausing between them, because it is ALSO
+-- deciding what to delete and must not monopolise the table. A measurement decides
+-- nothing, so it needs none of that -- no pages, no pause, and no gc_runs row for a
+-- frozen snapshot, because there is no delete here for a write barrier to protect.
+-- One grouped aggregate per backend, on cache_objects_pkey's leading column.
+--
+-- That also makes it cheap enough to run on a READ. The alternative shape -- borrow
+-- the sweep's scan, which needs a run id -- would mint a gc_runs row per dashboard
+-- load, which is a worse audit trail than none.
+--
+-- hashserv IS EXCLUDED, matching internal/gc's stagesFor exactly: it owns no
+-- cache_objects rows, so a row here would read 0/0 forever and the console's
+-- "not yet measured" would become a live, permanent zero. "hashserv structurally
+-- never gets a cache_backend_usage row" is a fact several screens already rely on.
+--
+-- LEFT JOIN, so a backend with no objects yet still produces a row -- an honest
+-- measured zero, which is a different fact from "never measured" and the only way
+-- the console can stop saying the latter.
+--
+-- name: MeasureProjectUsage :many
+SELECT cb.id AS backend_id, cb.kind, cb.quota_bytes,
+       p.slug AS project_slug, org.slug AS org_slug,
+       count(co.key)::bigint                  AS objects_count,
+       coalesce(sum(co.size_bytes), 0)::bigint AS logical_bytes
+  FROM cache_backends cb
+  JOIN projects p        ON p.id = cb.project_id
+  JOIN organizations org ON org.id = p.org_id
+  LEFT JOIN cache_objects co ON co.backend_id = cb.id
+ WHERE cb.project_id = sqlc.arg(project_id)
+   AND cb.kind <> 'hashserv'
+ GROUP BY cb.id, p.slug, org.slug
+ ORDER BY cb.id;
+
 -- name: UpsertBackendUsage :exec
 INSERT INTO cache_backend_usage (backend_id, objects_count, logical_bytes, measured_at)
 VALUES (sqlc.arg(backend_id), sqlc.arg(objects_count), sqlc.arg(logical_bytes), now())

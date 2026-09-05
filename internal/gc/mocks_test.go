@@ -140,6 +140,18 @@ func (f *fakeQueries) MarkOrphanedGCRunsFailed(_ context.Context) (int64, error)
 	return 0, nil
 }
 
+// MeasureProjectUsage: the read-triggered refresh's one statement. Returns nothing
+// here -- the measurement's behaviour is DB-backed (measure_test.go), because its
+// whole subject is a grouped aggregate over real rows -- while the singleflight and
+// the error path are exercised through the real engine.
+func (f *fakeQueries) MeasureProjectUsage(
+	_ context.Context, _ pgtype.UUID,
+) ([]repository.MeasureProjectUsageRow, error) {
+	f.note("MeasureProjectUsage")
+
+	return nil, nil
+}
+
 // The teardown surface (000018). A fake with no marked backends: every unit test in
 // this package drives the retention stages, and the teardown stage's own behaviour is
 // DB-backed (internal/db/gc_teardown_test.go) because its whole subject -- a RESTRICT

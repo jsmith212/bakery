@@ -49,7 +49,8 @@ func TestEndToEndInstanceServesWhateverConfigCarries(t *testing.T) {
 		PublicAddr: "0.0.0.0:8080", MetricsAddr: "127.0.0.1:9090", GRPCAddr: "127.0.0.1:9092",
 		ExternalURL: "https://bakery.example.com", OIDCIssuer: "", DevLoginEnabled: true,
 		AllowSelfServeOrgs: true, AllowLocalSiteAdmins: true, AllowMultiInstance: false,
-		GCEnabled: true, GCInterval: "6h0m0s", GCUsageInterval: "6h0m0s", GCGracePeriod: "24h0m0s",
+		GCEnabled: true, GCInterval: "6h0m0s", GCUsageInterval: "1h0m0s", GCGracePeriod: "24h0m0s",
+		UsageFreshness: "1m0s",
 	}
 
 	h.api.instance = want
