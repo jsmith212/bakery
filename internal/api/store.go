@@ -126,6 +126,18 @@ type Store interface {
 	UpdateBackend(ctx context.Context, arg repository.UpdateBackendParams) (repository.CacheBackend, error)
 	DeleteBackend(ctx context.Context, id int64) (int64, error)
 
+	// Teardown (000018). BackendHasObjects is the probe that decides between the fast
+	// path (an empty backend, deleted outright, 204) and the slow one (a mark, 202,
+	// and the GC's teardown stage). MarkBackendDeleting is the mark itself.
+	//
+	// There is deliberately no "unmark": a teardown is not reversible through the API.
+	// Reversing it would mean re-publishing a mount whose objects the GC has been
+	// deleting for an unknown number of chunks -- a cache that answers "present" for
+	// rows that are gone, which is the one failure this whole design exists to avoid.
+	// The recovery lever is a database rollback, not an endpoint.
+	BackendHasObjects(ctx context.Context, backendID int64) (bool, error)
+	MarkBackendDeleting(ctx context.Context, id int64) (repository.CacheBackend, error)
+
 	// GC run history (spec §9.10). Read-only: the write side -- starting a sweep --
 	// goes through gcTrigger, not Store, because answering 409 without first writing
 	// a row that would violate gc_runs' partial unique index needs the ENGINE's

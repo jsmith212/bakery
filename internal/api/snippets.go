@@ -438,7 +438,19 @@ func (a *API) backendSetFor(ctx context.Context, projectID pgtype.UUID) (backend
 	}
 
 	set := make(backendSet, len(rows))
+
 	for _, b := range rows {
+		// SKIPPED, not recorded as disabled (000018). backendSet's two states are
+		// "absent" (not in the map) and "configured but disabled" (in it, false), and
+		// why() renders a different sentence for each. A backend being torn down is
+		// ABSENT: its route already 404s, its objects are going, and telling an operator
+		// to "enable it" -- which is what the disabled sentence says -- would be advice
+		// that cannot work. Leaving the row out gets the right sentence for free rather
+		// than adding a third state every caller would have to learn.
+		if b.DeletingAt.Valid {
+			continue
+		}
+
 		set[b.Kind] = b.Enabled
 	}
 

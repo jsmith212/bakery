@@ -62,7 +62,12 @@
 		backends.map((b) => ({
 			backend: b,
 			usage: usageByKind.get(b.kind) ?? null,
-			status: backendStatus({ kind: b.kind, enabled: b.enabled, usage: usageByKind.get(b.kind) })
+			status: backendStatus({
+				kind: b.kind,
+				enabled: b.enabled,
+				usage: usageByKind.get(b.kind),
+				deleting_at: b.deleting_at
+			})
 		}))
 	);
 </script>

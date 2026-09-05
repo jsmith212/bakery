@@ -140,6 +140,55 @@ func (f *fakeQueries) MarkOrphanedGCRunsFailed(_ context.Context) (int64, error)
 	return 0, nil
 }
 
+// The teardown surface (000018). A fake with no marked backends: every unit test in
+// this package drives the retention stages, and the teardown stage's own behaviour is
+// DB-backed (internal/db/gc_teardown_test.go) because its whole subject -- a RESTRICT
+// foreign key refusing a delete until the last row is gone -- is a property of the
+// schema and not of any Go code a fake could stand in for.
+func (f *fakeQueries) ListBackendsForTeardown(
+	_ context.Context,
+) ([]repository.ListBackendsForTeardownRow, error) {
+	f.note("ListBackendsForTeardown")
+
+	return nil, nil
+}
+
+func (f *fakeQueries) DeleteTornDownBackend(_ context.Context, _ int64) (int64, error) {
+	f.note("DeleteTornDownBackend")
+
+	return 0, nil
+}
+
+func (f *fakeQueries) PurgeHashservUnihashesChunk(
+	_ context.Context, _ repository.PurgeHashservUnihashesChunkParams,
+) (int64, error) {
+	f.note("PurgeHashservUnihashesChunk")
+
+	return 0, nil
+}
+
+func (f *fakeQueries) PurgeHashservOuthashesChunk(
+	_ context.Context, _ repository.PurgeHashservOuthashesChunkParams,
+) (int64, error) {
+	f.note("PurgeHashservOuthashesChunk")
+
+	return 0, nil
+}
+
+func (f *fakeQueries) ListProjectsForTeardown(
+	_ context.Context,
+) ([]repository.ListProjectsForTeardownRow, error) {
+	f.note("ListProjectsForTeardown")
+
+	return nil, nil
+}
+
+func (f *fakeQueries) DeleteTornDownProject(_ context.Context, _ pgtype.UUID) (int64, error) {
+	f.note("DeleteTornDownProject")
+
+	return 0, nil
+}
+
 func (f *fakeQueries) ListBackendsForGC(_ context.Context) ([]repository.ListBackendsForGCRow, error) {
 	f.note("ListBackendsForGC")
 

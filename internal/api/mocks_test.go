@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -271,6 +272,17 @@ type fakeStore struct {
 	orgUsage     []repository.GetOrgUsageByProjectRow
 	projectUsage []repository.GetProjectBackendUsageRow
 	cacheObjects []repository.ListCacheObjectsForBrowseRow
+
+	// backendsWithObjects is what BackendHasObjects answers, keyed by backend id.
+	// Absent (the zero value) means empty, which is the state every existing test
+	// already assumes: a backend nobody wrote to deletes outright, 204.
+	backendsWithObjects map[int64]bool
+
+	// deleteBackendErr is DeleteBackend's own failure, separate from desiredErr,
+	// because the teardown handler calls BackendHasObjects FIRST and the interesting
+	// case is exactly the one where the probe succeeds and the delete then loses the
+	// race to a concurrent write. One shared error field cannot express that.
+	deleteBackendErr error
 
 	// calls records mutating calls, so a test can assert a denied request wrote
 	// NOTHING -- a 403 that still performed the write is the failure mode a
@@ -786,8 +798,58 @@ func (s *fakeStore) UpdateBackend(
 	return repository.CacheBackend{}, pgx.ErrNoRows
 }
 
+// Teardown (000018). The fake models the DECISION the handler makes, not the
+// database's foreign keys: hasObjects is set by a test to say "this backend is not
+// empty", which is exactly the fact BackendHasObjects reports and the only thing the
+// handler branches on. The FK itself -- and the lost-race 23503 the handler tolerates
+// -- is schema behaviour and is asserted DB-backed.
+func (s *fakeStore) BackendHasObjects(_ context.Context, backendID int64) (bool, error) {
+	s.note("BackendHasObjects")
+
+	if s.desiredErr != nil {
+		return false, s.desiredErr
+	}
+
+	return s.backendsWithObjects[backendID], nil
+}
+
+func (s *fakeStore) MarkBackendDeleting(
+	_ context.Context, id int64,
+) (repository.CacheBackend, error) {
+	s.note("MarkBackendDeleting")
+
+	if s.desiredErr != nil {
+		return repository.CacheBackend{}, s.desiredErr
+	}
+
+	for i := range s.backends {
+		if s.backends[i].ID != id {
+			continue
+		}
+
+		// coalesce(deleting_at, now()), exactly as MarkBackendDeleting does: a second
+		// mark keeps the first instant rather than restarting the clock, which is what
+		// makes the handler's repeat-DELETE idempotent rather than merely tolerated.
+		if !s.backends[i].DeletingAt.Valid {
+			s.backends[i].DeletingAt = pgtype.Timestamptz{
+				Time: markedAt, InfinityModifier: 0, Valid: true,
+			}
+		}
+
+		s.backends[i].Enabled = false
+
+		return s.backends[i], nil
+	}
+
+	return repository.CacheBackend{}, pgx.ErrNoRows
+}
+
 func (s *fakeStore) DeleteBackend(_ context.Context, id int64) (int64, error) {
 	s.note("DeleteBackend")
+
+	if s.deleteBackendErr != nil {
+		return 0, s.deleteBackendErr
+	}
 
 	if s.desiredErr != nil {
 		return 0, s.desiredErr
@@ -1242,3 +1304,8 @@ func (s *fakeStore) RevokeOrgToken(
 
 	return 0, nil
 }
+
+// markedAt is the fixed instant fakeStore stamps a teardown mark with. A constant
+// rather than time.Now(): the handler only ever tests deleting_at for PRESENCE, and
+// a moving value would make a response body untestable byte-for-byte.
+var markedAt = time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)

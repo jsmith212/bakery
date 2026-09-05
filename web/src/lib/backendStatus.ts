@@ -34,6 +34,11 @@ export interface BackendStatusInput {
 	enabled: boolean;
 	/** B2b's row for this backend, or null/undefined when there is none. */
 	usage?: ProjectBackendUsage | null;
+	/**
+	 * `Backend.deleting_at` (000018). Non-null means the GC is emptying this backend
+	 * and the row goes as soon as its last object does.
+	 */
+	deleting_at?: string | null;
 }
 
 export interface BackendStatusResult {
@@ -55,7 +60,21 @@ export function isUnmeasured(usage: ProjectBackendUsage | null | undefined): boo
 }
 
 export function backendStatus(input: BackendStatusInput): BackendStatusResult {
-	// 1. Disabled beats everything. A disabled backend 404s its mount whatever
+	// 0. Teardown beats everything, including disabled -- the mark sets
+	//    `enabled = false` too, so this MUST be tested first or every torn-down
+	//    backend reads as merely disabled, which is a state an operator would try to
+	//    undo. It reuses `stale` rather than widening BadgeStatus: FOUNDATION fixes
+	//    the glyph vocabulary at five and there is no sixth semantic color, and `▲`
+	//    with warn colors is already how `disabled` and a running GC render.
+	if (input.deleting_at) {
+		return {
+			status: 'stale',
+			label: 'deleting',
+			caption: 'Tearing down — the garbage collector is removing its objects.'
+		};
+	}
+
+	// 1. Disabled beats everything else. A disabled backend 404s its mount whatever
 	//    its stored bytes say.
 	if (!input.enabled) {
 		return { status: 'stale', label: 'disabled', caption: null };

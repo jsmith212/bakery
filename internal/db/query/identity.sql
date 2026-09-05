@@ -373,8 +373,15 @@ INSERT INTO projects (org_id, slug, name) VALUES ($1, $2, $3) RETURNING *;
 -- name: GetProject :one
 SELECT * FROM projects WHERE id = $1;
 
+-- `deleting_at IS NULL` (000018): a project being torn down is hidden from EVERY
+-- listing, for everyone, site admins included. It is not a permission question and
+-- there is no ?include_deleting= to widen it -- the project's routes already 404, its
+-- backends are being emptied, and its slug is about to become available again. A
+-- console that still listed it would be offering a link to a 404 and a rename form
+-- for a row that is going away.
+--
 -- name: ListProjectsForOrg :many
-SELECT * FROM projects WHERE org_id = $1 ORDER BY slug;
+SELECT * FROM projects WHERE org_id = $1 AND deleting_at IS NULL ORDER BY slug;
 
 -- name: UpdateProject :one
 UPDATE projects SET name = $2 WHERE id = $1 RETURNING *;
@@ -382,17 +389,77 @@ UPDATE projects SET name = $2 WHERE id = $1 RETURNING *;
 -- name: DeleteProject :execrows
 DELETE FROM projects WHERE id = $1;
 
+-- The project MARK (000018). Idempotent the same way MarkBackendDeleting is: coalesce
+-- keeps the original instant, so a repeat DELETE does not restart the clock.
+--
+-- name: MarkProjectDeleting :one
+UPDATE projects SET deleting_at = coalesce(deleting_at, now()) WHERE id = $1 RETURNING *;
+
+-- The teardown stage's project worklist: marked, and with NO backends left. The
+-- anti-join is the ordering rule -- projects -> cache_backends is ON DELETE RESTRICT,
+-- so a project row can only go after its last backend row has, which is exactly the
+-- "sweep tags BEFORE manifests BEFORE blobs" shape one level up in the ownership
+-- tree. Evaluated at SELECT time and again by the FK at DELETE time, so a backend
+-- re-created in the gap simply blocks the delete rather than orphaning anything.
+--
+-- name: ListProjectsForTeardown :many
+SELECT p.id, p.slug, o.slug AS org_slug
+  FROM projects p
+  JOIN organizations o ON o.id = p.org_id
+ WHERE p.deleting_at IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM cache_backends cb WHERE cb.project_id = p.id)
+ ORDER BY p.id;
+
+-- The last step. `deleting_at IS NOT NULL` guards a live project against a wrong id
+-- exactly as DeleteTornDownBackend's does.
+--
+-- THE LOCK IS IN THE STATEMENT, and that is the whole reason this is not two.
+-- Deleting a project cascades one project_memberships row per member, and each of
+-- those fires the authz-epoch trigger on that member's users row -- so this is a
+-- membership writer, and every membership writer in this codebase takes the users
+-- rows FIRST, in id order (LockProjectMemberUsersForAuthzUpdate above), or two of
+-- them deadlock. handleDeleteProject does it with an explicit transaction; the GC
+-- engine has none to do it in -- every write in internal/gc is deliberately a single
+-- self-contained statement (see its Queries doc) -- so the lock rides along here.
+--
+-- MATERIALIZED, and referenced from an InitPlan. `(SELECT count(*) FROM locked) >= 0`
+-- is trivially true and is not a filter: it is what forces the CTE to be evaluated,
+-- once, before the DELETE's own scan begins. Without a reference the planner may
+-- prune the CTE entirely; without MATERIALIZED it may inline it into the per-row
+-- predicate, taking the locks interleaved with the delete instead of ahead of it,
+-- which is precisely the ordering the rule exists to fix.
+--
+-- name: DeleteTornDownProject :execrows
+WITH locked AS MATERIALIZED (
+    SELECT u.id
+      FROM users u
+     WHERE u.id IN (SELECT pm.user_id FROM project_memberships pm WHERE pm.project_id = $1)
+     ORDER BY u.id
+       FOR NO KEY UPDATE
+)
+DELETE FROM projects p
+ WHERE p.id = $1
+   AND p.deleting_at IS NOT NULL
+   AND (SELECT count(*) FROM locked) >= 0;
+
 -- COLD: route-cache fill only, then ~never again. Two index probes
 -- (organizations_slug_key, then projects_org_id_slug_key). Deliberately NOT
 -- denormalised into one covering index: that would need a slug-immutability
 -- trigger to stay safe, which forecloses renames -- a product decision the schema
 -- must not make.
 --
+-- `p.deleting_at IS NULL` (000018) IS THE PROJECT HALF OF TEARDOWN, and putting it
+-- HERE is what makes it total: this one statement is both the cache route resolver's
+-- project probe (CachedResolver.load) and the control-plane guard's {project}
+-- resolution (api.resolveScope). A torn-down project therefore 404s on its cache
+-- mounts and on every /api/v1 route in one predicate, with no second place for the
+-- two to disagree.
+--
 -- name: ResolveRoute :one
 SELECT p.id AS project_id, p.org_id
   FROM projects p
   JOIN organizations o ON o.id = p.org_id
- WHERE o.slug = $1 AND p.slug = $2;
+ WHERE o.slug = $1 AND p.slug = $2 AND p.deleting_at IS NULL;
 
 -- Project roles are managed IN-APP. The OIDC reconciler must NEVER touch this
 -- table.

@@ -11,13 +11,20 @@ import (
 // the one an operator actually asks about after a cache shrinks: retention means the
 // window elapsed, quota means the backend was over its cap and the object lost the
 // eviction order, unreachable means the sstate root derivation found no surviving
-// unihash for it.
+// unihash for it, teardown means somebody deleted the backend (000018) and the sweep
+// is emptying it so the row can go.
+//
+// teardown is a FOURTH MEMBER rather than a reuse of retention, and the distinction
+// earns its series: every other reason answers "the policy decided this", and an
+// operator reading a sudden cliff in bakery_gc_objects_deleted_total needs to be able
+// to tell a retention change they did not intend from a delete somebody asked for.
 type GCReason string
 
 const (
 	GCReasonRetention   GCReason = "retention"
 	GCReasonQuota       GCReason = "quota"
 	GCReasonUnreachable GCReason = "unreachable"
+	GCReasonTeardown    GCReason = "teardown"
 )
 
 // gcCollectors are the bakery_gc_* families plus the two storage gauges the GC is

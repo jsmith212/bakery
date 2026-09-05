@@ -160,6 +160,22 @@ type Queries interface {
 	MarkOrphanedGCRunsFailed(ctx context.Context) (int64, error)
 
 	ListBackendsForGC(ctx context.Context) ([]repository.ListBackendsForGCRow, error)
+
+	// The teardown surface (000018, teardown.go). ListBackendsForGC deliberately does
+	// NOT filter deleting_at -- a marked backend still needs its retention stages if
+	// the teardown somehow stalls -- so these are separate, and they ride the two
+	// partial indexes 000018 creates: on a healthy installation both listings are
+	// empty forever and must cost nothing to ask.
+	ListBackendsForTeardown(ctx context.Context) ([]repository.ListBackendsForTeardownRow, error)
+	DeleteTornDownBackend(ctx context.Context, id int64) (int64, error)
+	PurgeHashservUnihashesChunk(
+		ctx context.Context, arg repository.PurgeHashservUnihashesChunkParams,
+	) (int64, error)
+	PurgeHashservOuthashesChunk(
+		ctx context.Context, arg repository.PurgeHashservOuthashesChunkParams,
+	) (int64, error)
+	ListProjectsForTeardown(ctx context.Context) ([]repository.ListProjectsForTeardownRow, error)
+	DeleteTornDownProject(ctx context.Context, id pgtype.UUID) (int64, error)
 	ScanObjectsForGC(
 		ctx context.Context, arg repository.ScanObjectsForGCParams,
 	) ([]repository.ScanObjectsForGCRow, error)

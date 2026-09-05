@@ -117,6 +117,30 @@ describe('backendStatus', () => {
 		);
 	});
 
+	// TEARDOWN BEATS DISABLED, and the ordering is the whole assertion. The mark
+	// (000018) sets `enabled = false` too, so a version that tested `enabled` first
+	// would render every torn-down backend as merely "disabled" -- a state an operator
+	// would reasonably try to undo, on a backend whose objects are already being
+	// deleted and whose row is about to stop existing.
+	it('a backend under teardown reads as deleting, not as disabled', () => {
+		const got = backendStatus({
+			kind: 'sstate',
+			enabled: false,
+			usage: usage({ logical_bytes: 9_000_000 }),
+			deleting_at: '2026-09-04T12:00:00Z'
+		});
+
+		expect(got.label).toBe('deleting');
+		expect(got.status).toBe('stale');
+		expect(got.caption).not.toBeNull();
+	});
+
+	it('a null deleting_at changes nothing', () => {
+		expect(backendStatus({ kind: 'sstate', enabled: true, deleting_at: null })).toEqual(
+			backendStatus({ kind: 'sstate', enabled: true })
+		);
+	});
+
 	it('never renders an unmeasured backend as zero bytes', () => {
 		expect(isUnmeasured(null)).toBe(true);
 		expect(isUnmeasured(usage({ measured_at: null }))).toBe(true);

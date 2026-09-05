@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -138,9 +139,107 @@ func TestBackendConflictsGetBackendSpecificMessages(t *testing.T) {
 		}
 	})
 
-	t.Run("delete-while-nonempty names the objects, not a missing reference", func(t *testing.T) {
+	// 000018 REPLACED THIS CONFLICT WITH A TEARDOWN. The endpoint used to answer 409
+	// on a backend that held objects -- forever, because the RESTRICT foreign key was
+	// never going to relent on its own and nothing else emptied the backend. It now
+	// answers 202 and marks the row; the GC's teardown stage does the emptying and
+	// then removes it.
+	t.Run("delete-while-nonempty marks the backend and answers 202", func(t *testing.T) {
 		store := backendFixture(t, time.Now(), time.Now())
-		store.desiredErr = &pgconn.PgError{
+		store.backendsWithObjects = map[int64]bool{1: true}
+		a := testAPI(t, store, nil)
+
+		w := do(t, a, admin, http.MethodDelete,
+			Prefix+"/orgs/acme/projects/firmware/backends/sstate", "")
+
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202 (body %s)", w.Code, w.Body.String())
+		}
+
+		var got Backend
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+
+		// The BODY is what tells the console this is a teardown and not a no-op: the
+		// status code alone cannot, because the client library reports the decoded body
+		// and nothing else.
+		if got.DeletingAt == nil {
+			t.Error("deleting_at is null on the 202 body: nothing distinguishes this from a live backend")
+		}
+
+		if got.Enabled {
+			t.Error("a backend marked for teardown is still enabled")
+		}
+
+		if !containsCall(store.calls, "MarkBackendDeleting") {
+			t.Errorf("calls = %v, want MarkBackendDeleting", store.calls)
+		}
+
+		if containsCall(store.calls, "DeleteBackend") {
+			t.Errorf("calls = %v: a backend holding objects must NOT be deleted outright", store.calls)
+		}
+	})
+
+	// A SECOND DELETE IS ANOTHER 202, NOT A 404. The console retries a request whose
+	// response it lost; telling it the backend is gone while the GC is still emptying
+	// it would be a lie it acts on.
+	t.Run("deleting an already-deleting backend is idempotent", func(t *testing.T) {
+		store := backendFixture(t, time.Now(), time.Now())
+		store.backendsWithObjects = map[int64]bool{1: true}
+		a := testAPI(t, store, nil)
+
+		first := do(t, a, admin, http.MethodDelete,
+			Prefix+"/orgs/acme/projects/firmware/backends/sstate", "")
+		if first.Code != http.StatusAccepted {
+			t.Fatalf("first status = %d, want 202", first.Code)
+		}
+
+		store.calls = nil
+
+		second := do(t, a, admin, http.MethodDelete,
+			Prefix+"/orgs/acme/projects/firmware/backends/sstate", "")
+		if second.Code != http.StatusAccepted {
+			t.Fatalf("second status = %d, want 202 (body %s)", second.Code, second.Body.String())
+		}
+
+		// Nothing was written the second time: the row already carries the mark, so the
+		// handler answers from what it read rather than re-stamping deleting_at.
+		if len(store.calls) != 0 {
+			t.Errorf("calls = %v, want none: a repeat delete must write nothing", store.calls)
+		}
+	})
+
+	// An EMPTY backend still goes immediately. That is the "configured it by mistake"
+	// case, and parking it in `deleting` for up to a GC interval with nothing to sweep
+	// would be a worse answer than the one that already worked.
+	t.Run("an empty backend is deleted outright", func(t *testing.T) {
+		store := backendFixture(t, time.Now(), time.Now())
+		a := testAPI(t, store, nil)
+
+		w := do(t, a, admin, http.MethodDelete,
+			Prefix+"/orgs/acme/projects/firmware/backends/sstate", "")
+
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204 (body %s)", w.Code, w.Body.String())
+		}
+
+		if !containsCall(store.calls, "DeleteBackend") {
+			t.Errorf("calls = %v, want DeleteBackend", store.calls)
+		}
+
+		if containsCall(store.calls, "MarkBackendDeleting") {
+			t.Errorf("calls = %v: an empty backend must not be marked", store.calls)
+		}
+	})
+
+	// THE LOST RACE. A build writes its first object between the probe and the
+	// delete, so the RESTRICT foreign key rejects the statement. That is not a
+	// failure: it is the same fact the probe would have reported a moment earlier,
+	// and the handler must land on the teardown path rather than surface a 23503.
+	t.Run("a 23503 between the probe and the delete falls back to the mark", func(t *testing.T) {
+		store := backendFixture(t, time.Now(), time.Now())
+		store.deleteBackendErr = &pgconn.PgError{
 			Code: pgForeignKeyViolation, ConstraintName: "cache_objects_backend_id_fkey",
 		}
 		a := testAPI(t, store, nil)
@@ -148,19 +247,48 @@ func TestBackendConflictsGetBackendSpecificMessages(t *testing.T) {
 		w := do(t, a, admin, http.MethodDelete,
 			Prefix+"/orgs/acme/projects/firmware/backends/sstate", "")
 
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202 (body %s)", w.Code, w.Body.String())
+		}
+
+		if !containsCall(store.calls, "MarkBackendDeleting") {
+			t.Errorf("calls = %v, want MarkBackendDeleting after the lost race", store.calls)
+		}
+	})
+
+	// A BACKEND UNDER TEARDOWN IS NOT PATCHABLE. UpdateBackend sets `enabled`
+	// unconditionally, so without this a PATCH of {"enabled":true} would republish a
+	// mount whose objects the GC is deleting row by row -- hits that turn into misses.
+	t.Run("patching a deleting backend is refused", func(t *testing.T) {
+		store := backendFixture(t, time.Now(), time.Now())
+		store.backendsWithObjects = map[int64]bool{1: true}
+		a := testAPI(t, store, nil)
+
+		if w := do(t, a, admin, http.MethodDelete,
+			Prefix+"/orgs/acme/projects/firmware/backends/sstate", ""); w.Code != http.StatusAccepted {
+			t.Fatalf("delete status = %d, want 202", w.Code)
+		}
+
+		w := do(t, a, admin, http.MethodPatch,
+			Prefix+"/orgs/acme/projects/firmware/backends/sstate", `{"enabled":true}`)
+
 		if w.Code != http.StatusConflict {
 			t.Fatalf("status = %d, want 409 (body %s)", w.Code, w.Body.String())
 		}
-
-		detail := decodeErr(t, w)
-		if detail.Code != CodeConflict {
-			t.Errorf("code = %q, want %q", detail.Code, CodeConflict)
-		}
-
-		if detail.Message != "this backend still holds cache objects and cannot be deleted until it is emptied" {
-			t.Errorf("message = %q, want the still-holds-objects conflict", detail.Message)
-		}
 	})
+}
+
+// containsCall reports whether the fake recorded a call by name. fakeStore.note
+// records some calls with a ":suffix" (the kind, the slug), so this is a prefix
+// match on the name rather than equality.
+func containsCall(calls []string, name string) bool {
+	for _, c := range calls {
+		if c == name || strings.HasPrefix(c, name+":") {
+			return true
+		}
+	}
+
+	return false
 }
 
 // RETENTION AND QUOTA ARE PATCHABLE, AND AN UNRELATED PATCH MUST NOT CLEAR THEM

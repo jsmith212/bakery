@@ -328,7 +328,8 @@ func TestWireTypesMatchTSFixtures(t *testing.T) {
 		project := Project{
 			ID: "p1", OrgID: "o1", OrgSlug: "acme", Slug: "firmware", Name: "Firmware",
 			Role: "admin", Backends: []string{"sstate", "downloads"},
-			CreatedAt: then, UpdatedAt: now,
+			DeletingAt: nil,
+			CreatedAt:  then, UpdatedAt: now,
 		}
 
 		assertSameKeySet(t, "Project", marshaledKeySet(t, project), listFixtureKeySet(t, "projects.json"))
@@ -341,7 +342,8 @@ func TestWireTypesMatchTSFixtures(t *testing.T) {
 		backend := Backend{
 			ID: 41, ProjectID: "p1", Kind: "sstate", Enabled: true, ReadAuthRequired: true,
 			Config: json.RawMessage(`{}`), RetentionWindow: &window, QuotaBytes: &quota,
-			CreatedAt: then, UpdatedAt: now,
+			DeletingAt: nil,
+			CreatedAt:  then, UpdatedAt: now,
 		}
 
 		assertSameKeySet(t, "Backend", marshaledKeySet(t, backend), listFixtureKeySet(t, "backends.json"))

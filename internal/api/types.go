@@ -91,6 +91,15 @@ type Project struct {
 	// which is what the projects screen lists per row.
 	Backends []string `json:"backends"`
 
+	// DeletingAt is 000018's teardown mark. It is on the wire for exactly ONE
+	// response -- the 202 that DELETE /orgs/{org}/projects/{project} answers when the
+	// project still holds cache objects -- because after that mark the project is
+	// gone from ResolveRoute and no endpoint that carries {project} resolves it any
+	// more. Without the field that 202's body is byte-identical to a live project and
+	// the client has nothing to distinguish "accepted, tearing down" from "nothing
+	// happened".
+	DeletingAt *time.Time `json:"deleting_at"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -108,7 +117,8 @@ func newProject(pr repository.Project, orgSlug string, backends []string, p Prin
 	return Project{
 		ID: uuidString(pr.ID), OrgID: uuidString(pr.OrgID), OrgSlug: orgSlug,
 		Slug: pr.Slug, Name: pr.Name, Role: role, Backends: backends,
-		CreatedAt: pr.CreatedAt.Time, UpdatedAt: pr.UpdatedAt.Time,
+		DeletingAt: timePtr(pr.DeletingAt),
+		CreatedAt:  pr.CreatedAt.Time, UpdatedAt: pr.UpdatedAt.Time,
 	}
 }
 
@@ -465,6 +475,17 @@ type Backend struct {
 	// not a disk figure and the console says so. null is "no cap".
 	QuotaBytes *int64 `json:"quota_bytes"`
 
+	// DeletingAt is 000018's teardown mark: non-null means this backend is being
+	// emptied by the GC and its row goes as soon as its last object does.
+	//
+	// It is on the wire, and the list/get endpoints keep returning the row, PRECISELY
+	// BECAUSE every other reader treats the backend as absent -- the route resolver
+	// 404s it, the snippet generator refuses it, and the object browser has nothing
+	// left to show. Without this field the console's only evidence that a delete was
+	// accepted would be a backend that keeps existing and keeps refusing to work,
+	// which reads as a bug rather than as progress.
+	DeletingAt *time.Time `json:"deleting_at"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -479,7 +500,8 @@ func newBackend(b repository.CacheBackend) Backend {
 		ID: b.ID, ProjectID: uuidString(b.ProjectID), Kind: string(b.Kind),
 		Enabled: b.Enabled, ReadAuthRequired: b.ReadAuthRequired, Config: cfg,
 		RetentionWindow: durationString(b.RetentionWindow), QuotaBytes: int64Ptr(b.QuotaBytes),
-		CreatedAt: b.CreatedAt.Time, UpdatedAt: b.UpdatedAt.Time,
+		DeletingAt: timePtr(b.DeletingAt),
+		CreatedAt:  b.CreatedAt.Time, UpdatedAt: b.UpdatedAt.Time,
 	}
 }
 

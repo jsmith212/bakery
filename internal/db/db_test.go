@@ -159,7 +159,7 @@ func TestMigrationVersion(t *testing.T) {
 		t.Error("dirty = true on a cleanly migrated database")
 	}
 
-	// 17 up/down pairs ship in internal/db/migrations. If this number changes, the
+	// 18 up/down pairs ship in internal/db/migrations. If this number changes, the
 	// change was deliberate and this line moves with it. (000012 is M6's GC
 	// retention/quotas change: accessed_at, cache_backends.retention_window/
 	// quota_bytes, cache_backend_usage, and the gc_runs trigger/dry_run columns.
@@ -167,9 +167,11 @@ func TestMigrationVersion(t *testing.T) {
 	// attribution. 000014 is feedback wave 1's avatar_url. 000015 is its user_tokens
 	// plus users.authz_epoch and the triggers that bump it. 000016 is its robots and
 	// org_tokens. 000017 is the buildkit-cache-export spec's `registry` backend_kind
-	// enum value.)
-	if version != 17 {
-		t.Errorf("version = %d, want 17", version)
+	// enum value. 000018 is the teardown wave's cache_backends.deleting_at and
+	// projects.deleting_at -- the soft-delete marks that let a backend holding
+	// objects be deleted at all.)
+	if version != 18 {
+		t.Errorf("version = %d, want 18", version)
 	}
 }
 

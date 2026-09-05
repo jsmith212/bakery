@@ -199,6 +199,7 @@ describe('response fixtures', () => {
 		expect(keys(decoded.items[0])).toEqual([
 			'backends',
 			'created_at',
+			'deleting_at',
 			'id',
 			'name',
 			'org_id',
@@ -371,6 +372,7 @@ describe('response fixtures', () => {
 		expect(keys(decoded.items[0])).toEqual([
 			'config',
 			'created_at',
+			'deleting_at',
 			'enabled',
 			'id',
 			'kind',

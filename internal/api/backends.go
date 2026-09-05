@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -198,6 +199,17 @@ func (a *API) handleUpdateBackend(w http.ResponseWriter, r *http.Request) error 
 		return err
 	}
 
+	// A backend under teardown (000018) is not patchable, and the refusal is not
+	// cosmetic: UpdateBackend sets `enabled` unconditionally, so a PATCH of
+	// {"enabled": true} against a marked row would re-enable a backend whose objects
+	// the GC is in the middle of deleting -- serving hits that turn into misses row
+	// by row. deleting_at is deliberately NOT in that query's SET list, so the mark
+	// itself survives; this is what stops the rest of the row from drifting under it.
+	if current.DeletingAt.Valid {
+		return errConflict(CodeConflict,
+			"this backend is being torn down and can no longer be changed")
+	}
+
 	var req UpdateBackendRequest
 	if err := decodeJSON(r, &req); err != nil {
 		return err
@@ -249,12 +261,36 @@ func (a *API) handleUpdateBackend(w http.ResponseWriter, r *http.Request) error 
 	return nil
 }
 
-// handleDeleteBackend removes a backend config. Project admin.
+// handleDeleteBackend tears a backend down. Project admin.
 //
-// This deletes the CONFIG ROW. The cache objects hanging off it go with it, by
-// cascade; the BYTES are left for the GC to reap, which is the storage-ordering
-// invariant working as designed -- metadata first, bytes second. Orphaned bytes
-// are recoverable; a dangling metadata row is a permanent 500.
+// TWO OUTCOMES, AND THE SLOW ONE IS THE NORMAL ONE. An EMPTY backend is deleted
+// outright, 204, exactly as before -- that is the "configured it by mistake" case and
+// it should not park a row in `deleting` for up to a GC interval. A backend that has
+// ever served a build is MARKED (000018's deleting_at) and answered 202 with its own
+// JSON, because the deletion is a bulk row removal the GC owns.
+//
+// WHY THE ROW IS NOT DRAINED HERE. cache_objects -> cache_backends is ON DELETE
+// RESTRICT, so before 000018 this endpoint answered 409 forever on any backend that
+// held objects: the backend could never be deleted at all. The obvious fix -- delete
+// the objects in this request -- is the one this codebase already refuses everywhere
+// else. A five-thousand-object backend times out the request; a ten-million-object
+// one holds a single transaction across the whole delete, pinning a snapshot on the
+// hottest table in the schema. And the delete would have to bypass
+// blob.Service.DeleteBatch (the only sanctioned path: digest-ordered blob locks, the
+// write barrier re-derived at delete time, shard-grouped LRU invalidation) or
+// reimplement it. The mark costs one UPDATE and hands the work to the machine that
+// already does exactly this, at exactly this pace, under exactly these rules.
+//
+// The moment the mark lands the backend is UNCONFIGURED: GetBackend (the route
+// resolver's own probe) filters on deleting_at IS NULL, so every cache mount 404s
+// like a kind that was never created, and the snippet generator refuses it. Only the
+// control-plane list/get still return the row, so the console can say what is
+// happening.
+//
+// IDEMPOTENT. A second DELETE on a marked backend is another 202 carrying the same
+// deleting_at the first one minted (MarkBackendDeleting coalesces), never a 404 and
+// never a restarted clock -- a console that retries a request whose response it lost
+// must not be told the backend is gone while the GC is still emptying it.
 func (a *API) handleDeleteBackend(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 
@@ -263,27 +299,70 @@ func (a *API) handleDeleteBackend(w http.ResponseWriter, r *http.Request) error 
 		return err
 	}
 
-	n, err := a.store.DeleteBackend(ctx, current.ID)
+	if current.DeletingAt.Valid {
+		writeJSON(w, http.StatusAccepted, newBackend(current))
+
+		return nil
+	}
+
+	done, err := a.deleteEmptyBackend(ctx, current.ID)
 	if err != nil {
-		// ON DELETE RESTRICT from cache_objects => a 23503 while the backend still
-		// holds objects. The generic mapping says "that reference does not exist, or
-		// the user is not a member of the organization", which is the exact opposite
-		// of the truth (the reference very much exists), so name it here.
-		if isPGCode(err, pgForeignKeyViolation) {
-			return errConflict(CodeConflict,
-				"this backend still holds cache objects and cannot be deleted until it is emptied")
-		}
-
-		return fmt.Errorf("delete backend: %w", err)
+		return err
 	}
 
-	if n == 0 {
-		return errNotFound("backend not found")
+	if done {
+		writeJSON(w, http.StatusNoContent, nil)
+
+		return nil
 	}
 
-	writeJSON(w, http.StatusNoContent, nil)
+	marked, err := a.store.MarkBackendDeleting(ctx, current.ID)
+	if err != nil {
+		return fmt.Errorf("mark the %s backend for teardown: %w", current.Kind, err)
+	}
+
+	writeJSON(w, http.StatusAccepted, newBackend(marked))
 
 	return nil
+}
+
+// deleteEmptyBackend deletes a backend that holds nothing, and reports whether it
+// did. false means "fall back to the mark" -- never an error.
+//
+// The probe and the delete are two statements, deliberately not one transaction: the
+// gap between them is a build writing its first object, and the ONLY consequence of
+// losing that race is a 23503 that lands the caller on the teardown path -- which is
+// the same answer the probe would have produced had it seen the row. Wrapping them
+// would buy a stricter answer to a question whose two answers are already both
+// correct, at the cost of holding a transaction open across a control-plane request.
+//
+// hashserv is why the probe asks three tables and not one: it owns no cache_objects
+// rows at all, and its RESTRICT comes from hashserv_unihashes / hashserv_outhashes
+// (000010). A probe on cache_objects alone would declare every hashserv backend empty
+// and walk it straight into the foreign-key violation this function exists to avoid.
+func (a *API) deleteEmptyBackend(ctx context.Context, id int64) (bool, error) {
+	has, err := a.store.BackendHasObjects(ctx, id)
+	if err != nil {
+		return false, fmt.Errorf("check whether the backend still holds objects: %w", err)
+	}
+
+	if has {
+		return false, nil
+	}
+
+	n, err := a.store.DeleteBackend(ctx, id)
+	if err != nil {
+		// The lost race described above. Anything else is a real failure.
+		if isPGCode(err, pgForeignKeyViolation) {
+			return false, nil
+		}
+
+		return false, fmt.Errorf("delete backend: %w", err)
+	}
+
+	// n == 0 means the row vanished between backendOf and here -- a concurrent
+	// delete. Reporting "deleted" is the truthful answer to DELETE: it is gone.
+	return n >= 0, nil
 }
 
 // backendOf resolves {kind} within the AUTHORIZED project.

@@ -47,7 +47,12 @@
 			return {
 				backend: b,
 				usage: u,
-				status: backendStatus({ kind: b.kind, enabled: b.enabled, usage: u }),
+				status: backendStatus({
+					kind: b.kind,
+					enabled: b.enabled,
+					usage: u,
+					deleting_at: b.deleting_at
+				}),
 				hasQuota: quotaApplicable(b.kind),
 				// A kind can serve two route families (bazel HTTP+gRPC, both OCI
 				// kinds containerd+BuildKit). The cell shows the first and the

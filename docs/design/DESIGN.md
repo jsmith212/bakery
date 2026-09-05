@@ -628,6 +628,63 @@ a follow-up, not a v1 gap papered over: blob liveness is `accessed_at` only, so 
 tag can age out a blob nothing has imported — but BuildKit's cache import failure is
 unconditionally soft, so the failure mode is a cold build, never a broken one.
 
+### Backend and project teardown as landed (2026-09-04)
+
+`DELETE /orgs/{org}/projects/{project}/backends/{kind}` deleted only the config row,
+and `cache_objects -> cache_backends` is `ON DELETE RESTRICT` — so a backend that had
+ever served a build answered **409 forever** and could never be deleted. `DELETE
+.../projects/{project}` inherited the same wall (`projects -> cache_backends` is
+RESTRICT too) and did not even map the violation. Migration `000018` adds
+`cache_backends.deleting_at` and `projects.deleting_at` (NULL = live, partial indexes
+on the marked predicate) and splits the work: **the API marks, the GC empties, and the
+row goes last.**
+
+An EMPTY backend is still deleted outright (204). Anything else is marked, disabled
+and answered **202 with the backend JSON** — idempotent, because `MarkBackendDeleting`
+coalesces. `DELETE .../projects/{project}` does the same one level up, in one
+transaction: lock the members (the cascade fires the authz-epoch trigger per member),
+mark every backend, delete the empty ones, then either delete the project (204) or
+mark it (202). A marked backend reads as **unconfigured** to `GetBackend` — the route
+resolver's own probe — so all five data-plane gates 404 it with no Go change; a marked
+project is filtered out of `ResolveRoute`, which is simultaneously the cache resolver's
+project probe and the API guard's `{project}` resolution, and out of
+`ListProjectsForOrg`. `backendKinds` and the snippet generator's `backendSetFor` skip
+marked rows so a torn-down kind reads as *absent* rather than as *disabled* — "enable
+it" is advice that cannot work. Only the control-plane list/get still return the row,
+carrying `deleting_at`, which is the console's only evidence the delete was accepted.
+
+The teardown stage (`internal/gc/teardown.go`) runs FIRST in every tick and **before
+the `--gc-disable-retention` brake**: the brake halts the retention *policy*, and a
+teardown is one explicit instruction a human issued. It has no age predicate at all —
+hence no `hasWindow` guard, and no `PendingTouch` veto (a doomed backend has no
+reservation to honour). One keyset cursor walks the backend's whole `cache_objects`
+slice across every namespace and issues one `DeleteBatch` per namespace run;
+`hashserv` gets a chunked purge of its own two RESTRICT tables instead, mirroring
+`sweepHashserv`. A 23503 on the final row delete is a *lost race*, not a failure — the
+write barrier spared a row written after the snapshot froze — so it is logged and
+retried next tick. `metrics.GCReasonTeardown` is a fourth member of the closed reason
+set. `DeleteTornDownProject` carries `LockProjectMemberUsersForAuthzUpdate` inside its
+own statement as a `MATERIALIZED` CTE forced by an InitPlan reference, because this
+package has no transaction and every write in it is one self-contained statement.
+
+**Console:** a new project Settings page (`/o/[org]/p/[project]/settings`) with a
+rename form (project admin) and a danger zone that is visible to everyone but enabled
+only for **org** admins — with a caption saying why — plus a Delete backend danger
+zone on the backend detail page, both behind a slug/kind-confirm modal. `deleting`
+reuses `BadgeStatus.stale` (FOUNDATION fixes the glyph vocabulary at five) and is
+tested BEFORE `enabled`, because the mark sets `enabled = false` too. While a backend
+is deleting its Edit, snippet and object-browser affordances are replaced by a
+"Tearing down" EmptyState.
+
+**What this did NOT build (recorded):** un-marking a teardown through the API (the
+recovery lever is a database rollback — republishing a mount whose objects the GC has
+been deleting is the one failure the whole design avoids); a progress figure for a
+teardown in flight; and immediate route-cache invalidation — `CachedResolver.Invalidate`
+still has no production call site, so a marked backend keeps resolving for at most
+`defaultRouteTTL` (30s), exactly as a disabled or updated one already does.
+
+---
+
 ---
 
 ## The three riskiest parts

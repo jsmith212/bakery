@@ -211,6 +211,102 @@ test.describe('console: dev-login through config snippets', () => {
 		});
 	});
 
+	// TEARDOWN, end to end (000018): the project Settings screen, a backend deleted
+	// from its own danger zone, and the project deleted from Settings.
+	//
+	// Both deletes here take the FAST path -- everything created in this test is
+	// empty, so the server deletes outright and answers 204. That is deliberate: the
+	// 202 teardown path's whole subject is a GC sweep on a database, which is where
+	// it is asserted (internal/gc's DB-backed teardown suite). What only a browser can
+	// prove is the part below -- that the screens exist, that the confirm gates work,
+	// and that the console lands somewhere real afterwards instead of on a 404 for the
+	// thing it just deleted.
+	test('project settings: rename, delete a backend, delete the project', async ({ page }) => {
+		const orgSlug = unique('e2e-org-teardown');
+		const projectSlug = 'teardown';
+
+		await test.step('dev-login, create org and project', async () => {
+			await signInWithoutAuth(page);
+			await createOrg(page, orgSlug);
+			await createProject(page, orgSlug, projectSlug);
+		});
+
+		await test.step('rename the project from Settings', async () => {
+			// Scoped by href, not by name: "Settings" now exists under BOTH the PROJECT
+			// and the ORG section of the nav, and a bare getByRole('link', {name}) is a
+			// strict-mode violation.
+			await consoleNav(page)
+				.locator(`a[href="/o/${orgSlug}/p/${projectSlug}/settings"]`)
+				.click();
+			await page.waitForURL(`**/o/${orgSlug}/p/${projectSlug}/settings`);
+
+			await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+
+			// The slug is immutable and the field says so by being disabled -- renaming
+			// must not be a way to move a project's cache URLs. `toHaveValue`, never an
+			// `input[value=...]` attribute selector: Svelte sets the DOM PROPERTY, so the
+			// attribute a selector matches on is never written.
+			const slugInput = page.locator('input[disabled]').first();
+			await expect(slugInput).toHaveValue(projectSlug);
+
+			const nameInput = page.locator('input:not([disabled])').first();
+			await nameInput.fill('Renamed by e2e');
+			await page.getByRole('button', { name: 'Save changes' }).click();
+
+			// The form re-reads `project` after invalidateAll, so this is the rename
+			// coming back from the server -- not the value the input was just typed into.
+			await expect(page.getByText('Settings saved')).toBeVisible();
+			await expect(nameInput).toHaveValue('Renamed by e2e');
+		});
+
+		await test.step('add a backend, then delete it from its danger zone', async () => {
+			// Back to Overview first: addFirstBackend drives the project overview's own
+			// "Add a backend" empty state, and the rename step above left us on Settings.
+			await consoleNav(page).getByRole('link', { name: 'Overview' }).click();
+			await page.waitForURL(`**/o/${orgSlug}/p/${projectSlug}/overview`);
+
+			await addFirstBackend(page, orgSlug, projectSlug);
+
+			await page.getByRole('button', { name: 'Delete backend' }).click();
+
+			const dialog = page.getByRole('dialog');
+			// The confirm gate: the primary button stays disabled until the kind matches.
+			await expect(dialog.getByRole('button', { name: 'Delete backend' })).toBeDisabled();
+			await dialog.locator('input[placeholder="sstate"]').fill('sstate');
+			await dialog.getByRole('button', { name: 'Delete backend' }).click();
+
+			await page.waitForURL(`**/o/${orgSlug}/p/${projectSlug}/backends`);
+			await expect(page.getByRole('row').filter({ hasText: 'sstate' })).toHaveCount(0);
+		});
+
+		await test.step('delete the project from Settings', async () => {
+			await consoleNav(page)
+				.locator(`a[href="/o/${orgSlug}/p/${projectSlug}/settings"]`)
+				.click();
+			await page.waitForURL(`**/o/${orgSlug}/p/${projectSlug}/settings`);
+
+			await page.getByRole('button', { name: 'Delete project' }).click();
+
+			const dialog = page.getByRole('dialog');
+			await expect(dialog.getByRole('button', { name: 'Delete project' })).toBeDisabled();
+			await dialog.locator(`input[placeholder="${projectSlug}"]`).fill(projectSlug);
+			await dialog.getByRole('button', { name: 'Delete project' }).click();
+
+			// Lands on the org's projects grid, and the CARD is gone -- the server excludes
+			// a deleting project from every listing, so this assertion holds on both the
+			// 204 and the 202 branch.
+			//
+			// Scoped to <main>, not the page: the nav's own project switcher still links
+			// to the remembered project (the slug is stashed in localStorage by the
+			// project layout, and nothing clears it on delete), so a page-wide locator
+			// matches two elements and would pass only by accident.
+			await page.waitForURL(`**/o/${orgSlug}/projects`);
+			await expect(
+				page.getByRole('main').locator(`a[href="/o/${orgSlug}/p/${projectSlug}/overview"]`)
+			).toHaveCount(0);
+		});
+	});
+
 	test('sstate-only project: yocto preview has no BB_HASHSERVE and warns', async ({ page }) => {
 		const orgSlug = unique('e2e-org-neg');
 		const projectSlug = 'sstate-only';

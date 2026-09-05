@@ -12,6 +12,7 @@
         "downloads",
         "hashserv"
       ],
+      "deleting_at": null,
       "created_at": "2026-07-12T09:15:44.201Z",
       "updated_at": "2026-07-12T09:15:44.201Z"
     },
@@ -22,6 +23,7 @@
       "slug": "tools",
       "name": "Tools",
       "backends": [],
+      "deleting_at": null,
       "created_at": "2026-08-02T08:00:00.000Z",
       "updated_at": "2026-08-02T08:00:00.000Z"
     }

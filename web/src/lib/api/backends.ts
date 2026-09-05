@@ -63,12 +63,29 @@ export function updateBackend(
 	);
 }
 
-/** 204, or **409** while the backend still holds objects. */
+/**
+ * Deletes or tears down a backend. Project admin.
+ *
+ * TWO OUTCOMES, AND THE BODY IS THE ONLY WAY TO TELL THEM APART. An empty backend is
+ * deleted outright and answers **204**, which `request` resolves as `undefined`. A
+ * backend that has ever served a build cannot be deleted synchronously (its objects
+ * hold a RESTRICT foreign key, and draining them in an HTTP request is what this
+ * design refuses), so it is MARKED and answers **202** with the backend, its
+ * `deleting_at` set. `client.ts` returns the decoded body and no status, so
+ * `result === undefined` is "gone" and a result is "tearing down".
+ *
+ * Idempotent: deleting an already-deleting backend is another 202, never a 404. The
+ * old **409** ("still holds cache objects") no longer exists -- it was unresolvable,
+ * because nothing was ever going to empty the backend.
+ */
 export function deleteBackend(
 	org: string,
 	project: string,
 	kind: BackendKind,
 	opts?: RequestOptions
-): Promise<void> {
-	return del<void>(`/orgs/${seg(org)}/projects/${seg(project)}/backends/${seg(kind)}`, opts);
+): Promise<Backend | undefined> {
+	return del<Backend | undefined>(
+		`/orgs/${seg(org)}/projects/${seg(project)}/backends/${seg(kind)}`,
+		opts
+	);
 }

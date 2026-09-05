@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/jsmith212/bakery/internal/auth"
 	"github.com/jsmith212/bakery/internal/db/repository"
 )
@@ -351,6 +353,39 @@ func TestSnippetYoctoHashservBlockOnlyWhenConfigured(t *testing.T) {
 
 		if !strings.Contains(strings.Join(out.Warnings, " "), "disabled") {
 			t.Errorf("the warning must say the backend is disabled, not that it is absent: %v", out.Warnings)
+		}
+	})
+
+	// A BACKEND UNDER TEARDOWN READS AS ABSENT, NOT AS DISABLED (000018). It is
+	// deliberately the OTHER sentence from the case immediately above: "enable it" is
+	// advice that cannot work on a backend whose objects the GC is deleting and whose
+	// row is about to stop existing, and an operator who follows it learns nothing.
+	// The mechanism is that backendSetFor skips the row entirely rather than recording
+	// a third state -- so `why()` gets the right sentence with no new vocabulary.
+	t.Run("a backend under teardown reads as absent, not as disabled", func(t *testing.T) {
+		store := snippetStore(t, repository.BackendKindSstate)
+		store.backends = append(store.backends, repository.CacheBackend{
+			ID: 99, ProjectID: mustUUID(t, projFirmwareID),
+			Kind: repository.BackendKindHashserv, Enabled: true,
+			DeletingAt: pgtype.Timestamptz{Time: markedAt, InfinityModifier: 0, Valid: true},
+		})
+
+		a := snippetAPI(t, store, &fakeMinter{token: snippetToken})
+		out := decodeSnippet(t, snippetPost(t, a, principals(t)["proj_write"], "", nil), http.StatusCreated)
+
+		if strings.Contains(out.LocalConf, "BB_HASHSERVE") {
+			t.Errorf("a backend being torn down 404s its mount; BB_HASHSERVE must be omitted:\n%s",
+				out.LocalConf)
+		}
+
+		joined := strings.Join(out.Warnings, " ")
+		if !strings.Contains(joined, "not configured") {
+			t.Errorf("the warning must read as absent: %v", out.Warnings)
+		}
+
+		if strings.Contains(joined, "disabled") {
+			t.Errorf("the warning tells the operator to enable a backend that is being deleted: %v",
+				out.Warnings)
 		}
 	})
 }

@@ -303,6 +303,16 @@ func (e *Engine) sweep(ctx context.Context, run repository.StartGCRunRow, sum *S
 		}
 	}
 
+	// THE TEARDOWN STAGE (000018), and it runs BEFORE the retention brake on purpose
+	// -- see teardown.go's package block. --gc-disable-retention halts the retention
+	// POLICY; a teardown is one explicit instruction a human issued through the API,
+	// and stalling it would mean a backend that cannot be deleted for as long as the
+	// brake is on. Layer B's mark stays halted either way, so the bytes still sit in
+	// the grace window and the brake still does what it is for.
+	if err := e.sweepTeardown(ctx, run, sum); err != nil {
+		return err
+	}
+
 	if e.cfg.DisableRetention {
 		e.log.WarnContext(ctx, "retention is disabled: stages 1-9 and Layer B's mark are halted",
 			slog.Int64("run", run.ID))

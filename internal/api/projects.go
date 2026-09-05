@@ -83,7 +83,16 @@ func (a *API) backendKinds(ctx context.Context, projectID pgtype.UUID) ([]string
 	}
 
 	kinds := make([]string, 0, len(backends))
+
 	for _, b := range backends {
+		// A backend under teardown (000018) is not a CONFIGURED kind: its mount 404s,
+		// its snippet is refused, and it is about to stop existing. This field is what
+		// the projects screen renders per row as "what this project can serve", so a
+		// torn-down kind listed here is an offer the router will not honour.
+		if b.DeletingAt.Valid {
+			continue
+		}
+
 		kinds = append(kinds, string(b.Kind))
 	}
 
@@ -252,32 +261,89 @@ func (a *API) handleUpdateProject(w http.ResponseWriter, r *http.Request) error 
 	return nil
 }
 
-// handleDeleteProject deletes a project. ORG admin, not project admin
+// handleDeleteProject tears a project down. ORG admin, not project admin
 // (AccessOrgAdmin): this destroys every cache object, key and backend config in
 // the project, and a project admin is a role the org's admins hand out. Letting
 // the recipient of a delegated role destroy the thing it was delegated over is
 // the wrong default.
 //
-// The cascade deletes a project_memberships row per member, so it fires the epoch
-// trigger once per member and is subject to lockUserFirst's ordering rule at the
-// width of the project's roster.
+// TWO OUTCOMES, THE SAME SHAPE AS A BACKEND DELETE. Everything happens in ONE
+// transaction, in ownership order:
+//
+//  1. lock the project's members (the cascade below deletes a project_memberships
+//     row per member and fires the epoch trigger once each, so lockUserFirst's
+//     ordering rule applies at the width of the roster);
+//  2. mark every backend for teardown, so none of them is reachable a moment later
+//     than the project is;
+//  3. delete the ones that hold nothing, which is the whole set in the common case
+//     -- a project configured by mistake;
+//  4. if nothing is left, delete the project outright: 204, exactly as before;
+//  5. otherwise mark the project and answer 202.
+//
+// One transaction and not five statements, because the intermediate states are all
+// wrong: marked backends under a live project (the project keeps serving nothing),
+// or a marked project whose backends are still live (routes that resolve to a
+// project the console has already forgotten). A crash between any two of them would
+// leave exactly that.
+//
+// BEFORE 000018 THIS ENDPOINT COULD NOT DELETE A USED PROJECT AT ALL. projects ->
+// cache_backends is ON DELETE RESTRICT and so is cache_backends -> cache_objects,
+// and the 23503 that came back was not even mapped -- a project with cached data
+// failed with a generic 500-shaped error and no way forward.
+//
+// Once marked, the project is GONE from the API: ResolveRoute filters
+// deleting_at IS NULL, and that one statement is both the cache route resolver's
+// project probe and this API's own {project} guard, so every route carrying
+// {project} 404s from here on. That is deliberate and it is why the 202 carries the
+// project body -- it is the last response about this project anyone will get.
 func (a *API) handleDeleteProject(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
+
+	p, ok := principalFrom(ctx)
+	if !ok {
+		return errUnauthorized("authentication required")
+	}
+
 	s := scopeFrom(ctx)
 
-	var n int64
+	var (
+		gone   bool
+		marked repository.Project
+	)
 
 	err := a.store.Tx(ctx, func(q *repository.Queries) error {
 		if err := q.LockProjectMemberUsersForAuthzUpdate(ctx, s.ProjectID); err != nil {
 			return fmt.Errorf("lock the project's members before deleting it: %w", err)
 		}
 
-		deleted, err := q.DeleteProject(ctx, s.ProjectID)
-		if err != nil {
-			return fmt.Errorf("delete project: %w", err)
+		if _, err := q.MarkProjectBackendsDeleting(ctx, s.ProjectID); err != nil {
+			return fmt.Errorf("mark the project's backends for teardown: %w", err)
 		}
 
-		n = deleted
+		if _, err := q.DeleteEmptyBackendsForProject(ctx, s.ProjectID); err != nil {
+			return fmt.Errorf("delete the project's empty backends: %w", err)
+		}
+
+		remaining, err := q.ListBackendsForProject(ctx, s.ProjectID)
+		if err != nil {
+			return fmt.Errorf("list the project's remaining backends: %w", err)
+		}
+
+		if len(remaining) == 0 {
+			deleted, err := q.DeleteProject(ctx, s.ProjectID)
+			if err != nil {
+				return fmt.Errorf("delete project: %w", err)
+			}
+
+			gone = deleted > 0
+
+			return nil
+		}
+
+		marked, err = q.MarkProjectDeleting(ctx, s.ProjectID)
+		if err != nil {
+			return fmt.Errorf("mark project for teardown: %w", err)
+		}
 
 		return nil
 	})
@@ -285,11 +351,22 @@ func (a *API) handleDeleteProject(w http.ResponseWriter, r *http.Request) error 
 		return err
 	}
 
-	if n == 0 {
+	if gone {
+		writeJSON(w, http.StatusNoContent, nil)
+
+		return nil
+	}
+
+	// A project that was neither deleted nor marked did not exist -- the guard
+	// resolved it, so this is a concurrent delete, and "not found" is the truth.
+	if !marked.DeletingAt.Valid {
 		return errNotFound("project not found")
 	}
 
-	writeJSON(w, http.StatusNoContent, nil)
+	// No kinds: every backend is marked, so backendKinds would render an empty list
+	// anyway, and the project is unresolvable from here on so nothing will re-read
+	// it. Passing nil says that plainly instead of spending a query to prove it.
+	writeJSON(w, http.StatusAccepted, newProject(marked, s.OrgSlug, nil, p))
 
 	return nil
 }

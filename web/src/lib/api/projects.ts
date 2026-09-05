@@ -55,13 +55,24 @@ export function updateProject(
 	return patch<Project>(`/orgs/${seg(org)}/projects/${seg(project)}`, body, opts);
 }
 
-/** `DELETE`. 204. **Org** admin, deliberately -- not project admin. */
+/**
+ * Deletes or tears down a project. **Org** admin, deliberately -- not project admin:
+ * this destroys every cache object, key and backend config in the project, and
+ * letting the recipient of a delegated role destroy the thing it was delegated over
+ * is the wrong default.
+ *
+ * Same two outcomes as `deleteBackend`, decided the same way: a project whose
+ * backends all hold nothing is deleted outright (**204**, resolves to `undefined`);
+ * one with cached data has its backends marked and answers **202** with the project,
+ * its `deleting_at` set. Either way the project stops resolving immediately, so this
+ * is the last response about it -- navigate away rather than re-fetching.
+ */
 export function deleteProject(
 	org: string,
 	project: string,
 	opts?: RequestOptions
-): Promise<void> {
-	return del<void>(`/orgs/${seg(org)}/projects/${seg(project)}`, opts);
+): Promise<Project | undefined> {
+	return del<Project | undefined>(`/orgs/${seg(org)}/projects/${seg(project)}`, opts);
 }
 
 /** B2b. Per-backend, unaggregated; counts are NULLABLE when nothing has measured. */

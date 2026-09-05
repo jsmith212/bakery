@@ -182,8 +182,17 @@ export interface Project {
 	name: string;
 	/** The caller's PROJECT role; absent when access comes from an org role. */
 	role?: ProjectRole;
-	/** The kinds configured on this project. */
+	/** The kinds configured on this project. A kind being torn down is not one. */
 	backends: BackendKind[];
+	/**
+	 * 000018's teardown mark, and it is only ever non-null on ONE response: the 202
+	 * that `DELETE /orgs/{org}/projects/{project}` answers when the project still
+	 * holds cache objects. After that mark the project resolves nowhere -- the same
+	 * statement backs the cache route resolver and the API's own `{project}` guard --
+	 * so nothing will ever fetch it again. Without the field that 202's body is
+	 * byte-identical to a live project.
+	 */
+	deleting_at: string | null;
 	created_at: string;
 	updated_at: string;
 }
@@ -379,6 +388,17 @@ export interface Backend {
 	retention_window: string | null;
 	/** LOGICAL bytes, not a disk figure. null is "no cap". */
 	quota_bytes: number | null;
+	/**
+	 * 000018's teardown mark. Non-null means the GC is emptying this backend and the
+	 * row goes as soon as its last object does.
+	 *
+	 * The list and get endpoints keep returning the row PRECISELY BECAUSE every other
+	 * reader treats it as absent -- the mount 404s, the snippet generator refuses it,
+	 * the object browser has nothing to show. Without this field the console's only
+	 * evidence that a delete was accepted is a backend that keeps existing and keeps
+	 * refusing to work, which reads as a bug rather than as progress.
+	 */
+	deleting_at: string | null;
 	created_at: string;
 	updated_at: string;
 }

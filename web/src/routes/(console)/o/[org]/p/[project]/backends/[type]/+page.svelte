@@ -1,13 +1,14 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
-	import { invalidateAll } from '$app/navigation';
+	import { goto, invalidateAll } from '$app/navigation';
 
-	import { updateBackend } from '$lib/api/backends';
+	import { deleteBackend, updateBackend } from '$lib/api/backends';
 	import { listCacheObjects } from '$lib/api/objects';
 	import { isApiError } from '$lib/api/errors';
 	import { tri } from '$lib/api/patch';
 	import type { BackendKind, CacheObject } from '$lib/api/types';
 	import { canAdminProject } from '$lib/roles';
+	import { projectPath } from '$lib/tenancy';
 	import { backendStatus } from '$lib/backendStatus';
 	import {
 		backendEndpoints,
@@ -46,7 +47,20 @@
 	const backend = $derived(data.backend);
 	const usageRow = $derived(data.usage.find((u) => u.kind === kind) ?? null);
 
-	const status = $derived(backendStatus({ kind, enabled: backend.enabled, usage: usageRow }));
+	const status = $derived(
+		backendStatus({
+			kind,
+			enabled: backend.enabled,
+			usage: usageRow,
+			deleting_at: backend.deleting_at
+		})
+	);
+
+	// A backend under teardown is read-only and unreachable: its mount 404s, its
+	// snippet is refused, and its objects are being deleted row by row. Every action
+	// on this page is therefore hidden while it is set -- offering Edit or a snippet
+	// for it would be offering something the server has already stopped honouring.
+	const deleting = $derived(backend.deleting_at !== null);
 	const canEdit = $derived(canAdminProject(data.me, project));
 
 	// yocto composes sstate/downloads/hashserv into one snippet; bazel-family
@@ -312,6 +326,52 @@
 			editPending = false;
 		}
 	}
+
+	// -------------------------------------------------------------------------
+	// Delete (000018). Two outcomes, and the BODY is what tells them apart: 204
+	// resolves to `undefined` (the backend is gone), 202 resolves to the backend with
+	// `deleting_at` set (the GC is emptying it). Either way this page's subject has
+	// stopped being reachable as a mount, so both land on the backends index.
+	// -------------------------------------------------------------------------
+
+	let showDelete = $state(false);
+	let deleteConfirm = $state('');
+	let deletePending = $state(false);
+	const deleteDisabled = $derived(deleteConfirm !== kind || deletePending);
+
+	function openDelete() {
+		deleteConfirm = '';
+		showDelete = true;
+	}
+
+	function closeDelete() {
+		if (deletePending) return;
+		showDelete = false;
+	}
+
+	async function confirmDelete() {
+		if (deleteDisabled) return;
+		deletePending = true;
+
+		try {
+			const result = await deleteBackend(org.slug, project.slug, kind);
+			pushToast({
+				variant: 'success',
+				title: result ? `Deleting ${kind}…` : `Deleted ${kind}`,
+				detail: result
+					? 'Its objects are being removed by the garbage collector.'
+					: undefined
+			});
+			// invalidateAll for the same reason the project settings page passes it: the
+			// parent layouts' data (the project's own `backends` kind list) is reused
+			// across this navigation and would still name the backend just deleted.
+			await goto(`${projectPath(org.slug, project.slug)}/backends`, { invalidateAll: true });
+		} catch (err) {
+			toastError(err, 'Could not delete backend');
+			deletePending = false;
+			showDelete = false;
+		}
+	}
 </script>
 
 <div class="flex items-center gap-1.5 text-sm text-text-3">
@@ -334,11 +394,13 @@
 			<span class="text-xs text-text-3">{status.caption}</span>
 		{/if}
 	</div>
-	<div class="flex items-center gap-2">
-		<Button href="/o/{org.slug}/p/{project.slug}/snippets?tool={snippetTool}" variant="secondary" size="md"
-			>Get config snippet</Button
-		>
-	</div>
+	{#if !deleting}
+		<div class="flex items-center gap-2">
+			<Button href="/o/{org.slug}/p/{project.slug}/snippets?tool={snippetTool}" variant="secondary" size="md"
+				>Get config snippet</Button
+			>
+		</div>
+	{/if}
 </div>
 
 <div class="grid grid-cols-4 gap-2">
@@ -362,7 +424,13 @@
      `lg`. -->
 <div class="grid grid-cols-1 items-start gap-2 lg:grid-cols-[minmax(0,1fr)_320px]">
 	<div class="flex min-w-0 flex-col gap-[14px]">
-		{#if kind === 'hashserv'}
+		{#if deleting}
+			<EmptyState
+				glyph="▲"
+				title="Tearing down"
+				desc="Objects are being removed by the garbage collector. The backend's mounts already 404, and the row goes as soon as its last object does."
+			/>
+		{:else if kind === 'hashserv'}
 			<EmptyState
 				glyph="∅"
 				title="Hash equivalence stores unihashes, not cache objects"
@@ -458,13 +526,37 @@
 			<div class="text-xs font-medium uppercase tracking-[var(--tracking-label)] text-text-3">
 				Config
 			</div>
-			{#if canEdit}
+			{#if canEdit && !deleting}
 				<Button variant="ghost" size="sm" onclick={openEdit}>Edit</Button>
 			{/if}
 		</div>
 		<KeyValueList pairs={configPairs} />
 	</div>
 </div>
+
+{#if canEdit && !deleting}
+	<section class="flex flex-col gap-3 rounded-2 border border-err-border bg-bg-1 p-[14px]">
+		<div class="text-xs font-medium tracking-[var(--tracking-label)] text-err uppercase">
+			Danger zone
+		</div>
+		<div class="flex items-center justify-between gap-3">
+			<div>
+				<div class="text-base text-text-1">Delete backend</div>
+				<div class="mt-0.5 text-sm text-text-3">
+					Unmounts <span class="font-mono text-text-1"
+						>/cache/{org.slug}/{project.slug}/{kind}</span
+					> immediately and hands its
+					<span class="tabular text-text-1">{formatCount(usageRow?.objects_count)}</span> objects to
+					the garbage collector. Every build pointed at this mount starts missing. This cannot be
+					undone.
+				</div>
+			</div>
+			<div class="flex-none">
+				<Button variant="danger" size="md" onclick={openDelete}>Delete backend</Button>
+			</div>
+		</div>
+	</section>
+{/if}
 
 {#if showEdit}
 	<Modal title="Edit {kind}" onclose={closeEdit}>
@@ -546,6 +638,34 @@
 			<Button variant="ghost" size="md" onclick={closeEdit} disabled={editPending}>Cancel</Button>
 			<Button variant="primary" size="md" onclick={submitEdit} disabled={editPending}>
 				{editPending ? 'Saving…' : 'Save changes'}
+			</Button>
+		{/snippet}
+	</Modal>
+{/if}
+
+{#if showDelete}
+	<Modal title="Delete {kind}" onclose={closeDelete}>
+		<div class="flex flex-col gap-3">
+			<div>
+				This unmounts <span class="font-mono text-text-1"
+					>/cache/{org.slug}/{project.slug}/{kind}</span
+				>
+				and deletes
+				<span class="font-semibold text-text-1"
+					>{formatCount(usageRow?.objects_count)} cached objects</span
+				>. A backend holding objects is emptied by the garbage collector, so the row may take a
+				sweep or two to disappear. This cannot be undone.
+			</div>
+			<Field label="Type the backend kind to confirm">
+				{#snippet children(f)}
+					<Input size="md" mono placeholder={kind} bind:value={deleteConfirm} {...f} />
+				{/snippet}
+			</Field>
+		</div>
+		{#snippet footer()}
+			<Button variant="ghost" size="md" onclick={closeDelete} disabled={deletePending}>Cancel</Button>
+			<Button variant="danger" size="md" disabled={deleteDisabled} onclick={confirmDelete}>
+				{deletePending ? 'Deleting…' : 'Delete backend'}
 			</Button>
 		{/snippet}
 	</Modal>

@@ -57,7 +57,8 @@
 					{ label: 'Overview', href: `${projectBase}/overview` },
 					{ label: 'Backends', href: `${projectBase}/backends` },
 					{ label: 'API keys', href: `${projectBase}/keys` },
-					{ label: 'Config snippets', href: `${projectBase}/snippets` }
+					{ label: 'Config snippets', href: `${projectBase}/snippets` },
+					{ label: 'Settings', href: `${projectBase}/settings` }
 				]
 			: []
 	);

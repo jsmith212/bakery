@@ -296,7 +296,20 @@ routes/(console)/+error.svelte renders a load failure in place, in console chrom
   /o/[org]/p/[project]/backends/new      (static wins over [type])
   /o/[org]/p/[project]/keys
   /o/[org]/p/[project]/snippets
+  /o/[org]/p/[project]/settings         (rename is project admin; delete is ORG admin)
 ```
+
+Note the two "Settings" nav items: one under PROJECT and one under ORG. They are
+different screens with different gates, and a Playwright locator must scope by `href`
+rather than by link name.
+
+**Danger zones** follow the org settings page verbatim: a `section` with
+`border-err-border`, an uppercase `text-err` micro-label reading exactly `Danger
+zone`, a one-line title plus a `text-text-3` paragraph naming REAL counts (never a
+generic warning), a right-aligned `Button variant="danger"`, and a confirm `Modal`
+whose primary button stays disabled until the typed text matches the slug (or, for a
+backend, the kind). A control the caller may not use is rendered DISABLED with a
+one-line caption saying why — never hidden, which leaves them hunting for it.
 
 The pre-tenancy flat routes (`/overview`, `/projects`, `/backends/[type]`,
 `/backends/new`, `/keys`, `/snippets`, `/members`, `/settings`) survive for one

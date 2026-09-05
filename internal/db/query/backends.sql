@@ -9,10 +9,19 @@
 
 -- COLD: route-cache fill only. One probe on cache_backends_project_id_kind_key.
 --
+-- `deleting_at IS NULL` IS THE ROUTE RESOLVER'S WHOLE VIEW OF TEARDOWN (000018). A
+-- marked backend must read as UNCONFIGURED here, not as a disabled or an empty one:
+-- CLAUDE.md's rule is that a project/kind with no cache_backends row 404s -- it never
+-- mounts a mount point it cannot serve -- and a backend the GC is actively emptying
+-- is exactly that. Filtering in the QUERY rather than in the resolver is what makes
+-- it structural: CachedResolver.load takes pgx.ErrNoRows as its 404, so there is no
+-- flag for a caller to forget to check and no second code path where a torn-down
+-- backend could still resolve.
+--
 -- name: GetBackend :one
 SELECT id, enabled, read_auth_required, config
   FROM cache_backends
- WHERE project_id = $1 AND kind = $2;
+ WHERE project_id = $1 AND kind = $2 AND deleting_at IS NULL;
 
 -- name: GetBackendByID :one
 SELECT * FROM cache_backends WHERE id = $1;
@@ -119,5 +128,122 @@ RETURNING *;
 -- still holds objects. Teardown goes through blob.Service's chunked purge, which
 -- the refcount trigger then makes arithmetically correct for free.
 --
+-- The API calls this ONLY on a backend it has just proved empty (BackendHasObjects
+-- below, in the same request): on anything else it marks deleting_at instead and
+-- lets the GC's teardown stage do the emptying. A 23503 from here is therefore a
+-- LOST RACE -- a build wrote an object between the probe and the delete -- and the
+-- handler falls back to the mark, which is the same answer it would have given had
+-- the probe seen that row.
+--
 -- name: DeleteBackend :execrows
 DELETE FROM cache_backends WHERE id = $1;
+
+-- ===========================================================================
+-- Teardown (000018). The API marks; the GC empties and then deletes.
+-- ===========================================================================
+
+-- Does this backend still hold anything a RESTRICT foreign key would refuse to let
+-- go? EXISTS, never count(*): the question is "any", cache_objects is the table sized
+-- in the tens of millions, and an exact count would scan the whole backend's slice to
+-- answer a boolean. hashserv is the one kind whose RESTRICT comes from somewhere else
+-- entirely (hashserv_unihashes / hashserv_outhashes, 000010) and it owns no
+-- cache_objects rows at all, so all three tables are asked here -- a hashserv backend
+-- that answered "empty" on cache_objects alone would be deleted straight into a
+-- foreign-key violation.
+--
+-- name: BackendHasObjects :one
+SELECT (EXISTS (SELECT 1 FROM cache_objects      o WHERE o.backend_id = sqlc.arg(backend_id))
+     OR EXISTS (SELECT 1 FROM hashserv_unihashes u WHERE u.backend_id = sqlc.arg(backend_id))
+     OR EXISTS (SELECT 1 FROM hashserv_outhashes h WHERE h.backend_id = sqlc.arg(backend_id))
+       )::boolean AS has_objects;
+
+-- The MARK. Idempotent by construction: coalesce keeps the ORIGINAL deleting_at, so a
+-- second DELETE on an already-deleting backend reports the same instant the first one
+-- did rather than restarting the clock -- and the handler can answer 202 again
+-- without a special case.
+--
+-- `enabled = false` rides along because the two facts are the same fact from a
+-- different angle, and because the GC's disabled clamp (least(configured, 30d)) is
+-- the right posture for a backend nobody can reach: if the teardown stage is somehow
+-- not running, the retention stages still shrink it.
+--
+-- name: MarkBackendDeleting :one
+UPDATE cache_backends
+   SET deleting_at = coalesce(deleting_at, now()),
+       enabled     = false
+ WHERE id = $1
+RETURNING *;
+
+-- Every backend of one project, marked in one statement -- DELETE /projects/{project}
+-- marks the whole set inside its own transaction, so a crash cannot leave half a
+-- project torn down and half of it live.
+--
+-- name: MarkProjectBackendsDeleting :execrows
+UPDATE cache_backends
+   SET deleting_at = coalesce(deleting_at, now()),
+       enabled     = false
+ WHERE project_id = $1;
+
+-- The empty ones go immediately, in the same transaction, so tearing down a project
+-- whose backends were only ever configured (the common case: someone made a typo)
+-- completes synchronously and answers 204 rather than parking a project in `deleting`
+-- for up to one GC interval with nothing to sweep.
+--
+-- The anti-joins mirror BackendHasObjects exactly, evaluated at DELETE time: a
+-- backend a build wrote to between the two statements simply is not deleted here and
+-- stays marked, which is the outcome the mark already provides for.
+--
+-- name: DeleteEmptyBackendsForProject :execrows
+DELETE FROM cache_backends cb
+ WHERE cb.project_id = $1
+   AND NOT EXISTS (SELECT 1 FROM cache_objects      o WHERE o.backend_id = cb.id)
+   AND NOT EXISTS (SELECT 1 FROM hashserv_unihashes u WHERE u.backend_id = cb.id)
+   AND NOT EXISTS (SELECT 1 FROM hashserv_outhashes h WHERE h.backend_id = cb.id);
+
+-- The teardown stage's worklist: every marked backend, with the slugs its metrics
+-- label on (CLAUDE.md: Prometheus labels are slugs, never ids) and the paired project
+-- so a fully-emptied project can be finished in the same pass.
+--
+-- Riding cache_backends_deleting_idx, the partial index 000018 creates: on a healthy
+-- installation this returns nothing, forever, and must cost nothing to ask.
+--
+-- name: ListBackendsForTeardown :many
+SELECT cb.id, cb.kind, cb.project_id, p.slug AS project_slug, o.slug AS org_slug
+  FROM cache_backends cb
+  JOIN projects p      ON p.id = cb.project_id
+  JOIN organizations o ON o.id = p.org_id
+ WHERE cb.deleting_at IS NOT NULL
+ ORDER BY cb.id;
+
+-- The last step of one backend's teardown. `deleting_at IS NOT NULL` is not
+-- decoration: it is what stops this statement from ever deleting a LIVE backend if a
+-- caller passes the wrong id, and what makes it a no-op (0 rows, not an error) if the
+-- mark was rolled back while the sweep was running.
+--
+-- A 23503 here means a build wrote an object after this run's snapshot was frozen --
+-- the write barrier spares such a row by design -- so the caller leaves the backend
+-- marked and finishes it on the next tick.
+--
+-- name: DeleteTornDownBackend :execrows
+DELETE FROM cache_backends WHERE id = $1 AND deleting_at IS NOT NULL;
+
+-- hashserv's teardown, and the reason it is not DeleteBatch's job: hashserv owns no
+-- cache_objects rows and no blobs, so there is no refcount to decrement, no byte to
+-- reclaim and no LRU entry to invalidate -- exactly the reasoning sweepHashserv
+-- already applies to stages 1 and 2. Chunked (ctid keyset via a LIMITed subquery)
+-- because a backend can hold millions of unihashes and one unbounded DELETE is one
+-- unbounded transaction.
+--
+-- name: PurgeHashservUnihashesChunk :execrows
+DELETE FROM hashserv_unihashes u
+ WHERE u.ctid IN (
+     SELECT c.ctid FROM hashserv_unihashes c
+      WHERE c.backend_id = sqlc.arg(backend_id) LIMIT sqlc.arg(chunk_limit)
+ );
+
+-- name: PurgeHashservOuthashesChunk :execrows
+DELETE FROM hashserv_outhashes h
+ WHERE h.ctid IN (
+     SELECT c.ctid FROM hashserv_outhashes c
+      WHERE c.backend_id = sqlc.arg(backend_id) LIMIT sqlc.arg(chunk_limit)
+ );
