@@ -1,9 +1,14 @@
 package gc
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/jsmith212/bakery/internal/blob"
 	"github.com/jsmith212/bakery/internal/db/repository"
 )
 
@@ -252,29 +257,180 @@ func TestTeardownDeletesTheProjectAfterItsLastBackend(t *testing.T) {
 	}
 }
 
-// TestTeardownKeepsAProjectWhoseBackendsRemain is the negative of the rule above, and
-// it is the one that would break silently: a project deleted while a backend still
-// referenced it would violate the foreign key, and a project deleted while a LIVE
-// backend still served traffic would leave a route resolving to nothing.
+// TestTeardownHealsABackendCreatedUnderADeletingProject is the STRANDED PROJECT, and
+// it is the failure that has no way out once it happens.
 //
-// The live backend here is NOT marked, which is a state handleDeleteProject never
-// creates -- it marks the whole set in one transaction. It is asserted anyway,
-// because the teardown stage's project step must decide on the anti-join and on
-// nothing else: a version that finished any marked project would delete this one.
-func TestTeardownKeepsAProjectWhoseBackendsRemain(t *testing.T) {
+// handleDeleteProject marks the project's backends and then the project, under READ
+// COMMITTED. Its row lock on the project did not conflict with a concurrent
+// POST .../backends -- a foreign key takes KEY SHARE on the parent, which NO KEY
+// UPDATE does not block -- so a backend could land UNMARKED under a project that was
+// already marked. That backend was in no worklist (the teardown listing asked
+// `cb.deleting_at IS NOT NULL` alone) and ListProjectsForTeardown's anti-join could
+// therefore never see zero backends. The project stayed in `deleting`: hidden from
+// every listing, holding its slug, un-unmarkable by any endpoint, forever.
+//
+// The state below is exactly that one -- a marked project, an UNMARKED backend holding
+// objects -- and the fix is two independent halves, both exercised here: the stage
+// marks the straggler (MarkBackendsOfDeletingProjects) and the listing finds it either
+// way (`OR p.deleting_at IS NOT NULL`).
+func TestTeardownHealsABackendCreatedUnderADeletingProject(t *testing.T) {
+	f := newFixture(t, testConfig())
+
+	straggler := f.backend(repository.BackendKindSstate, backendOpts{window: 90 * 24 * time.Hour})
+	f.put(straggler, nsDefault, "sstate:a", "a")
+
+	// No markDeleting on the backend: this is the row the race creates.
+	f.markProjectDeleting()
+
+	f.run()
+
+	if f.backendExists(straggler) {
+		t.Error("a backend created under a project already being torn down survived the tick")
+	}
+
+	if f.projectExists() {
+		t.Error("the project stayed stranded in `deleting` with its slug held")
+	}
+}
+
+// TestTeardownLeavesALiveProjectAlone is the other side of that disjunction. The
+// listing now asks about the PROJECT as well as the backend, so the test that matters
+// is that an unmarked backend under an unmarked project is still untouchable -- a
+// predicate that over-reached here would tear down live caches.
+func TestTeardownLeavesALiveProjectAlone(t *testing.T) {
 	f := newFixture(t, testConfig())
 
 	live := f.backend(repository.BackendKindSstate, backendOpts{window: 90 * 24 * time.Hour})
 	f.put(live, nsDefault, "sstate:a", "a")
 
-	f.markProjectDeleting()
 	f.run()
 
-	if !f.projectExists() {
-		t.Error("a marked project was deleted while a backend still referenced it")
+	if !f.backendExists(live) {
+		t.Error("a live backend under a live project was torn down")
 	}
 
-	if !f.backendExists(live) {
-		t.Error("an unmarked backend was torn down because its project was marked")
+	if !f.projectExists() {
+		t.Error("a live project was deleted")
+	}
+}
+
+// errStuckBackend is one backend's delete failing for a reason the sweep cannot fix --
+// a storage error, a lock timeout, a constraint nothing else explains.
+var errStuckBackend = errors.New("teardown: this backend cannot be emptied")
+
+// seedTeardownBackend puts one MARKED backend, with n objects, in front of the
+// teardown stage. The unit fakes are the right harness for these two: the subject is
+// the stage's LOOP -- whether one backend's failure ends the tick, and whether one
+// backend's size owns it -- and neither is a property of the schema.
+func seedTeardownBackend(q *fakeQueries, id int64, n int) {
+	q.teardown = append(q.teardown, repository.ListBackendsForTeardownRow{
+		ID: id, Kind: repository.BackendKindSstate, ProjectID: uuidOf(1),
+		ProjectSlug: "widget", OrgSlug: "acme",
+	})
+
+	cold := pgtype.Timestamptz{Time: q.startedAt.Add(-time.Hour), InfinityModifier: 0, Valid: true}
+
+	for i := range n {
+		q.addObject(id, repository.ScanObjectsForGCRow{
+			Namespace: nsDefault,
+			Key:       fmt.Sprintf("object-%05d", i),
+			Digest:    make([]byte, 32),
+			SizeBytes: 10,
+			CreatedAt: cold,
+			AccessedAt: pgtype.Timestamptz{
+				Time: time.Time{}, InfinityModifier: 0, Valid: false,
+			},
+			UpdatedAt:   cold,
+			ContentType: pgtype.Text{String: "", Valid: false},
+		})
+	}
+}
+
+// TestTeardownStuckBackendDoesNotStarveItsSiblings pins the log-and-continue rule.
+//
+// The stage used to return on the first backend that errored, and it runs FIRST in
+// every tick -- so one backend whose objects could not be deleted aborted the sweep
+// before stage 1, every tick, indefinitely. Every other teardown, the project
+// finisher, and all nine retention stages were starved by one row. The error must
+// still surface (the run lands `failed`), it just must not decide what the rest of the
+// tick gets to do.
+func TestTeardownStuckBackendDoesNotStarveItsSiblings(t *testing.T) {
+	eng, q, b := fakeEngine(t, testConfig())
+
+	seedTeardownBackend(q, 1, 2)
+	seedTeardownBackend(q, 2, 2)
+
+	b.deleteErr[1] = errStuckBackend
+
+	sum, err := eng.Run(t.Context(), TriggerAPI, false)
+	if err == nil {
+		t.Fatal("Run() error = nil, want the stuck backend's failure to surface")
+	}
+
+	if !errors.Is(err, errStuckBackend) {
+		t.Errorf("Run() error = %v, want it to wrap the stuck backend's error", err)
+	}
+
+	if len(q.dropped) != 1 || q.dropped[0] != 2 {
+		t.Errorf("dropped backends = %v, want only the healthy sibling (2)", q.dropped)
+	}
+
+	if q.count("ListProjectsForTeardown") != 1 {
+		t.Errorf("ListProjectsForTeardown ran %d times, want 1: the project finisher must "+
+			"still run after a backend fails", q.count("ListProjectsForTeardown"))
+	}
+
+	if sum.ObjectsDeleted != 2 {
+		t.Errorf("ObjectsDeleted = %d, want 2 (the sibling's objects)", sum.ObjectsDeleted)
+	}
+}
+
+// TestTeardownBudgetStopsAndResumes pins the per-tick object budget.
+//
+// purgeObjects used to loop until the backend was empty. On a ten-million-object
+// backend that is thousands of pages plus a --gc-batch-pause between each: one
+// teardown owning the whole --gc-interval while every other backend waits. The budget
+// caps it at teardownMaxPages pages, and the property that makes that safe is that the
+// backend RESUMES -- the keyset restarts from the sentinel over the rows that are
+// left, so nothing is skipped and the row is dropped only once it is really empty.
+func TestTeardownBudgetStopsAndResumes(t *testing.T) {
+	cfg := testConfig()
+	cfg.BatchSize = 2
+
+	eng, q, b := fakeEngine(t, cfg)
+
+	const total = 2*teardownMaxPages + 4
+
+	seedTeardownBackend(q, 1, total)
+
+	// The corpus has to shrink as the deletes land, the way the real scan's does.
+	b.onDelete = func(refs []blob.DeleteRef) { q.removeObjects(refs) }
+
+	first, err := eng.Run(t.Context(), TriggerAPI, false)
+	if err != nil {
+		t.Fatalf("first Run() error = %v", err)
+	}
+
+	if first.ObjectsDeleted != int64(cfg.BatchSize*teardownMaxPages) {
+		t.Errorf("first tick deleted %d objects, want the budget (%d)",
+			first.ObjectsDeleted, cfg.BatchSize*teardownMaxPages)
+	}
+
+	if len(q.dropped) != 0 {
+		t.Errorf("dropped = %v, want none: the backend is not empty yet", q.dropped)
+	}
+
+	second, err := eng.Run(t.Context(), TriggerAPI, false)
+	if err != nil {
+		t.Fatalf("second Run() error = %v", err)
+	}
+
+	if second.ObjectsDeleted != int64(total-cfg.BatchSize*teardownMaxPages) {
+		t.Errorf("second tick deleted %d objects, want the remainder (%d)",
+			second.ObjectsDeleted, total-cfg.BatchSize*teardownMaxPages)
+	}
+
+	if len(q.dropped) != 1 || q.dropped[0] != 1 {
+		t.Errorf("dropped = %v, want the backend row removed once it was really empty", q.dropped)
 	}
 }

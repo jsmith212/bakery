@@ -2,10 +2,15 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/jsmith212/bakery/internal/slug"
 )
@@ -147,6 +152,71 @@ func TestCreateProjectRejectsReservedSlugs(t *testing.T) {
 
 			if got := decodeErr(t, w).Code; got != CodeReservedSlug {
 				t.Errorf("error code = %q, want %q", got, CodeReservedSlug)
+			}
+		})
+	}
+}
+
+// TestCreateProjectDistinguishesADeletingSlug is the 23505 that needs two messages.
+//
+// A project being TORN DOWN is hidden from every listing, for everyone, site admins
+// included -- so an admin who reuses its slug is told "that slug is already taken",
+// looks at the org's projects, finds nothing with that name, and has no way to learn
+// why or whether waiting helps. It does: the slug frees up the moment the GC finishes
+// emptying the project's backends. That is the only sentence that tells them what to
+// do, and the ordinary "taken" case must keep the wording it had.
+func TestCreateProjectDistinguishesADeletingSlug(t *testing.T) {
+	orgAdmin := principals(t)["org_admin"]
+	acme := mustUUID(t, orgAcmeID)
+	taken := &pgconn.PgError{Code: pgUniqueViolation, ConstraintName: "projects_org_id_slug_key"}
+
+	tests := []struct {
+		name     string
+		deleting bool
+		want     string
+	}{
+		{
+			name: "a live project holding the slug keeps the generic wording",
+			want: "that slug is already taken",
+		},
+		{
+			name:     "a project being torn down says the slug comes back",
+			deleting: true,
+			want:     "a project with this slug is being torn down; the slug frees up when that finishes",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := fixtureStore(t)
+			store.txErr = fmt.Errorf("create project %q: %w", "firmware", taken)
+
+			if tt.deleting {
+				for i := range store.projects {
+					if store.projects[i].OrgID == acme && store.projects[i].Slug == "firmware" {
+						store.projects[i].DeletingAt = pgtype.Timestamptz{
+							Time: time.Now(), InfinityModifier: 0, Valid: true,
+						}
+					}
+				}
+			}
+
+			a := testAPI(t, store, nil)
+
+			w := do(t, a, orgAdmin, http.MethodPost, Prefix+"/orgs/acme/projects",
+				`{"slug":"firmware","name":"Firmware"}`)
+
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409 (body %s)", w.Code, w.Body.String())
+			}
+
+			detail := decodeErr(t, w)
+			if detail.Code != CodeConflict {
+				t.Errorf("code = %q, want %q", detail.Code, CodeConflict)
+			}
+
+			if detail.Message != tt.want {
+				t.Errorf("message = %q, want %q", detail.Message, tt.want)
 			}
 		})
 	}

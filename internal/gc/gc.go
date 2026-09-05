@@ -167,6 +167,7 @@ type Queries interface {
 	// the teardown somehow stalls -- so these are separate, and they ride the two
 	// partial indexes 000018 creates: on a healthy installation both listings are
 	// empty forever and must cost nothing to ask.
+	MarkBackendsOfDeletingProjects(ctx context.Context) (int64, error)
 	ListBackendsForTeardown(ctx context.Context) ([]repository.ListBackendsForTeardownRow, error)
 	DeleteTornDownBackend(ctx context.Context, id int64) (int64, error)
 	PurgeHashservUnihashesChunk(
@@ -398,6 +399,16 @@ type Engine struct {
 	// same aggregate.
 	measureFlight singleflight.Group
 
+	// measureAttempts is when each project's read-triggered measurement was last
+	// ATTEMPTED -- successful or not. It is the backoff the freshness gate cannot
+	// provide: that gate reads measured_at, which is written only on SUCCESS, so a
+	// project whose aggregate exceeds measureTimeout is permanently stale and
+	// re-measured by every single dashboard load, forever, at a cost that is by
+	// definition more than ten seconds of database time each. Keyed on the project
+	// uuid's string form, the same key the singleflight uses.
+	measureAttemptsMu sync.Mutex
+	measureAttempts   map[string]time.Time
+
 	// rampUntil is gc_state.touch_ramp_until as unix nanos, read ONCE at boot
 	// (LoadTouchRamp) and read on every toucher tick by TouchStaleness. Zero means
 	// "not read yet", which resolves to the RAMPED (conservative, fewer writes)
@@ -474,7 +485,9 @@ func New(ctx context.Context, deps Deps, cfg Config) (*Engine, error) {
 		measured:   map[int64]time.Time{},
 		lastUsage:  map[int64]snapshot{},
 
-		measureFlight: singleflight.Group{},
+		measureFlight:     singleflight.Group{},
+		measureAttemptsMu: sync.Mutex{},
+		measureAttempts:   map[string]time.Time{},
 
 		rampUntil: atomic.Int64{},
 	}

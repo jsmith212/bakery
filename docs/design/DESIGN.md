@@ -676,6 +676,38 @@ tested BEFORE `enabled`, because the mark sets `enabled = false` too. While a ba
 is deleting its Edit, snippet and object-browser affordances are replaced by a
 "Tearing down" EmptyState.
 
+**Review follow-ups (same day).** Four things the first cut got wrong, all now closed.
+(1) **The stranded project.** The delete transaction's row lock did not conflict with a
+concurrent `POST .../backends` — a foreign key takes KEY SHARE on the parent and
+`MarkProjectDeleting` takes NO KEY UPDATE — so a backend created mid-delete landed
+UNMARKED under a marked project, appeared in no worklist, and left the project in
+`deleting` forever: hidden from every listing, holding its slug, with no endpoint that
+could un-mark it. Closed three ways at once, none depending on the others: an explicit
+`LockProjectForTeardown` (`FOR UPDATE`, taken after the member users) in the delete
+transaction; `MarkBackendsOfDeletingProjects` as the first statement of every teardown
+stage; and `ListBackendsForTeardown`'s predicate widened to
+`cb.deleting_at IS NOT NULL OR p.deleting_at IS NOT NULL`. (2) **The role split.** The
+MARK branch of `DELETE .../backends/{kind}` now requires an org admin (the route stays
+`AccessProjectAdmin`; the empty-delete 204 stays project admin), because RESTRICT used
+to make destroying a used backend impossible for anyone and landing the teardown
+without a role change silently promoted a delegated role into a destructive one — the
+same reasoning that already put project deletion behind org admin. (3) **Starvation.**
+The stage runs first in every tick, so one backend whose delete errored aborted the
+whole sweep before stage 1, indefinitely; failures are now logged per backend and the
+first is returned only after the loop and after the project finisher. (4) **The
+interval.** `purgeObjects`/`purgeHashserv` looped until empty; both are now bounded by
+`teardownMaxPages` (20) pages of `--gc-batch-size`, and a large teardown simply resumes
+on the next tick — the keyset restarts from the sentinel over what is left, so nothing
+is skipped and the row is dropped only when it is really empty.
+
+**Accepted trade (not fixed):** a torn-down `registry` backend reads as *absent* to
+`BuildCache.serve`, whose static shadow then hands the read back to the OCI mirror
+(`serveTail`) — so a buildcache pull against a project being torn down can burn one
+upstream fetch on a verified principal instead of missing locally. It is bounded by the
+teardown's own duration, it is the behaviour an unconfigured `registry` backend has
+always had, and the alternative — teaching the shadow about `deleting_at` — would put a
+second resolver probe on the buildcache hot path to change a miss into a different miss.
+
 **What this did NOT build (recorded):** un-marking a teardown through the API (the
 recovery lever is a database rollback — republishing a mount whose objects the GC has
 been deleting is the one failure the whole design avoids); a progress figure for a
@@ -715,9 +747,19 @@ restores the old behaviour exactly). Three guards deep: the window, the singlefl
 and a hard 10s ceiling past which the **stale row is served unchanged** — not a
 fallback but the contract, since `measured_at` rides on every figure. A failed
 measurement never fails the read. `POST .../usage/measure` is the explicit Refresh:
-ProjectRead, rate-limited server-side to one measurement per project per 10s, and
-**always 200** — "you asked too soon" is not a condition a dashboard can act on.
-`--gc-usage-interval` drops 6h → **1h** as the backstop.
+ProjectRead, rate-limited server-side, and **always 200** — "you asked too soon" is not
+a condition a dashboard can act on. `--gc-usage-interval` drops 6h → **1h** as the
+backstop.
+
+**Review follow-up (same day): the rate limit had to move off `measured_at`.** Both
+gates — the read's freshness window and the Refresh button's own 10s floor — asked how
+old the last *successful* measurement was, and `measured_at` is written only on success.
+So a project whose aggregate exceeds the 10s ceiling stayed permanently stale, and every
+single dashboard load re-ran the most expensive query in the installation, forever, with
+the number never moving. The floor is now `gc.MinMeasureInterval` (30s), kept in the
+engine, keyed on the last **attempt** whatever its outcome, and it covers both entry
+points — one mechanism rather than two that can disagree. Refusing there is a silent
+no-op: the handler serves the row on file, and `measured_at` says how old it is.
 
 **Org usage stays on the backstop, deliberately.** `GET /orgs/{org}/usage` is one
 request that would fan out into one aggregate per project — over every `cache_objects`

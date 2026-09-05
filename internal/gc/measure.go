@@ -55,6 +55,28 @@ import (
 // worse answer to the same question.
 const measureTimeout = 10 * time.Second
 
+// MinMeasureInterval is the FLOOR between two read-triggered measurements of the same
+// project, counted from the last ATTEMPT rather than the last success, and it is the
+// only rate limit on this path.
+//
+// The freshness gate cannot be that limit and never could. It reads measured_at, and
+// measured_at is written only when a measurement SUCCEEDS -- so a project whose
+// aggregate does not finish inside measureTimeout, or whose measurement errors, keeps
+// exactly the measured_at it had. It is stale on the next page load, and the one after
+// that, and every one after that: the console re-runs a ten-second aggregate on the
+// biggest project in the installation on every dashboard open, forever, and the only
+// symptom is that the number never updates. The same hole was open on the explicit
+// refresh (POST .../usage/measure), whose own ten-second gate read the same column.
+//
+// So the attempt is what is remembered, and BOTH entry points come through here --
+// there is one mechanism, not a handler-side one and an engine-side one that can
+// disagree about what "recently" means. Refusing is not an error: MeasureProject
+// returns nil and the caller serves the row on file, whose measured_at says how old it
+// is. Thirty seconds is longer than the ten-second ceiling on one attempt, which is the
+// property that matters -- a timing-out project is not re-attempted before the previous
+// attempt could possibly have finished.
+const MinMeasureInterval = 30 * time.Second
+
 // MeasureProject measures ONE project's backends and writes their usage rows.
 //
 // SINGLEFLIGHT, KEYED ON THE PROJECT. Several people opening the same project's
@@ -71,6 +93,15 @@ const measureTimeout = 10 * time.Second
 func (e *Engine) MeasureProject(ctx context.Context, projectID pgtype.UUID) error {
 	key := projectID.String()
 
+	// THE BACKOFF IS TAKEN BEFORE THE FLIGHT, and it is a claim, not a question: the
+	// attempt time is stamped by whichever caller wins, so a second caller inside the
+	// window is refused rather than joining. Joining would be wrong here -- the flight
+	// it would join is the one that is already too slow, and the caller would inherit
+	// its full timeout for a figure it is happy to serve stale.
+	if !e.claimMeasureAttempt(key) {
+		return nil
+	}
+
 	ch := e.measureFlight.DoChan(key, func() (any, error) {
 		// The flight's own bounded context, derived from the ENGINE LIFETIME rather than
 		// from the request that happened to start it: a shared flight must not be
@@ -79,7 +110,22 @@ func (e *Engine) MeasureProject(ctx context.Context, projectID pgtype.UUID) erro
 		flightCtx, cancel := context.WithTimeout(e.lifetime, measureTimeout)
 		defer cancel()
 
-		return nil, e.measureProjectNow(flightCtx, projectID)
+		measured, err := e.measureProjectNow(flightCtx, projectID)
+
+		// A project with NOTHING MEASURABLE does not consume the window. The aggregate
+		// returned no rows, which means the project configures no measurable backend at
+		// all -- a trivial index lookup on cache_backends that cannot be the expensive
+		// query this backoff exists to stop, and nothing was written, so there is nothing
+		// on file for the next caller to be served instead. Holding the window here would
+		// mean a backend created seconds after someone opened the project's overview reads
+		// "not yet measured" until the window expired, with the Refresh button doing
+		// nothing -- the exact "the numbers never move" complaint this whole feature
+		// exists to fix, reintroduced by its own rate limit.
+		if err == nil && measured == 0 {
+			e.releaseMeasureAttempt(key)
+		}
+
+		return nil, err
 	})
 
 	select {
@@ -91,11 +137,11 @@ func (e *Engine) MeasureProject(ctx context.Context, projectID pgtype.UUID) erro
 }
 
 // measureProjectNow is the measurement itself: one aggregate, then one upsert and one
-// gauge publish per backend.
-func (e *Engine) measureProjectNow(ctx context.Context, projectID pgtype.UUID) error {
+// gauge publish per backend. It reports how many backends it wrote.
+func (e *Engine) measureProjectNow(ctx context.Context, projectID pgtype.UUID) (int, error) {
 	rows, err := e.db.MeasureProjectUsage(ctx, projectID)
 	if err != nil {
-		return fmt.Errorf("measure project usage: %w", err)
+		return 0, fmt.Errorf("measure project usage: %w", err)
 	}
 
 	at := time.Now()
@@ -104,7 +150,7 @@ func (e *Engine) measureProjectNow(ctx context.Context, projectID pgtype.UUID) e
 		if err := e.db.UpsertBackendUsage(ctx, repository.UpsertBackendUsageParams{
 			BackendID: r.BackendID, ObjectsCount: r.ObjectsCount, LogicalBytes: r.LogicalBytes,
 		}); err != nil {
-			return fmt.Errorf("record usage for backend %d: %w", r.BackendID, err)
+			return 0, fmt.Errorf("record usage for backend %d: %w", r.BackendID, err)
 		}
 
 		var quota int64
@@ -130,5 +176,35 @@ func (e *Engine) measureProjectNow(ctx context.Context, projectID pgtype.UUID) e
 	e.log.DebugContext(ctx, "measured a project's usage on read",
 		slog.Int("backends", len(rows)))
 
-	return nil
+	return len(rows), nil
+}
+
+// claimMeasureAttempt records an attempt and reports whether the caller may make one.
+//
+// Attempts are remembered per project and never expired on a timer: the map is bounded
+// by the number of projects whose usage anyone has ever looked at in this process's
+// lifetime, which is bounded by the number of projects, and each entry is a uuid string
+// and a time. A sweep would cost more than it saves.
+func (e *Engine) claimMeasureAttempt(key string) bool {
+	now := time.Now()
+
+	e.measureAttemptsMu.Lock()
+	defer e.measureAttemptsMu.Unlock()
+
+	if last, ok := e.measureAttempts[key]; ok && now.Sub(last) < MinMeasureInterval {
+		return false
+	}
+
+	e.measureAttempts[key] = now
+
+	return true
+}
+
+// releaseMeasureAttempt undoes a claim, so the window is not held by a flight that
+// measured nothing. See MeasureProject's flight body for when that is right.
+func (e *Engine) releaseMeasureAttempt(key string) {
+	e.measureAttemptsMu.Lock()
+	defer e.measureAttemptsMu.Unlock()
+
+	delete(e.measureAttempts, key)
 }

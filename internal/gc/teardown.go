@@ -69,6 +69,36 @@ import (
 // cannot be deleted for as long as the brake is on -- the exact state 000018 exists
 // to end. Layer B's mark stays halted, so the bytes still sit in the grace window
 // and the brake still does what it is for.
+//
+// # And it runs BEFORE the access-toucher force-flushes, which is only safe because
+// # it has no accessed_at predicate
+//
+// Every other cache_objects stage runs strictly AFTER flushAccessMarks (and stage 1
+// after flushUnihashMarks) because its liveness rule reads
+// `coalesce(accessed_at, created_at)`: a mark still sitting in memory makes a key a
+// build read minutes ago look ninety days cold. This stage reads neither column. Its
+// worklist is "every object of a backend a human asked us to delete", and no in-memory
+// mark can change that answer -- the flush that lands later UPDATEs rows this stage has
+// already deleted, which is a no-op, not a lost write.
+//
+// So the ordering is free HERE and nowhere else: adding ANY accessed_at-sensitive
+// predicate to this stage -- a "do not tear down a backend still being read" guard, a
+// per-object age floor -- would make the pre-flush position wrong and require moving
+// the stage below flushUnihashMarks/flushAccessMarks in sweep(). The position is a
+// consequence of the missing predicate, not an independent choice.
+//
+// # ONE STUCK BACKEND MUST NOT STARVE THE REST OF THE SWEEP
+//
+// Two shapes of that failure, and both are fixed here rather than tolerated. A backend
+// whose delete errors used to abort the whole sweep before stage 1, so a single broken
+// teardown halted every retention stage and every other teardown in the installation,
+// every tick, indefinitely; now each backend is logged and skipped, the FIRST error is
+// kept, and it is returned only after the loop and after finishTornDownProjects, so the
+// run still reports failed while its siblings still make progress. And a ten-million
+// -object backend used to loop until empty inside one tick, owning the entire interval;
+// now every per-backend purge is bounded by teardownMaxPages and simply resumes on the
+// next tick. Neither bound changes what is deleted -- only how long one backend may hold
+// the sweep.
 
 // teardownChunk is the row count for the hashserv purge's LIMITed DELETE. It reuses
 // --gc-batch-size rather than a knob of its own, for the same reason every other
@@ -77,6 +107,22 @@ func (e *Engine) teardownChunk() int32 {
 	//nolint:gosec // BatchSize is a bounded config knob, normalized in New
 	return int32(e.cfg.BatchSize)
 }
+
+// teardownMaxPages is ONE BACKEND'S OBJECT BUDGET FOR ONE TICK, in --gc-batch-size
+// pages. Not a knob, because it is not a policy: it is the shape of the loop.
+//
+// Without it, purgeObjects runs until the backend is empty. On a ten-million-object
+// backend at the default batch size that is thousands of pages plus a --gc-batch-pause
+// between each, so one teardown owns the whole --gc-interval and every other backend
+// -- torn down or merely retained -- waits for it. With it, the teardown makes
+// batch x pages of progress every tick and yields; the keyset cursor restarts from the
+// ("", "") sentinel on the next tick and walks the rows that are left, so nothing is
+// skipped and nothing is done twice. A teardown finishing over several ticks instead
+// of one is invisible to everyone: the backend already 404s.
+//
+// Twenty is chosen against the pause, not against the row count: at the default pacing
+// twenty pages is a small fraction of a tick, which is the property that matters.
+const teardownMaxPages = 20
 
 // sweepTeardown empties and then removes every marked backend, and finishes every
 // marked project whose last backend has gone.
@@ -91,22 +137,81 @@ func (e *Engine) sweepTeardown(
 		return nil
 	}
 
+	firstErr := e.markStragglers(ctx)
+
 	stmtCtx, cancel := chunkCtx(ctx)
 	rows, err := e.db.ListBackendsForTeardown(stmtCtx)
 
 	cancel()
 
 	if err != nil {
-		return fmt.Errorf("list backends for teardown: %w", err)
+		return errors.Join(firstErr, fmt.Errorf("list backends for teardown: %w", err))
 	}
 
 	for _, b := range rows {
-		if err := e.tearDownBackend(ctx, run.ID, b, sum); err != nil {
-			return err
+		// A cancelled context is not one backend's failure -- it is the sweep ending --
+		// so it stops the loop instead of being logged per backend.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.Join(firstErr, ctxErr)
+		}
+
+		if tdErr := e.tearDownBackend(ctx, run.ID, b, sum); tdErr != nil {
+			// LOG AND CONTINUE. One backend whose objects cannot be deleted -- a storage
+			// error, a lock timeout, a constraint nothing else in the schema can explain --
+			// must not take its siblings, the project finisher, or stages 1-10 down with it.
+			// The error is kept and returned below so the run still lands `failed` and the
+			// operator still sees it; it just no longer decides what the rest of the tick
+			// gets to do.
+			e.log.ErrorContext(ctx, "tearing down a cache backend failed; continuing with the rest",
+				slog.String("org", b.OrgSlug), slog.String("project", b.ProjectSlug),
+				slog.String("kind", string(b.Kind)), slog.Int64("backend", b.ID),
+				slog.Any("error", tdErr))
+
+			if firstErr == nil {
+				firstErr = tdErr
+			}
 		}
 	}
 
-	return e.finishTornDownProjects(ctx)
+	if finishErr := e.finishTornDownProjects(ctx); finishErr != nil && firstErr == nil {
+		firstErr = finishErr
+	}
+
+	return firstErr
+}
+
+// markStragglers brings every backend under a marked project into the marked state,
+// and it is the self-healing half of the stranded-project fix.
+//
+// DELETE /projects/{project} marks the project's backends and the project in one READ
+// COMMITTED transaction, and now takes the projects row FOR UPDATE first so a
+// concurrent POST .../backends serialises behind it. That is the prevention. This is
+// the cure, for the rows that predate the fix or arrive through some path nobody
+// anticipated: an UNMARKED backend under a marked project is in no worklist, so the
+// project's anti-join never sees zero backends, and the project sits in `deleting`
+// forever -- hidden from every listing, holding its slug, un-unmarkable through any
+// API. One idempotent UPDATE per tick, on a partial index that is empty on a healthy
+// installation, ends that state permanently.
+//
+// A failure here is NOT fatal to the stage: ListBackendsForTeardown's own
+// `OR p.deleting_at IS NOT NULL` finds the same rows without it, so the tick still
+// tears them down and only the control plane's view of them is briefly wrong.
+func (e *Engine) markStragglers(ctx context.Context) error {
+	stmtCtx, cancel := chunkCtx(ctx)
+	n, err := e.db.MarkBackendsOfDeletingProjects(stmtCtx)
+
+	cancel()
+
+	if err != nil {
+		return fmt.Errorf("mark backends of deleting projects: %w", err)
+	}
+
+	if n > 0 {
+		e.log.InfoContext(ctx, "marked backends that were created under a project already being torn down",
+			slog.Int64("backends", n))
+	}
+
+	return nil
 }
 
 // tearDownBackend empties ONE marked backend and, if it succeeded, removes its row.
@@ -116,11 +221,12 @@ func (e *Engine) tearDownBackend(
 	before := sum.ObjectsDeleted
 	beforeBytes := sum.LogicalBytesFreed
 
-	if err := e.purgeObjects(ctx, runID, b, sum); err != nil {
+	done, err := e.purgeObjects(ctx, runID, b, sum)
+	if err != nil {
 		return err
 	}
 
-	rows, err := e.purgeHashserv(ctx, b, sum)
+	rows, hashDone, err := e.purgeHashserv(ctx, b, sum)
 	if err != nil {
 		return err
 	}
@@ -133,6 +239,18 @@ func (e *Engine) tearDownBackend(
 	// a backend nobody can look up is noise.
 	e.publishRunBackend(ctx, runID, b.ID,
 		sum.ObjectsDeleted-before+rows, sum.LogicalBytesFreed-beforeBytes, false)
+
+	// BUDGET EXHAUSTED means "more to do", not "failed". Dropping the row now would
+	// hit the RESTRICT foreign key that is still holding, so the attempt is skipped
+	// outright rather than made and forgiven: the backend stays marked and the next
+	// tick continues from where this one stopped.
+	if !done || !hashDone {
+		e.log.InfoContext(ctx, "backend teardown used its per-tick budget; it will continue on the next run",
+			slog.String("org", b.OrgSlug), slog.String("project", b.ProjectSlug),
+			slog.String("kind", string(b.Kind)), slog.Int64("backend", b.ID))
+
+		return nil
+	}
 
 	return e.dropBackendRow(ctx, b, sum.ObjectsDeleted-before+rows)
 }
@@ -148,15 +266,20 @@ func (e *Engine) tearDownBackend(
 // (ErrMixedDeleteBatch), so a page that spans a namespace boundary is split into
 // runs and issued as several batches, which costs nothing: the boundary can be
 // crossed at most once per namespace for the whole backend.
+//
+// PER-TICK BUDGET. The walk stops after teardownMaxPages pages and reports done=false;
+// the caller then leaves the backend marked and the next tick resumes from the ("", "")
+// sentinel over the rows that are left. Without the bound a large backend owns the
+// whole GC interval (see the package block).
 func (e *Engine) purgeObjects(
 	ctx context.Context, runID int64, b repository.ListBackendsForTeardownRow, sum *Summary,
-) error {
+) (bool, error) {
 	backend := backendOf(b.Kind)
 	afterNamespace, afterKey := nsDefault, ""
 
-	for {
+	for page := 0; page < teardownMaxPages; page++ {
 		if err := ctx.Err(); err != nil {
-			return err
+			return false, err
 		}
 
 		stmtCtx, cancel := chunkCtx(ctx)
@@ -172,28 +295,33 @@ func (e *Engine) purgeObjects(
 		cancel()
 
 		if err != nil {
-			return fmt.Errorf("scan backend %d for teardown: %w", b.ID, err)
+			return false, fmt.Errorf("scan backend %d for teardown: %w", b.ID, err)
 		}
 
 		if len(rows) == 0 {
-			return nil
+			return true, nil
 		}
 
 		last := rows[len(rows)-1]
 		afterNamespace, afterKey = last.Namespace, last.Key
 
 		if err := e.deletePage(ctx, runID, b, backend, rows, sum); err != nil {
-			return err
+			return false, err
 		}
 
+		// A short page is the end of the backend's slice of the btree, not the end of the
+		// budget: it means the scan found fewer rows than it asked for, so there is
+		// nothing after it.
 		if len(rows) < e.cfg.BatchSize {
-			return nil
+			return true, nil
 		}
 
 		if err := e.pause(ctx); err != nil {
-			return err
+			return false, err
 		}
 	}
+
+	return false, nil
 }
 
 // deletePage issues one DeleteBatch per namespace run within a scanned page.
@@ -291,11 +419,15 @@ func teardownKindLabel(namespace string) string {
 // The order is the GC's own root ordering, one level down: unihashes are the root
 // and outhashes hang off them, so the root goes first here exactly as it does in
 // stage 1 before stage 2.
+//
+// It carries the SAME per-tick budget purgeObjects does, per table, and for the same
+// reason: a backend can hold millions of unihashes, and draining all of them inside one
+// tick is the shape that starves every other backend.
 func (e *Engine) purgeHashserv(
 	ctx context.Context, b repository.ListBackendsForTeardownRow, sum *Summary,
-) (int64, error) {
+) (int64, bool, error) {
 	if b.Kind != repository.BackendKindHashserv {
-		return 0, nil
+		return 0, true, nil
 	}
 
 	var total int64
@@ -313,9 +445,11 @@ func (e *Engine) purgeHashserv(
 				repository.PurgeHashservOuthashesChunkParams{BackendID: id, ChunkLimit: n})
 		}},
 	} {
-		for {
+		drained := false
+
+		for page := 0; page < teardownMaxPages; page++ {
 			if err := ctx.Err(); err != nil {
-				return total, err
+				return total, false, err
 			}
 
 			stmtCtx, cancel := chunkCtx(ctx)
@@ -324,23 +458,31 @@ func (e *Engine) purgeHashserv(
 			cancel()
 
 			if err != nil {
-				return total, fmt.Errorf("purge hashserv %s for backend %d: %w", purge.what, b.ID, err)
+				return total, false, fmt.Errorf("purge hashserv %s for backend %d: %w", purge.what, b.ID, err)
 			}
 
 			total += n
 			sum.HashservRows += n
 
 			if n < int64(e.cfg.BatchSize) {
+				drained = true
+
 				break
 			}
 
 			if err := e.pause(ctx); err != nil {
-				return total, err
+				return total, false, err
 			}
+		}
+
+		if !drained {
+			// Out of budget on this table. The next table is not attempted -- outhashes hang
+			// off unihashes, and the root goes first here exactly as it does in stage 1.
+			return total, false, nil
 		}
 	}
 
-	return total, nil
+	return total, true, nil
 }
 
 // dropBackendRow removes the emptied backend, tolerating the one failure that is not

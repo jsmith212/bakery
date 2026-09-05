@@ -304,3 +304,71 @@ func countGCRuns(t *testing.T, f *fixture) int64 {
 
 	return n
 }
+
+// TestMeasureProjectBacksOffAfterAFailedAttempt is the backoff, and the bug it closes
+// is a self-inflicted denial of service on the biggest project in the installation.
+//
+// The freshness gate that decides whether a page load measures reads measured_at, and
+// measured_at is written only when a measurement SUCCEEDS. A project whose aggregate
+// exceeds measureTimeout therefore stays stale FOREVER: every dashboard load sees a
+// stale row, starts another ten-second aggregate, times out, writes nothing, and the
+// next load does it again. The row never moves and the database never stops. The same
+// hole was open on the explicit refresh, whose own gate read the same column.
+//
+// So the attempt is what is remembered, and it is remembered whatever the outcome.
+func TestMeasureProjectBacksOffAfterAFailedAttempt(t *testing.T) {
+	eng, q, _ := fakeEngine(t, testConfig())
+
+	q.measureErr = context.DeadlineExceeded
+	project := uuidOf(7)
+
+	if err := eng.MeasureProject(t.Context(), project); err == nil {
+		t.Fatal("MeasureProject() error = nil, want the failed attempt to surface")
+	}
+
+	// The second caller is refused, and refusing is a NO-OP, not an error: the handler
+	// serves the row on file, whose measured_at says how old it is.
+	if err := eng.MeasureProject(t.Context(), project); err != nil {
+		t.Errorf("MeasureProject() inside the interval error = %v, want nil", err)
+	}
+
+	if got := q.count("MeasureProjectUsage"); got != 1 {
+		t.Errorf("MeasureProjectUsage ran %d times, want 1: a failed attempt must back off", got)
+	}
+
+	// A DIFFERENT project is not held back by this one's attempt.
+	if err := eng.MeasureProject(t.Context(), uuidOf(8)); err == nil {
+		t.Error("MeasureProject() for another project was refused; the backoff is per project")
+	}
+
+	if got := q.count("MeasureProjectUsage"); got != 2 {
+		t.Errorf("MeasureProjectUsage ran %d times, want 2 across two projects", got)
+	}
+}
+
+// TestMeasureProjectDoesNotHoldTheWindowOnAnEmptyProject is the exception the backoff
+// needs, and without it the rate limit reintroduces the complaint the whole feature
+// exists to answer.
+//
+// A project that configures no measurable backend aggregates to NO ROWS: a trivial
+// index lookup on cache_backends, which cannot be the expensive query the backoff
+// guards against, and which writes nothing -- so there is no stale row for the next
+// caller to be served instead. Holding the window there means a backend created
+// seconds after somebody opened the project overview reads "not yet measured" until it
+// expires, with Refresh doing nothing.
+func TestMeasureProjectDoesNotHoldTheWindowOnAnEmptyProject(t *testing.T) {
+	eng, q, _ := fakeEngine(t, testConfig())
+
+	project := uuidOf(9)
+
+	for range 3 {
+		if err := eng.MeasureProject(t.Context(), project); err != nil {
+			t.Fatalf("MeasureProject() error = %v", err)
+		}
+	}
+
+	if got := q.count("MeasureProjectUsage"); got != 3 {
+		t.Errorf("MeasureProjectUsage ran %d times, want 3: a measurement that wrote "+
+			"nothing must not hold the window", got)
+	}
+}

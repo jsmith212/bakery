@@ -484,7 +484,8 @@ func (a *API) mount(mux *http.ServeMux) {
 	// The EXPLICIT refresh. ProjectRead, the same floor as the GET it refreshes: it
 	// writes only cache_backend_usage, a derived figure about data the caller can
 	// already see, and putting it behind ProjectAdmin would leave a reader staring at
-	// a number they cannot make correct. Rate-limited server-side (minMeasureInterval)
+	// a number they cannot make correct. Rate-limited server-side (gc.MinMeasureInterval,
+	// counted from the last ATTEMPT so a timing-out project backs off)
 	// and always 200 -- "too soon" is not a condition a dashboard can act on.
 	a.route(mux, AccessProjectRead, "POST "+p+"/orgs/{org}/projects/{project}/usage/measure",
 		a.handleMeasureProjectUsage)

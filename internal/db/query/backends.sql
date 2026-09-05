@@ -200,12 +200,47 @@ DELETE FROM cache_backends cb
    AND NOT EXISTS (SELECT 1 FROM hashserv_unihashes u WHERE u.backend_id = cb.id)
    AND NOT EXISTS (SELECT 1 FROM hashserv_outhashes h WHERE h.backend_id = cb.id);
 
+-- THE STRAGGLER MARK, and it is a correctness statement, not tidying.
+--
+-- DELETE /projects/{project} marks the project's backends and then the project, in
+-- one READ COMMITTED transaction. That transaction's row lock on the project does not
+-- conflict with a concurrent INSERT INTO cache_backends, whose foreign key takes only
+-- KEY SHARE on the parent -- so a backend created while the delete was in flight can
+-- land UNMARKED under a project that is already marked. Such a row is in no worklist:
+-- the backend listing below used to ask `cb.deleting_at IS NOT NULL` alone, and
+-- ListProjectsForTeardown's anti-join sees a project that still has a backend. The
+-- project sits in `deleting` forever, invisible to every listing, holding its slug,
+-- with no path back.
+--
+-- This statement is the self-healing half: every tick, before the worklist is read,
+-- any backend under a marked project is brought into the same state the API would
+-- have put it in. `enabled = false` and the coalesce mirror MarkProjectBackendsDeleting
+-- exactly, so a straggler is indistinguishable from a backend the API marked -- which
+-- is the point: the control plane reads deleting_at, and a row the GC is about to
+-- empty must not read as live there.
+--
+-- name: MarkBackendsOfDeletingProjects :execrows
+UPDATE cache_backends cb
+   SET deleting_at = coalesce(cb.deleting_at, now()),
+       enabled     = false
+  FROM projects p
+ WHERE p.id = cb.project_id
+   AND p.deleting_at IS NOT NULL
+   AND (cb.deleting_at IS NULL OR cb.enabled);
+
 -- The teardown stage's worklist: every marked backend, with the slugs its metrics
 -- label on (CLAUDE.md: Prometheus labels are slugs, never ids) and the paired project
 -- so a fully-emptied project can be finished in the same pass.
 --
--- Riding cache_backends_deleting_idx, the partial index 000018 creates: on a healthy
--- installation this returns nothing, forever, and must cost nothing to ask.
+-- THE PREDICATE IS A DISJUNCTION, and the second half is the belt to the mark above's
+-- braces. `p.deleting_at IS NOT NULL` catches a backend inserted under a marked
+-- project between that UPDATE and this SELECT -- the same race, one statement narrower
+-- -- so a straggler is torn down on the tick it appears rather than waiting for the
+-- next one to mark it. Neither half depends on the other being correct.
+--
+-- Riding cache_backends_deleting_idx and projects_deleting_idx, the two partial
+-- indexes 000018 creates: on a healthy installation this returns nothing, forever, and
+-- must cost nothing to ask.
 --
 -- name: ListBackendsForTeardown :many
 SELECT cb.id, cb.kind, cb.project_id, p.slug AS project_slug, o.slug AS org_slug
@@ -213,6 +248,7 @@ SELECT cb.id, cb.kind, cb.project_id, p.slug AS project_slug, o.slug AS org_slug
   JOIN projects p      ON p.id = cb.project_id
   JOIN organizations o ON o.id = p.org_id
  WHERE cb.deleting_at IS NOT NULL
+    OR p.deleting_at IS NOT NULL
  ORDER BY cb.id;
 
 -- The last step of one backend's teardown. `deleting_at IS NOT NULL` is not

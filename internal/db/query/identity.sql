@@ -91,6 +91,43 @@ SELECT u.id
  ORDER BY u.id
    FOR NO KEY UPDATE;
 
+-- THE PARENT LOCK for a project teardown, taken AFTER the member users and BEFORE
+-- anything is marked.
+--
+-- handleDeleteProject marks the project's backends, deletes the empty ones, counts
+-- what is left and marks the project -- all under READ COMMITTED. Nothing in that
+-- sequence conflicts with a concurrent POST .../backends: creating a backend takes
+-- only KEY SHARE on the projects row (the foreign key's own lock), and MarkProjectDeleting's
+-- UPDATE takes NO KEY UPDATE, which KEY SHARE does not block. So a backend could be
+-- inserted between the mark of the set and the count of it, landing unmarked under a
+-- project that is about to be marked -- the stranded-project bug MarkBackendsOfDeletingProjects
+-- heals after the fact and this prevents in the first place.
+--
+-- FOR UPDATE, not FOR NO KEY UPDATE, precisely because FOR UPDATE is the one row-level
+-- mode that conflicts with KEY SHARE. That is the whole point of the statement: it is
+-- not protecting a column, it is serialising against the child insert.
+--
+-- The ordering rule still holds -- users first, then this. A transaction that took the
+-- project before the roster would deadlock against every other membership writer.
+--
+-- name: LockProjectForTeardown :exec
+SELECT 1 FROM projects WHERE id = $1 FOR UPDATE;
+
+-- Does a project with this (org, slug) exist but sit in teardown?
+--
+-- Asked only after a 23505 on CreateProject, to tell two conflicts apart that a
+-- generic "that slug is already taken" conflates. A deleting project is hidden from
+-- every listing, so an admin who retries the create sees the slug refused by nothing
+-- they can find -- and the slug really does free up on its own, once the GC has
+-- emptied the project's backends. That is a different sentence, and it is the only
+-- one that tells them what to do (wait).
+--
+-- name: ProjectSlugIsDeleting :one
+SELECT EXISTS (
+    SELECT 1 FROM projects p
+     WHERE p.org_id = $1 AND p.slug = $2 AND p.deleting_at IS NOT NULL
+)::boolean AS is_deleting;
+
 -- LOCAL SITE-ADMIN GRANTS -- the API's half of the site role, and ONLY its half.
 --
 -- Mirror image of UpsertUser above: these name site_role_local, site_granted_by and

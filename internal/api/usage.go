@@ -110,18 +110,6 @@ func newProjectBackendUsage(r repository.GetProjectBackendUsageRow) ProjectBacke
 	}
 }
 
-// minMeasureInterval is the server-side rate limit on the EXPLICIT refresh
-// (POST .../usage/measure). It is deliberately tighter than --usage-freshness, whose
-// job is different: freshness decides whether an ordinary page load is worth a
-// measurement, while this decides how hard a human leaning on a Refresh button can
-// push. Ten seconds is short enough that a second click after reading the result
-// re-measures, and long enough that a held-down button is one query.
-//
-// Refusing is NOT an error. The endpoint answers 200 with the current row either way,
-// because "you asked too soon" is not information a dashboard can act on -- and
-// measured_at already tells the caller exactly how fresh the answer they got is.
-const minMeasureInterval = 10 * time.Second
-
 // usageMeasurer is the slice of *gc.Engine this package needs to refresh one
 // project's usage. An interface for the same reason gcTrigger is: the freshness
 // decision is ordinary handler logic and must be testable without an engine, a
@@ -184,6 +172,15 @@ func (a *API) handleGetProjectUsage(w http.ResponseWriter, r *http.Request) erro
 // limit is a server-side floor on how often the work happens, not a condition the
 // client has to handle: a 429 here would give a dashboard nothing to do except show
 // the same rows it would have got anyway, with an error attached.
+//
+// THE RATE LIMIT IS THE ENGINE'S, and it used to be this handler's. The handler asked
+// staleEnough(rows, 10s) -- a question about measured_at, which is written only when a
+// measurement SUCCEEDS. A project whose aggregate exceeds the engine's ten-second
+// ceiling therefore passed that gate on every single click, forever, and re-ran the
+// most expensive query in the installation each time. gc.MinMeasureInterval keys off
+// the last ATTEMPT instead and covers both entry points, so there is one floor rather
+// than two that can disagree; refusing there is a silent no-op, and this endpoint
+// answers with the rows on file exactly as it always did.
 func (a *API) handleMeasureProjectUsage(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	s := scopeFrom(ctx)
@@ -193,7 +190,7 @@ func (a *API) handleMeasureProjectUsage(w http.ResponseWriter, r *http.Request) 
 		return fmt.Errorf("get project usage: %w", err)
 	}
 
-	if a.staleEnough(rows, minMeasureInterval) {
+	if a.measurer != nil {
 		rows, err = a.remeasure(ctx, s.ProjectID, rows)
 		if err != nil {
 			return err

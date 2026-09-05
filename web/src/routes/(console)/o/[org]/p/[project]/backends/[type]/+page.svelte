@@ -7,7 +7,7 @@
 	import { isApiError } from '$lib/api/errors';
 	import { tri } from '$lib/api/patch';
 	import type { BackendKind, CacheObject } from '$lib/api/types';
-	import { canAdminProject } from '$lib/roles';
+	import { canAdminOrg, canAdminProject } from '$lib/roles';
 	import { projectPath } from '$lib/tenancy';
 	import { backendStatus } from '$lib/backendStatus';
 	import {
@@ -68,6 +68,20 @@
 	// for it would be offering something the server has already stopped honouring.
 	const deleting = $derived(backend.deleting_at !== null);
 	const canEdit = $derived(canAdminProject(data.me, project));
+
+	// THE DESTRUCTIVE HALF OF DELETE IS ORG ADMIN, and the API enforces it: deleting an
+	// EMPTY backend is ordinary project configuration, but tearing down one that holds
+	// objects destroys every byte in it, irreversibly, and a project admin is a role the
+	// org's admins hand out. Mirrored here so the button says so instead of failing with
+	// a 403 after a typed confirmation.
+	//
+	// Only a MEASURED, non-zero count disables it. A null objects_count means nobody has
+	// measured this backend yet, and disabling on an unknown would lock a project admin
+	// out of deleting an empty backend -- which they may do. The server is the authority
+	// either way; this is the caption, not the check.
+	const holdsObjects = $derived((usageRow?.objects_count ?? 0) > 0);
+	const canTearDown = $derived(canAdminOrg(data.me, org));
+	const deleteBlocked = $derived(holdsObjects && !canTearDown);
 
 	// yocto composes sstate/downloads/hashserv into one snippet; bazel-family
 	// tools (moon/ccache/sccache/bazel) share the bazel backend; the OCI tools
@@ -352,6 +366,7 @@
 	const deleteDisabled = $derived(deleteConfirm !== kind || deletePending);
 
 	function openDelete() {
+		if (deleteBlocked) return;
 		deleteConfirm = '';
 		showDelete = true;
 	}
@@ -569,9 +584,17 @@
 				</div>
 			</div>
 			<div class="flex-none">
-				<Button variant="danger" size="md" onclick={openDelete}>Delete backend</Button>
+				<Button variant="danger" size="md" disabled={deleteBlocked} onclick={openDelete}>
+					Delete backend
+				</Button>
 			</div>
 		</div>
+		{#if deleteBlocked}
+			<div class="text-sm text-text-3">
+				Deleting a backend that holds cache objects requires an org admin; a project admin may
+				delete only an empty one.
+			</div>
+		{/if}
 	</section>
 {/if}
 

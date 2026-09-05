@@ -174,7 +174,7 @@ func (a *API) handleCreateProject(w http.ResponseWriter, r *http.Request) error 
 		return nil
 	})
 	if err != nil {
-		return err
+		return a.slugConflict(ctx, s.OrgID, req.Slug, err)
 	}
 
 	out := newProject(project, s.OrgSlug, nil, p)
@@ -191,6 +191,36 @@ func (a *API) handleCreateProject(w http.ResponseWriter, r *http.Request) error 
 	writeJSON(w, http.StatusCreated, out)
 
 	return nil
+}
+
+// slugConflict re-reads a 23505 to tell two conflicts apart.
+//
+// The generic mapping is "that slug is already taken", which is true and, for a project
+// being TORN DOWN, actively unhelpful: a deleting project is hidden from every listing
+// for everyone, site admins included, so the admin who just hit this looks at the org's
+// projects, sees nothing with that slug, and has no way to learn why the name is
+// refused or whether waiting would help. It would. The slug frees up on its own the
+// moment the GC finishes emptying the project's backends, and that is the only sentence
+// that tells them what to do.
+//
+// The probe runs only on the conflict, never on the happy path, and a failure to answer
+// it falls back to the generic message rather than turning a 409 into a 500.
+func (a *API) slugConflict(
+	ctx context.Context, orgID pgtype.UUID, slug string, err error,
+) error {
+	if !isPGCode(err, pgUniqueViolation) {
+		return err
+	}
+
+	deleting, probeErr := a.store.ProjectSlugIsDeleting(ctx, repository.ProjectSlugIsDeletingParams{
+		OrgID: orgID, Slug: slug,
+	})
+	if probeErr != nil || !deleting {
+		return err
+	}
+
+	return errConflict(CodeConflict,
+		"a project with this slug is being torn down; the slug frees up when that finishes")
 }
 
 // handleGetProject reads one project.
@@ -314,6 +344,25 @@ func (a *API) handleDeleteProject(w http.ResponseWriter, r *http.Request) error 
 	err := a.store.Tx(ctx, func(q *repository.Queries) error {
 		if err := q.LockProjectMemberUsersForAuthzUpdate(ctx, s.ProjectID); err != nil {
 			return fmt.Errorf("lock the project's members before deleting it: %w", err)
+		}
+
+		// THEN THE PROJECT ROW ITSELF, FOR UPDATE, before anything is marked. Steps 2-5
+		// below are all READ COMMITTED and none of them conflicts with a concurrent
+		// POST .../backends: creating a backend takes only KEY SHARE on this row (its
+		// foreign key's own lock) and MarkProjectDeleting takes NO KEY UPDATE, which KEY
+		// SHARE does not block. So a backend inserted between step 2's mark and step 3's
+		// count lands UNMARKED under a project that is then marked -- a row in no
+		// worklist, whose project's teardown anti-join never sees zero backends. The
+		// project sits in `deleting` forever: hidden from every listing, holding its slug,
+		// with no API that can un-mark it. FOR UPDATE is the one row mode that conflicts
+		// with KEY SHARE, so the create either finishes before this transaction reads the
+		// set or waits and is marked by it.
+		//
+		// Users first, then this: the ordering rule is about the transaction as a whole,
+		// and a project taken before its roster deadlocks against every other membership
+		// writer. The GC's markStragglers heals a row that got past this anyway.
+		if err := q.LockProjectForTeardown(ctx, s.ProjectID); err != nil {
+			return fmt.Errorf("lock the project before deleting it: %w", err)
 		}
 
 		if _, err := q.MarkProjectBackendsDeleting(ctx, s.ProjectID); err != nil {

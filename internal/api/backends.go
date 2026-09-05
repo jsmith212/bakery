@@ -291,8 +291,26 @@ func (a *API) handleUpdateBackend(w http.ResponseWriter, r *http.Request) error 
 // deleting_at the first one minted (MarkBackendDeleting coalesces), never a 404 and
 // never a restarted clock -- a console that retries a request whose response it lost
 // must not be told the backend is gone while the GC is still emptying it.
+//
+// AND THE TWO OUTCOMES CARRY TWO DIFFERENT ROLE FLOORS. The route stays
+// AccessProjectAdmin, because deleting an empty backend is ordinary project
+// configuration. The MARK is not: it destroys every object the backend holds,
+// irreversibly, and until 000018 the RESTRICT foreign key made that PHYSICALLY
+// IMPOSSIBLE for anyone at all -- the endpoint answered 409 forever. Landing the
+// teardown machinery without a role change would have quietly promoted "may configure
+// this project" into "may wipe every byte in it, one kind at a time", which is the same
+// reason DELETE /projects/{project} is org admin: a delegated role must not be able to
+// destroy the thing it was delegated over. So the mark asks CanAdminOrg and a project
+// admin gets a 403 that says exactly which half they may do.
 func (a *API) handleDeleteBackend(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
+
+	p, ok := principalFrom(ctx)
+	if !ok {
+		return errUnauthorized("authentication required")
+	}
+
+	s := scopeFrom(ctx)
 
 	current, err := a.backendOf(r)
 	if err != nil {
@@ -314,6 +332,15 @@ func (a *API) handleDeleteBackend(w http.ResponseWriter, r *http.Request) error 
 		writeJSON(w, http.StatusNoContent, nil)
 
 		return nil
+	}
+
+	// The backend holds objects, so this is the destructive branch. The check is HERE
+	// rather than at the top on purpose: an org admin is not required to delete an empty
+	// backend, and asking before the emptiness probe would have made every backend
+	// deletion an org-admin operation.
+	if !p.CanAdminOrg(s.OrgID) {
+		return errForbidden("deleting a backend that holds cache objects requires an org admin; " +
+			"a project admin may delete only an empty one")
 	}
 
 	marked, err := a.store.MarkBackendDeleting(ctx, current.ID)

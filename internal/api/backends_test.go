@@ -111,6 +111,12 @@ func TestGetBackendCarriesRealTimestamps(t *testing.T) {
 func TestBackendConflictsGetBackendSpecificMessages(t *testing.T) {
 	admin := principals(t)["proj_admin"]
 
+	// THE DESTRUCTIVE BRANCH IS ORG ADMIN. Deleting an EMPTY backend is ordinary
+	// project configuration; marking one that holds objects destroys every byte in it,
+	// irreversibly, and a project admin is a role the org's admins hand out -- the same
+	// reason DELETE /projects/{project} is org admin.
+	orgAdmin := principals(t)["org_admin"]
+
 	t.Run("duplicate kind names the backend, not a slug", func(t *testing.T) {
 		store := fixtureStore(t)
 		store.desiredErr = &pgconn.PgError{
@@ -149,7 +155,7 @@ func TestBackendConflictsGetBackendSpecificMessages(t *testing.T) {
 		store.backendsWithObjects = map[int64]bool{1: true}
 		a := testAPI(t, store, nil)
 
-		w := do(t, a, admin, http.MethodDelete,
+		w := do(t, a, orgAdmin, http.MethodDelete,
 			Prefix+"/orgs/acme/projects/firmware/backends/sstate", "")
 
 		if w.Code != http.StatusAccepted {
@@ -189,7 +195,7 @@ func TestBackendConflictsGetBackendSpecificMessages(t *testing.T) {
 		store.backendsWithObjects = map[int64]bool{1: true}
 		a := testAPI(t, store, nil)
 
-		first := do(t, a, admin, http.MethodDelete,
+		first := do(t, a, orgAdmin, http.MethodDelete,
 			Prefix+"/orgs/acme/projects/firmware/backends/sstate", "")
 		if first.Code != http.StatusAccepted {
 			t.Fatalf("first status = %d, want 202", first.Code)
@@ -197,7 +203,7 @@ func TestBackendConflictsGetBackendSpecificMessages(t *testing.T) {
 
 		store.calls = nil
 
-		second := do(t, a, admin, http.MethodDelete,
+		second := do(t, a, orgAdmin, http.MethodDelete,
 			Prefix+"/orgs/acme/projects/firmware/backends/sstate", "")
 		if second.Code != http.StatusAccepted {
 			t.Fatalf("second status = %d, want 202 (body %s)", second.Code, second.Body.String())
@@ -244,7 +250,7 @@ func TestBackendConflictsGetBackendSpecificMessages(t *testing.T) {
 		}
 		a := testAPI(t, store, nil)
 
-		w := do(t, a, admin, http.MethodDelete,
+		w := do(t, a, orgAdmin, http.MethodDelete,
 			Prefix+"/orgs/acme/projects/firmware/backends/sstate", "")
 
 		if w.Code != http.StatusAccepted {
@@ -256,6 +262,36 @@ func TestBackendConflictsGetBackendSpecificMessages(t *testing.T) {
 		}
 	})
 
+	// THE ROLE SPLIT ITSELF. Before the teardown machinery landed, the RESTRICT foreign
+	// key made this physically impossible for anyone: the endpoint answered 409 forever
+	// on a backend that held objects. Landing the teardown without a role change would
+	// have quietly promoted "may configure this project" into "may wipe every byte in
+	// it, one kind at a time".
+	t.Run("a project admin may not tear down a backend that holds objects", func(t *testing.T) {
+		store := backendFixture(t, time.Now(), time.Now())
+		store.backendsWithObjects = map[int64]bool{1: true}
+		a := testAPI(t, store, nil)
+
+		w := do(t, a, admin, http.MethodDelete,
+			Prefix+"/orgs/acme/projects/firmware/backends/sstate", "")
+
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403 (body %s)", w.Code, w.Body.String())
+		}
+
+		// The message has to say which half they MAY do, or the caller learns only that
+		// the button does not work.
+		if detail := decodeErr(t, w); !strings.Contains(detail.Message, "org admin") ||
+			!strings.Contains(detail.Message, "empty one") {
+			t.Errorf("message = %q, want it to name the org-admin requirement and the "+
+				"empty-delete they may still do", detail.Message)
+		}
+
+		if containsCall(store.calls, "MarkBackendDeleting") {
+			t.Errorf("calls = %v: the refusal must happen BEFORE the mark", store.calls)
+		}
+	})
+
 	// A BACKEND UNDER TEARDOWN IS NOT PATCHABLE. UpdateBackend sets `enabled`
 	// unconditionally, so without this a PATCH of {"enabled":true} would republish a
 	// mount whose objects the GC is deleting row by row -- hits that turn into misses.
@@ -264,7 +300,7 @@ func TestBackendConflictsGetBackendSpecificMessages(t *testing.T) {
 		store.backendsWithObjects = map[int64]bool{1: true}
 		a := testAPI(t, store, nil)
 
-		if w := do(t, a, admin, http.MethodDelete,
+		if w := do(t, a, orgAdmin, http.MethodDelete,
 			Prefix+"/orgs/acme/projects/firmware/backends/sstate", ""); w.Code != http.StatusAccepted {
 			t.Fatalf("delete status = %d, want 202", w.Code)
 		}

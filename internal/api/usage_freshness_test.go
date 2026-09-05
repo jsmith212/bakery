@@ -206,32 +206,42 @@ func TestProjectUsageMeasureEndpoint(t *testing.T) {
 		}
 	})
 
-	// THE RATE LIMIT, AND IT IS NOT AN ERROR. "You asked too soon" is not information
-	// a dashboard can act on -- and the row it gets back carries measured_at, which
-	// already says exactly how fresh the answer is. A 429 here would give the client
-	// nothing to do except show the same rows with an error attached.
-	t.Run("a repeat inside the rate limit is a 200 that measures nothing", func(t *testing.T) {
+	// THE RATE LIMIT MOVED, AND THAT IS THE POINT. It used to be here -- the handler
+	// asked staleEnough(rows, 10s), a question about measured_at, which is written only
+	// when a measurement SUCCEEDS. So a project whose aggregate exceeds the engine's own
+	// ten-second ceiling passed that gate on every single click, forever. The floor is
+	// now gc.MinMeasureInterval, counted from the last ATTEMPT, and it covers the GET
+	// path too, so there is one mechanism rather than two that can disagree.
+	//
+	// What this endpoint owes is unchanged and is what is asserted: it delegates, and it
+	// answers 200 with the rows on file whatever the engine decided. Refusing there is a
+	// silent no-op -- "you asked too soon" is not information a dashboard can act on, and
+	// measured_at already says how fresh the answer is.
+	t.Run("a repeat delegates to the engine and is still a 200", func(t *testing.T) {
 		m := &fakeMeasurer{}
 		a := usageAPI(t, usageStore(t, time.Second), m, 0)
 
-		w := do(t, a, reader, http.MethodPost, path, "")
-		if w.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200 (body %s)", w.Code, w.Body.String())
+		for range 3 {
+			w := do(t, a, reader, http.MethodPost, path, "")
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body %s)", w.Code, w.Body.String())
+			}
+
+			if got := decodeUsage(t, w.Body.Bytes()); len(got) != 1 {
+				t.Errorf("usage = %+v, want the current rows anyway", got)
+			}
 		}
 
-		if m.calls != 0 {
-			t.Errorf("MeasureProject called %d times inside the rate limit, want 0", m.calls)
-		}
-
-		if got := decodeUsage(t, w.Body.Bytes()); len(got) != 1 {
-			t.Errorf("usage = %+v, want the current rows anyway", got)
+		if m.calls != 3 {
+			t.Errorf("MeasureProject called %d times, want 3: the handler no longer keeps "+
+				"a second, measured_at-based rate limit of its own", m.calls)
 		}
 	})
 
-	// The rate limit is TIGHTER than the read freshness window, and deliberately so:
-	// a row 30s old is fresh enough that a page load leaves it alone, and stale enough
-	// that pressing Refresh does something.
-	t.Run("the rate limit is tighter than the read freshness window", func(t *testing.T) {
+	// The explicit refresh does NOT consult --usage-freshness, and that separation
+	// survived the move: a row that is fresh enough for a page load to leave alone is
+	// still measured when a human presses Refresh.
+	t.Run("the explicit refresh ignores the read freshness window", func(t *testing.T) {
 		m := &fakeMeasurer{}
 		a := usageAPI(t, usageStore(t, 30*time.Second), m, time.Minute)
 
@@ -250,6 +260,15 @@ func TestProjectUsageMeasureEndpoint(t *testing.T) {
 
 		if m.calls != 1 {
 			t.Errorf("MeasureProject called %d times on an explicit refresh, want 1", m.calls)
+		}
+	})
+
+	// Nil-tolerant: an embedder with no engine wired serves what is on file.
+	t.Run("no engine wired is still a 200", func(t *testing.T) {
+		a := usageAPI(t, usageStore(t, time.Hour), nil, time.Minute)
+
+		if w := do(t, a, reader, http.MethodPost, path, ""); w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", w.Code)
 		}
 	})
 }

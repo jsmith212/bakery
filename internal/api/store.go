@@ -32,6 +32,14 @@ type Store interface {
 	ListProjectsForOrg(ctx context.Context, orgID pgtype.UUID) ([]repository.Project, error)
 	UpdateProject(ctx context.Context, arg repository.UpdateProjectParams) (repository.Project, error)
 	DeleteProject(ctx context.Context, id pgtype.UUID) (int64, error)
+
+	// ProjectSlugIsDeleting is asked ONLY after a 23505 on CreateProject, to tell
+	// "taken" apart from "being torn down" -- a deleting project is in no listing, so
+	// without this the caller is refused a slug they cannot find and cannot learn will
+	// come back.
+	ProjectSlugIsDeleting(
+		ctx context.Context, arg repository.ProjectSlugIsDeletingParams,
+	) (bool, error)
 	ResolveRoute(ctx context.Context, arg repository.ResolveRouteParams) (repository.ResolveRouteRow, error)
 
 	// Users. Resolving {user} for an ORG grant cannot go through the org roster --

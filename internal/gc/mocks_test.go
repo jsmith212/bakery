@@ -56,6 +56,18 @@ type fakeQueries struct {
 
 	// onScan runs inside ScanObjectsForGC, before it answers.
 	onScan func(page int)
+
+	// The teardown stage's worklists. teardown is what ListBackendsForTeardown
+	// answers; dropped records every DeleteTornDownBackend that reached a row, which
+	// is the only observable difference between "this backend finished" and "this
+	// backend used its per-tick budget and will continue".
+	teardown []repository.ListBackendsForTeardownRow
+	dropped  []int64
+
+	// measureErr fails the read-triggered aggregate, which is how a test builds the
+	// project whose measurement never succeeds -- the one that used to be re-measured
+	// on every dashboard load, forever.
+	measureErr error
 }
 
 func newFakeQueries() *fakeQueries {
@@ -69,6 +81,27 @@ func newFakeQueries() *fakeQueries {
 		calls: map[string]int{}, scanLimits: nil, scanAt: nil, finished: nil, usage: nil,
 		runBackends: nil,
 		startErr:    nil, scanErr: nil, rampUntil: time.Time{}, rampErr: nil, onScan: nil,
+		teardown: nil, dropped: nil,
+	}
+}
+
+// removeObjects drops the rows a DeleteBatch reported deleting, so a second tick sees
+// the corpus the first one left behind. The real ScanObjectsForGC gets this for free
+// from the delete; the fake's corpus is a slice and has to be told.
+func (f *fakeQueries) removeObjects(refs []blob.DeleteRef) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	for _, ref := range refs {
+		rows := f.objects[ref.BackendID]
+
+		for i := range rows {
+			if rows[i].Namespace == ref.Namespace && rows[i].Key == ref.Key {
+				f.objects[ref.BackendID] = append(rows[:i], rows[i+1:]...)
+
+				break
+			}
+		}
 	}
 }
 
@@ -149,6 +182,14 @@ func (f *fakeQueries) MeasureProjectUsage(
 ) ([]repository.MeasureProjectUsageRow, error) {
 	f.note("MeasureProjectUsage")
 
+	f.mu.Lock()
+	err := f.measureErr
+	f.mu.Unlock()
+
+	if err != nil {
+		return nil, err
+	}
+
 	return nil, nil
 }
 
@@ -157,16 +198,37 @@ func (f *fakeQueries) MeasureProjectUsage(
 // DB-backed (internal/db/gc_teardown_test.go) because its whole subject -- a RESTRICT
 // foreign key refusing a delete until the last row is gone -- is a property of the
 // schema and not of any Go code a fake could stand in for.
+func (f *fakeQueries) MarkBackendsOfDeletingProjects(_ context.Context) (int64, error) {
+	f.note("MarkBackendsOfDeletingProjects")
+
+	return 0, nil
+}
+
 func (f *fakeQueries) ListBackendsForTeardown(
 	_ context.Context,
 ) ([]repository.ListBackendsForTeardownRow, error) {
 	f.note("ListBackendsForTeardown")
 
-	return nil, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return append([]repository.ListBackendsForTeardownRow(nil), f.teardown...), nil
 }
 
-func (f *fakeQueries) DeleteTornDownBackend(_ context.Context, _ int64) (int64, error) {
+func (f *fakeQueries) DeleteTornDownBackend(_ context.Context, id int64) (int64, error) {
 	f.note("DeleteTornDownBackend")
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	for i := range f.teardown {
+		if f.teardown[i].ID == id {
+			f.teardown = append(f.teardown[:i], f.teardown[i+1:]...)
+			f.dropped = append(f.dropped, id)
+
+			return 1, nil
+		}
+	}
 
 	return 0, nil
 }
@@ -423,21 +485,43 @@ type fakeBlobs struct {
 	invalidated []string
 	reaped      int
 	pending     map[string]struct{}
+
+	// deleteErr fails DeleteBatch for ONE backend id, which is how a test builds the
+	// "one stuck backend" the teardown stage must not let starve its siblings.
+	deleteErr map[int64]error
+
+	// onDelete runs after a successful DeleteBatch, so a test can keep the queries
+	// fake's corpus in step with what has been deleted across ticks.
+	onDelete func(refs []blob.DeleteRef)
 }
 
 func newFakeBlobs() *fakeBlobs {
 	return &fakeBlobs{
 		mu: sync.Mutex{}, deleted: nil, deleteRuns: nil, invalidated: nil,
 		reaped: 0, pending: map[string]struct{}{},
+		deleteErr: map[int64]error{}, onDelete: nil,
 	}
 }
 
 func (f *fakeBlobs) DeleteBatch(_ context.Context, runID int64, refs []blob.DeleteRef) (int64, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+
+	if len(refs) > 0 {
+		if err := f.deleteErr[refs[0].BackendID]; err != nil {
+			f.mu.Unlock()
+
+			return 0, err
+		}
+	}
 
 	f.deleted = append(f.deleted, refs...)
 	f.deleteRuns = append(f.deleteRuns, runID)
+	onDelete := f.onDelete
+	f.mu.Unlock()
+
+	if onDelete != nil {
+		onDelete(refs)
+	}
 
 	return int64(len(refs)), nil
 }

@@ -241,6 +241,9 @@ func (p *fakePrincipal) CanAdminProject(orgID, projectID pgtype.UUID) bool {
 // better than any generated double, and it lets a test assert on what was WRITTEN
 // (see calls) rather than only on what was returned.
 type fakeStore struct {
+	// txErr, when set, is what Tx returns instead of errFakeTx -- see Tx.
+	txErr error
+
 	orgs     []repository.Organization
 	projects []repository.Project
 	backends []repository.CacheBackend
@@ -1024,7 +1027,29 @@ var errFakeTx = errors.New("fakeStore: Tx is not implemented; use a DB-backed te
 func (s *fakeStore) Tx(_ context.Context, _ func(*repository.Queries) error) error {
 	s.note("Tx")
 
+	// txErr lets a handler test drive the ERROR MAPPING that happens after a
+	// transaction fails -- the 23505-to-409 translations -- without a database. The
+	// transaction body itself still cannot run here; anything that depends on what it
+	// writes stays a DB-backed test.
+	if s.txErr != nil {
+		return s.txErr
+	}
+
 	return errFakeTx
+}
+
+func (s *fakeStore) ProjectSlugIsDeleting(
+	_ context.Context, arg repository.ProjectSlugIsDeletingParams,
+) (bool, error) {
+	s.note("ProjectSlugIsDeleting:" + arg.Slug)
+
+	for _, p := range s.projects {
+		if p.OrgID == arg.OrgID && p.Slug == arg.Slug && p.DeletingAt.Valid {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // uuidOf derives a stable UUID from a slug, so a fake create can hand back an id.
